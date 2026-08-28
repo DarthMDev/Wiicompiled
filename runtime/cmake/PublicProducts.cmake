@@ -76,7 +76,7 @@ target_compile_definitions(mkw_runtime_common PRIVATE
     _DISABLE_STRING_ANNOTATION _DISABLE_VECTOR_ANNOTATION)
 target_link_libraries(mkw_runtime_common PRIVATE
     aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx)
-target_link_libraries(mkw_runtime_common PRIVATE mkw::pugixml mkw::toml11 mkw::cryptopp)
+target_link_libraries(mkw_runtime_common PRIVATE mkw_platform mkw::pugixml mkw::toml11 mkw::cryptopp)
 if(MKW_PLATFORM_WINDOWS)
     target_link_libraries(mkw_runtime_common PRIVATE shell32 windowsapp)
 endif()
@@ -188,7 +188,7 @@ function(mkw_configure_product target)
     # include the same fat translated headers; bound them by the same pool.
     mkw_bound_translated_compiles(${target})
     target_link_libraries(${target} PRIVATE
-        mkw_base_shared mkw::pugixml mkw::toml11 mkw::cryptopp)
+        mkw_platform mkw_base_shared mkw::pugixml mkw::toml11 mkw::cryptopp)
 
     target_link_libraries(${target} PRIVATE
         aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx)

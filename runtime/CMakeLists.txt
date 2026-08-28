@@ -224,6 +224,7 @@ endif()
 # a registration file is silently never compiled and never errors. The stale-glob
 # failure mode is worth far more than the milliseconds.
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
+set(MKW_PLATFORM_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/platform/host_platform.cpp")
 set(MKW_BASE_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/base_product.cpp")
 set(MKW_RETRO_REWIND_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/retro_rewind_product.cpp")
 # The host ISA guard is the one translation unit that must not receive the
@@ -231,7 +232,22 @@ set(MKW_RETRO_REWIND_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/retro
 # mkw_runtime_common. See cmake/PublicProducts.cmake and the file's own header.
 set(MKW_CPU_BASELINE_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/host_cpu_baseline.cpp")
 list(REMOVE_ITEM SOURCES ${MKW_BASE_PRODUCT_SOURCE} ${MKW_RETRO_REWIND_PRODUCT_SOURCE}
-     ${MKW_CPU_BASELINE_SOURCE})
+     ${MKW_CPU_BASELINE_SOURCE} ${MKW_PLATFORM_SOURCE})
+
+# This deliberately small library contains host services that are safe to
+# validate before guest memory and fiber work makes a full runtime build viable.
+add_library(mkw_platform STATIC "${MKW_PLATFORM_SOURCE}")
+target_include_directories(mkw_platform PUBLIC "${CMAKE_CURRENT_LIST_DIR}/include")
+target_compile_features(mkw_platform PUBLIC cxx_std_17)
+set_target_properties(mkw_platform PROPERTIES UNITY_BUILD OFF)
+
+# Keep this independent from Aurora's BUILD_TESTING option: it is a host
+# portability gate, not a third-party test suite.
+enable_testing()
+add_executable(mkw_platform_smoke "${CMAKE_CURRENT_LIST_DIR}/tests/platform_smoke.cpp")
+target_link_libraries(mkw_platform_smoke PRIVATE mkw_platform)
+target_compile_features(mkw_platform_smoke PRIVATE cxx_std_17)
+add_test(NAME mkw_platform_smoke COMMAND mkw_platform_smoke)
 
 # The translator emits the complete, content-addressed source graph. Consuming
 # this one manifest keeps configure independent of the 28k generated function
@@ -255,6 +271,6 @@ if(MKW_BUILD_PRODUCTS)
     set(MKW_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/PublicProducts.cmake")
 else()
-    add_custom_target(mkw_configure_smoke)
+    add_custom_target(mkw_configure_smoke DEPENDS mkw_platform)
     message(STATUS "Translated product targets disabled (MKW_BUILD_PRODUCTS=OFF)")
 endif()

@@ -36,8 +36,6 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <dbghelp.h>
-#else
-#include <unistd.h>
 #endif
 
 #include "abi_bridge.h"
@@ -53,6 +51,7 @@
 #include "runtime_config.h"
 #include "runtime_log.h"
 #include "runtime_product.h"
+#include "platform/host_platform.h"
 #include "recomp_mod_loader.h"
 #include <aurora/aurora.h>
 #include <aurora/gfx.h>
@@ -162,7 +161,7 @@ struct ProcessTranscriptState {
 };
 
 std::filesystem::path GetDefaultRuntimeLogDirectory() {
-    return RuntimeConfigFile::ApplicationDataDirectory() / "Logs";
+    return RuntimePlatform::LogDirectory(RuntimeConfigFile::kApplicationDirectoryName);
 }
 
 // Every entry in the Logs root - both the per-run folders written by this
@@ -197,11 +196,7 @@ const std::filesystem::path& GetRunLogDirectory() {
         std::filesystem::create_directories(logRoot, ec);
         PruneOldRunLogs(logRoot);
 
-#if defined(_WIN32)
-        const unsigned long pid = ::GetCurrentProcessId();
-#else
-        const auto pid = static_cast<unsigned long>(::getpid());
-#endif
+        const auto pid = RuntimePlatform::CurrentProcessId();
         const auto now = std::chrono::system_clock::now();
         const auto secs = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
 
@@ -403,11 +398,7 @@ void InitializeProcessTranscript(int argc, char** argv) {
     state.enabled = true;
     state.path = path;
 
-#if defined(_WIN32)
-    const unsigned long pid = ::GetCurrentProcessId();
-#else
-    const auto pid = static_cast<unsigned long>(::getpid());
-#endif
+    const auto pid = RuntimePlatform::CurrentProcessId();
 
     const std::string setupVersion = ReadInstalledSetupVersion();
 
