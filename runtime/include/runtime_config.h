@@ -17,13 +17,7 @@
 #include <utility>
 #include <vector>
 #include <toml.hpp>
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#include <shlobj.h>
-#endif
+#include "platform/host_platform.h"
 
 struct RuntimeUserConfig {
     std::optional<bool> widescreen;
@@ -146,22 +140,7 @@ inline bool IsSupportedFrameInterpolationFps(uint32_t value) {
 }
 
 inline std::optional<std::filesystem::path> ExecutableDirectory() {
-#ifdef _WIN32
-    std::wstring buffer(MAX_PATH, L'\0');
-    for (;;) {
-        const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
-        if (length == 0) {
-            return std::nullopt;
-        }
-        if (length < buffer.size() - 1) {
-            buffer.resize(length);
-            return std::filesystem::path(buffer).parent_path();
-        }
-        buffer.resize(buffer.size() * 2);
-    }
-#else
-    return std::nullopt;
-#endif
+    return RuntimePlatform::ExecutableDirectory();
 }
 
 // The portable root this executable lives under, or nullopt for a normal installation. The answer
@@ -194,15 +173,7 @@ inline std::filesystem::path ApplicationDataDirectory() {
     if (const auto& portableRoot = PortableRootDirectory()) {
         return *portableRoot / kPortableUserDataDirectoryName;
     }
-#ifdef _WIN32
-    PWSTR rawPath = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_CREATE, nullptr, &rawPath)) && rawPath) {
-        const std::filesystem::path directory = std::filesystem::path(rawPath) / kApplicationDirectoryName;
-        CoTaskMemFree(rawPath);
-        return directory;
-    }
-#endif
-    return std::filesystem::current_path() / kApplicationDirectoryName;
+    return RuntimePlatform::ApplicationDataDirectory(kApplicationDirectoryName);
 }
 
 inline std::filesystem::path ResolveConfigPath() {

@@ -6,6 +6,7 @@
 #include "aurora_events.h"
 #include "settings_overlay.h"
 #include "fiber_manager.h"
+#include "platform/host_platform.h"
 #include "runtime_log.h"
 
 #include <dolphin/vi.h>
@@ -21,16 +22,6 @@
 #include <thread>
 
 #include <aurora/aurora.h>
-
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#endif
 
 // Forward declaration for OSWakeupThread - used to wake threads on VI retrace queue
 extern "C" void OSWakeupThread_HLE_801aaaa4(CpuContext* ctx);
@@ -163,54 +154,7 @@ constexpr std::chrono::microseconds kFinalSpinWindow{500};
 
 void SleepPreciselyUntil(Clock::time_point deadline, bool finishWithSpin = false,
                          std::chrono::microseconds spinWindow = 750us) {
-    const auto now = Clock::now();
-    if (now >= deadline) {
-        return;
-    }
-    const auto timerDeadline =
-        finishWithSpin && deadline - now > spinWindow ? deadline - spinWindow : deadline;
-#if defined(_WIN32)
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
-    struct HighResolutionTimer {
-        HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                                               TIMER_MODIFY_STATE | SYNCHRONIZE);
-        ~HighResolutionTimer() {
-            if (handle != nullptr) {
-                CloseHandle(handle);
-            }
-        }
-    };
-    static thread_local HighResolutionTimer timer;
-    if (timer.handle != nullptr) {
-        const auto remaining100ns =
-            std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10000000>>>(timerDeadline - now);
-        LARGE_INTEGER due{};
-        due.QuadPart = -std::max<int64_t>(remaining100ns.count(), 1);
-        if (SetWaitableTimerEx(timer.handle, &due, 0, nullptr, nullptr, nullptr, 0) != FALSE) {
-            WaitForSingleObject(timer.handle, INFINITE);
-            if (!finishWithSpin) {
-                return;
-            }
-        }
-    }
-#endif
-    if (!finishWithSpin) {
-        std::this_thread::sleep_until(deadline);
-        return;
-    }
-    if (Clock::now() < timerDeadline) {
-        std::this_thread::sleep_until(timerDeadline);
-    }
-    // This runs only for the final fraction of a VI interval. Do not yield the
-    // host thread here: a scheduler quantum is larger than the remaining
-    // budget and would recreate the 17-18 ms sawtooth this path removes.
-    while (Clock::now() < deadline) {
-#if defined(_WIN32)
-        YieldProcessor();
-#endif
-    }
+    RuntimePlatform::SleepPreciselyUntil(deadline, finishWithSpin, spinWindow);
 }
 
 void ViSetR3(CpuContext* ctx, uint32_t value)
