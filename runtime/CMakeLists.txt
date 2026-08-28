@@ -249,6 +249,19 @@ target_link_libraries(mkw_platform_smoke PRIVATE mkw_platform)
 target_compile_features(mkw_platform_smoke PRIVATE cxx_std_17)
 add_test(NAME mkw_platform_smoke COMMAND mkw_platform_smoke)
 
+if(MKW_PLATFORM_MACOS)
+    # These are feasibility gates for the two execution-substrate risks. They
+    # intentionally do not link the runtime or change its Windows-only memory
+    # and fiber implementations.
+    add_executable(mkw_macos_context_prototype "${CMAKE_CURRENT_LIST_DIR}/tests/macos_context_prototype.cpp")
+    target_compile_features(mkw_macos_context_prototype PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_context_prototype COMMAND mkw_macos_context_prototype)
+
+    add_executable(mkw_macos_memory_prototype "${CMAKE_CURRENT_LIST_DIR}/tests/macos_memory_prototype.cpp")
+    target_compile_features(mkw_macos_memory_prototype PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_memory_prototype COMMAND mkw_macos_memory_prototype)
+endif()
+
 # The translator emits the complete, content-addressed source graph. Consuming
 # this one manifest keeps configure independent of the 28k generated function
 # files and of optional Retro Rewind artifacts such as code.map.
