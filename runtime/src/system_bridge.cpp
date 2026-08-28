@@ -9,10 +9,12 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 
 #include "abi_bridge.h"

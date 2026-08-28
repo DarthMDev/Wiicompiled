@@ -6,6 +6,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -22,7 +23,7 @@
 // Forward declarations
 struct CpuContext;
 
-// GuestFiberManager: each guest OSThread maps to a Windows Fiber. A scheduler fiber picks
+// GuestFiberManager: each guest OSThread maps to a host context. A scheduler context picks
 // which guest fiber runs; a real timer thread queues VI retraces at the VI cadence. Guest
 // threads only switch at explicit yield points (OSSleepThread, OSYieldThread, ...), matching
 // Wii cooperative semantics exactly.
@@ -39,7 +40,7 @@ enum class ThreadState : uint32_t {
 
 // Information about a guest fiber
 struct GuestFiber {
-    void* fiber = nullptr;              // Windows fiber handle
+    void* fiber = nullptr;              // Host context handle
     uint32_t entryPoint = 0;            // Thread entry function
     uint32_t entryArg = 0;              // Argument to entry function
     CpuContext cpuContext{};            // Saved CPU context for this fiber
@@ -123,4 +124,3 @@ private:
 extern std::atomic<uint32_t> g_viRetracePendingCount;
 
 } // namespace Fiber
-
