@@ -129,10 +129,12 @@ mkw_apply_common_compile_options(mkw_runtime_common)
 # check from a C initializer so an unsupported machine gets a readable error
 # instead of an illegal-instruction crash. Excluded from the unity build and the
 # precompiled header because both are produced with the owning target's flags.
-add_library(mkw_cpu_baseline OBJECT "${MKW_CPU_BASELINE_SOURCE}")
-target_compile_features(mkw_cpu_baseline PRIVATE cxx_std_17)
-set_target_properties(mkw_cpu_baseline PROPERTIES UNITY_BUILD OFF)
-target_compile_options(mkw_cpu_baseline PRIVATE -w)
+if(MKW_PLATFORM_WINDOWS)
+    add_library(mkw_cpu_baseline OBJECT "${MKW_CPU_BASELINE_SOURCE}")
+    target_compile_features(mkw_cpu_baseline PRIVATE cxx_std_17)
+    set_target_properties(mkw_cpu_baseline PROPERTIES UNITY_BUILD OFF)
+    target_compile_options(mkw_cpu_baseline PRIVATE -w)
+endif()
 
 if(NOT MKW_BASE_COMMON_SHARDS)
     message(FATAL_ERROR "Translator build graph contains no shared base shards")
@@ -172,7 +174,9 @@ function(mkw_configure_product target)
     target_sources(${target} PRIVATE $<TARGET_OBJECTS:mkw_runtime_common>)
     # Startup CPU check. Must stay a separate object library so it keeps the
     # plain baseline ISA while everything around it is built for x86-64-v3.
-    target_sources(${target} PRIVATE $<TARGET_OBJECTS:mkw_cpu_baseline>)
+    if(MKW_PLATFORM_WINDOWS)
+        target_sources(${target} PRIVATE $<TARGET_OBJECTS:mkw_cpu_baseline>)
+    endif()
     target_include_directories(${target} PRIVATE
         "${MKW_RUNTIME_SOURCE_DIR}/include"
         "${MKW_RUNTIME_SOURCE_DIR}/src"
