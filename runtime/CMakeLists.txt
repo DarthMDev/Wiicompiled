@@ -1,13 +1,27 @@
 ﻿cmake_minimum_required(VERSION 3.16)
 project(mkw_recompiled)
 
-if(NOT WIN32 OR NOT MINGW OR NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
-   NOT CMAKE_SIZEOF_VOID_P EQUAL 8 OR
-   NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-    message(FATAL_ERROR "WiiCompiled requires 64-bit LLVM-MinGW Clang on Windows")
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "WiiCompiled requires a 64-bit Clang toolchain")
+endif()
+
+if(WIN32 AND MINGW AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+    set(MKW_PLATFORM_WINDOWS TRUE)
+elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|ARM64)$")
+    # The first native macOS target is Apple Silicon. Intel and universal
+    # binaries remain future compatibility work; do not silently claim them.
+    set(MKW_PLATFORM_MACOS TRUE)
+else()
+    message(FATAL_ERROR
+        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows or Apple Clang on macOS arm64")
 endif()
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     message(FATAL_ERROR "WiiCompiled only supports Release builds")
+endif()
+
+option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
+if(MKW_PLATFORM_MACOS)
+    message(STATUS "WiiCompiled macOS arm64 support is experimental")
 endif()
 
 # Preprocessor definitions that belong to this project's own code (the runtime,
@@ -110,9 +124,17 @@ else()
         message(FATAL_ERROR "Requested aurora-main but ${MKW_AURORA_DIR} is missing")
     endif()
     set(DAWN_ENABLE_D3D11 OFF CACHE BOOL "" FORCE)
-    set(DAWN_ENABLE_D3D12 ON CACHE BOOL "" FORCE)
-    set(DAWN_ENABLE_VULKAN ON CACHE BOOL "" FORCE)
-    set(TINT_BUILD_HLSL_WRITER ON CACHE BOOL "" FORCE)
+    if(MKW_PLATFORM_WINDOWS)
+        set(DAWN_ENABLE_D3D12 ON CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_VULKAN ON CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_METAL OFF CACHE BOOL "" FORCE)
+        set(TINT_BUILD_HLSL_WRITER ON CACHE BOOL "" FORCE)
+    else()
+        set(DAWN_ENABLE_D3D12 OFF CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_VULKAN OFF CACHE BOOL "" FORCE)
+        set(DAWN_ENABLE_METAL ON CACHE BOOL "" FORCE)
+        set(TINT_BUILD_HLSL_WRITER OFF CACHE BOOL "" FORCE)
+    endif()
     set(DAWN_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
     set(DAWN_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(DAWN_USE_WINDOWS_UI OFF CACHE BOOL "" FORCE)
@@ -120,11 +142,13 @@ else()
     # Provide a tiny stub for DXProgrammableCapture when the SDK/PIX headers are
     # missing (common on MinGW). Dawn only includes the header; no symbols are
     # referenced when PIX isn't present.
-    set(MKW_DX_STUB_DIR "${CMAKE_BINARY_DIR}/aurora_dx_stubs")
-    if(NOT EXISTS "${MKW_DX_STUB_DIR}/DXProgrammableCapture.h")
-        file(MAKE_DIRECTORY ${MKW_DX_STUB_DIR})
-        file(WRITE "${MKW_DX_STUB_DIR}/DXProgrammableCapture.h"
-"#pragma once\n// Stubbed PIX capture header for Dawn; no functionality when PIX is absent.\n")
+    if(MKW_PLATFORM_WINDOWS)
+        set(MKW_DX_STUB_DIR "${CMAKE_BINARY_DIR}/aurora_dx_stubs")
+        if(NOT EXISTS "${MKW_DX_STUB_DIR}/DXProgrammableCapture.h")
+            file(MAKE_DIRECTORY ${MKW_DX_STUB_DIR})
+            file(WRITE "${MKW_DX_STUB_DIR}/DXProgrammableCapture.h"
+"#pragma once\n// Stubbed PIX capture header for Dawn; no functionality when PIX isn't present.\n")
+        endif()
     endif()
     # Deliberately NOT injected project-wide. Only a from-source Dawn build ever
     # includes DXProgrammableCapture.h, and this tree consumes Dawn as a prebuilt
@@ -153,7 +177,9 @@ else()
         if(TARGET ${t})
             set_target_properties(${t} PROPERTIES UNITY_BUILD OFF)
             target_compile_options(${t} PRIVATE -O3 -ffast-math -w -pipe)
-            target_include_directories(${t} PRIVATE ${MKW_DX_STUB_DIR})
+            if(MKW_PLATFORM_WINDOWS)
+                target_include_directories(${t} PRIVATE ${MKW_DX_STUB_DIR})
+            endif()
             # Aurora's own sources include Windows headers and call std::min/max;
             # they relied on the old project-wide NOMINMAX that no longer leaks
             # into this subtree, so the define is applied per target here.
@@ -210,20 +236,25 @@ list(REMOVE_ITEM SOURCES ${MKW_BASE_PRODUCT_SOURCE} ${MKW_RETRO_REWIND_PRODUCT_S
 # The translator emits the complete, content-addressed source graph. Consuming
 # this one manifest keeps configure independent of the 28k generated function
 # files and of optional Retro Rewind artifacts such as code.map.
-set(MKW_TRANSLATED_SHARD_MANIFEST
-    "${CMAKE_CURRENT_LIST_DIR}/../generated/build_shards/shards.cmake"
-    CACHE FILEPATH "Translator-owned aggregate shard manifest")
-if(NOT EXISTS "${MKW_TRANSLATED_SHARD_MANIFEST}")
-    message(FATAL_ERROR
-        "Missing translator-owned shard manifest: ${MKW_TRANSLATED_SHARD_MANIFEST}. "
-        "Run Translator.Cli emit-build-shards first; see translator/README.md.")
-endif()
-include("${MKW_TRANSLATED_SHARD_MANIFEST}")
-set(MKW_HAVE_RETRO_REWIND ${MKW_HAVE_RETRO_REWIND_SHARDS})
-message(STATUS
-    "Translator graph: ${MKW_SHARED_BASE_FUNCTION_COUNT}/${MKW_BASE_FUNCTION_COUNT} base functions shared; "
-    "${MKW_PROFILE_SENSITIVE_CALLER_COUNT} profile-sensitive callers; "
-    "${MKW_RETRO_REWIND_FUNCTION_COUNT} Retro Rewind functions")
+if(MKW_BUILD_PRODUCTS)
+    set(MKW_TRANSLATED_SHARD_MANIFEST
+        "${CMAKE_CURRENT_LIST_DIR}/../generated/build_shards/shards.cmake"
+        CACHE FILEPATH "Translator-owned aggregate shard manifest")
+    if(NOT EXISTS "${MKW_TRANSLATED_SHARD_MANIFEST}")
+        message(FATAL_ERROR
+            "Missing translator-owned shard manifest: ${MKW_TRANSLATED_SHARD_MANIFEST}. "
+            "Run Translator.Cli emit-build-shards first; see translator/README.md.")
+    endif()
+    include("${MKW_TRANSLATED_SHARD_MANIFEST}")
+    set(MKW_HAVE_RETRO_REWIND ${MKW_HAVE_RETRO_REWIND_SHARDS})
+    message(STATUS
+        "Translator graph: ${MKW_SHARED_BASE_FUNCTION_COUNT}/${MKW_BASE_FUNCTION_COUNT} base functions shared; "
+        "${MKW_PROFILE_SENSITIVE_CALLER_COUNT} profile-sensitive callers; "
+        "${MKW_RETRO_REWIND_FUNCTION_COUNT} Retro Rewind functions")
 
-set(MKW_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
-include("${CMAKE_CURRENT_LIST_DIR}/cmake/PublicProducts.cmake")
+    set(MKW_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+    include("${CMAKE_CURRENT_LIST_DIR}/cmake/PublicProducts.cmake")
+else()
+    add_custom_target(mkw_configure_smoke)
+    message(STATUS "Translated product targets disabled (MKW_BUILD_PRODUCTS=OFF)")
+endif()
