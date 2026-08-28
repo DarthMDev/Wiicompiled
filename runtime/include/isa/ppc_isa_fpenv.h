@@ -1,17 +1,24 @@
 #pragma once
 // FPSCR[NI] (non-IEEE flush-to-zero) modeled on the host FP environment, plus
-// the thread-local mirror of that state the hot paths read instead of MXCSR.
+// the thread-local mirror of that state the hot paths read instead of MXCSR/FPCR.
 
 #include "ppc_isa_config.h"
 
 #include <cstdint>
 
 // Software-flushing Gekko's single-precision denormals per op roughly doubled the THP IDCT
-// kernel's cycle count, so instead the runtime mirrors guest FPSCR[NI] into host MXCSR FTZ+DAZ
-// wherever FPSCR can change (PPC_Mtfs*, fiber context switches, CpuContextScope), making per-op
-// flushes free. Accepted deviations (same trade Dolphin makes): FTZ also flushes double
-// denormals unlike real NI, and a pre-round-flush edge near FLT_MIN rounds via cvtsd2ss instead.
-inline constexpr uint32_t kMkwMxcsrFlushToZeroBits = (1u << 15) | (1u << 6); // FTZ | DAZ
+// kernel's cycle count, so instead the runtime mirrors guest FPSCR[NI] into the host FP control
+// register's flush-to-zero bit(s) wherever FPSCR can change (PPC_Mtfs*, fiber context switches,
+// CpuContextScope), making per-op flushes free. Accepted deviations (same trade Dolphin makes):
+// flush-to-zero also flushes double denormals unlike real NI, and a pre-round-flush edge near
+// FLT_MIN rounds via cvtsd2ss (or its AArch64 equivalent) instead.
+#if defined(__x86_64__)
+inline constexpr uint32_t kMkwFpControlFlushToZeroBits = (1u << 15) | (1u << 6); // FTZ | DAZ
+#elif defined(__aarch64__)
+inline constexpr uint32_t kMkwFpControlFlushToZeroBits = 1u << 24; // FPCR FZ
+#else
+#error "ppc_isa_fpenv.h has no host FP control register mapping for this architecture"
+#endif
 
 
 inline thread_local bool g_mkwHostNiActive = false;
@@ -22,15 +29,38 @@ inline thread_local bool g_mkwHostNiActive = false;
 inline constexpr double kMkwNiFlushThreshold = 0x1p-126;  // 0x3810000000000000
 inline thread_local double g_mkwNiFlushThreshold = 0.0;
 
+inline uint32_t MkwGetHostFpControl() noexcept
+{
+#if defined(__x86_64__)
+    return _mm_getcsr();
+#elif defined(__aarch64__)
+    uint64_t fpcr = 0;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    return static_cast<uint32_t>(fpcr);
+#endif
+}
+
+inline void MkwSetHostFpControl(uint32_t value) noexcept
+{
+#if defined(__x86_64__)
+    _mm_setcsr(value);
+#elif defined(__aarch64__)
+    uint64_t fpcr = 0;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr = (fpcr & ~static_cast<uint64_t>(0xFFFFFFFFu)) | value;
+    __asm__ __volatile__("msr fpcr, %0" :: "r"(fpcr));
+#endif
+}
+
 inline void MkwApplyHostNiMode(uint32_t fpscr) noexcept
 {
-    const uint32_t csr = _mm_getcsr();
+    const uint32_t csr = MkwGetHostFpControl();
     const bool wantNi = (fpscr & 0x4u) != 0;
     const uint32_t want = wantNi
-        ? (csr | kMkwMxcsrFlushToZeroBits)
-        : (csr & ~kMkwMxcsrFlushToZeroBits);
+        ? (csr | kMkwFpControlFlushToZeroBits)
+        : (csr & ~kMkwFpControlFlushToZeroBits);
     if (want != csr)
-        _mm_setcsr(want);
+        MkwSetHostFpControl(want);
     // `want` has both bits set or both clear, so this is exactly
     // `(_mm_getcsr() & kMkwMxcsrFlushToZeroBits) != 0` after the write - the
     // mirror cannot disagree with the register even if the incoming CSR held
@@ -46,8 +76,8 @@ inline void MkwApplyHostNiMode(uint32_t fpscr) noexcept
 /// </summary>
 inline void MkwRestoreHostMxcsr(uint32_t csr) noexcept
 {
-    _mm_setcsr(csr);
-    const bool niActive = (csr & kMkwMxcsrFlushToZeroBits) != 0;
+    MkwSetHostFpControl(csr);
+    const bool niActive = (csr & kMkwFpControlFlushToZeroBits) != 0;
     g_mkwHostNiActive = niActive;
     g_mkwNiFlushThreshold = niActive ? kMkwNiFlushThreshold : 0.0;
 }

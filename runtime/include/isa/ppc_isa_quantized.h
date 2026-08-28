@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #include <utility>
@@ -38,16 +39,23 @@ inline uint32_t PpcStorePsqFloatBitsInline(uint32_t value)
 
 inline uint64_t PpcLoadPairPsqFloatBitsPackedInline(uint64_t value)
 {
+#if defined(__x86_64__)
     const __m128i lanes = _mm_cvtsi64_si128(static_cast<long long>(value));
     const __m128i magnitude = _mm_and_si128(lanes, _mm_set1_epi32(0x7FFFFFFF));
     const __m128i nanMask = _mm_cmpgt_epi32(magnitude, _mm_set1_epi32(0x7F800000));
     const __m128i result = _mm_or_si128(
         lanes, _mm_and_si128(nanMask, _mm_set1_epi32(0x00400000)));
     return static_cast<uint64_t>(_mm_cvtsi128_si64(result));
+#else
+    const uint32_t lo = PpcLoadPsqFloatBitsInline(static_cast<uint32_t>(value));
+    const uint32_t hi = PpcLoadPsqFloatBitsInline(static_cast<uint32_t>(value >> 32));
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+#endif
 }
 
 inline uint64_t PpcStorePairPsqFloatBitsPackedInline(uint64_t value)
 {
+#if defined(__x86_64__)
     const __m128i lanes = _mm_cvtsi64_si128(static_cast<long long>(value));
     const __m128i magnitude = _mm_and_si128(lanes, _mm_set1_epi32(0x7FFFFFFF));
     const __m128i subnormalMask = _mm_cmplt_epi32(magnitude, _mm_set1_epi32(0x00800000));
@@ -60,8 +68,14 @@ inline uint64_t PpcStorePairPsqFloatBitsPackedInline(uint64_t value)
         _mm_and_si128(subnormalMask, signedZero),
         _mm_andnot_si128(subnormalMask, quieted));
     return static_cast<uint64_t>(_mm_cvtsi128_si64(result));
+#else
+    const uint32_t lo = PpcStorePsqFloatBitsInline(static_cast<uint32_t>(value));
+    const uint32_t hi = PpcStorePsqFloatBitsInline(static_cast<uint32_t>(value >> 32));
+    return (static_cast<uint64_t>(hi) << 32) | lo;
+#endif
 }
 
+#if defined(__x86_64__)
 inline __m128i PpcPsqSwapPairBytesInline(__m128i lanes)
 {
     const __m128i order = _mm_setr_epi8(
@@ -95,21 +109,34 @@ inline __m128i PpcStorePairPsqFloatBitsLanesInline(__m128i lanes)
         _mm_and_si128(subnormalMask, signedZero),
         _mm_andnot_si128(subnormalMask, quieted));
 }
+#endif
 
 // host -> packed FPR double, guard already proven by the caller.
 inline double PpcLoadPairPsqFloatFromHostInline(const uint8_t* host)
 {
+#if defined(__x86_64__)
     const __m128i raw = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(host));
     return PpcM128ToPsInline(_mm_castsi128_ps(
         PpcLoadPairPsqFloatBitsLanesInline(PpcPsqSwapPairBytesInline(raw))));
+#else
+    uint64_t raw = 0;
+    std::memcpy(&raw, host, sizeof(raw));
+    return PpcBitCastToDoubleInline(PpcLoadPairPsqFloatBitsPackedInline(__builtin_bswap64(raw)));
+#endif
 }
 
 // packed FPR double -> host, guard already proven by the caller.
 inline void PpcStorePairPsqFloatToHostInline(uint8_t* host, double value)
 {
+#if defined(__x86_64__)
     const __m128i lanes = PpcStorePairPsqFloatBitsLanesInline(
         _mm_castps_si128(PpcPsToM128Inline(value)));
     _mm_storel_epi64(reinterpret_cast<__m128i*>(host), PpcPsqSwapPairBytesInline(lanes));
+#else
+    const uint64_t quieted = PpcStorePairPsqFloatBitsPackedInline(PpcBitCastToU64Inline(value));
+    const uint64_t swapped = __builtin_bswap64(quieted);
+    std::memcpy(host, &swapped, sizeof(swapped));
+#endif
 }
 
 template <typename SignedType>
@@ -329,6 +356,7 @@ inline uint8_t PpcQuantizePsqU8Scale61Inline(float value)
 // matching PpcQuantizePsqU8Scale61Inline's !(scaled > 0) rule.
 inline uint16_t PpcQuantizePairPsqU8Scale61PackedInline(double value)
 {
+#if defined(__x86_64__)
     const __m128 scaled = _mm_mul_ps(PpcPsToM128Inline(value), _mm_set1_ps(0.125f));
     const __m128 nonNegative = _mm_max_ps(scaled, _mm_setzero_ps());
     const __m128 clamped = _mm_min_ps(nonNegative, _mm_set1_ps(255.0f));
@@ -338,6 +366,13 @@ inline uint16_t PpcQuantizePairPsqU8Scale61PackedInline(double value)
     // Native lane 0 is ps1 and lane 1 is ps0. Packing to the low uint16_t
     // therefore produces the guest-order numeric value (ps0 << 8) | ps1.
     return static_cast<uint16_t>(_mm_cvtsi128_si32(lanes8));
+#else
+    PPC_FPR fpr{};
+    fpr.d = value;
+    const uint8_t q0 = PpcQuantizePsqU8Scale61Inline(fpr.paired.ps0);
+    const uint8_t q1 = PpcQuantizePsqU8Scale61Inline(fpr.paired.ps1);
+    return static_cast<uint16_t>((static_cast<uint16_t>(q0) << 8) | static_cast<uint16_t>(q1));
+#endif
 }
 
 // Preserve the complete memory/MMIO/executable-write behavior off the leaf

@@ -226,8 +226,12 @@ endif()
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 if(MKW_PLATFORM_MACOS)
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory.cpp")
+    list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/wup028_adapter.cpp")
+    list(APPEND SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/wup028_adapter_macos.cpp")
+    list(APPEND SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
 else()
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_macos.cpp")
+    list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/wup028_adapter_macos.cpp")
 endif()
 set(MKW_PLATFORM_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/platform/host_platform.cpp")
 set(MKW_BASE_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/base_product.cpp")
@@ -265,6 +269,14 @@ if(MKW_PLATFORM_MACOS)
     target_compile_features(mkw_macos_context_prototype PRIVATE cxx_std_17)
     add_test(NAME mkw_macos_context_prototype COMMAND mkw_macos_context_prototype)
 
+    add_executable(mkw_macos_host_context_smoke
+        "${CMAKE_CURRENT_LIST_DIR}/tests/macos_host_context_smoke.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
+    target_include_directories(mkw_macos_host_context_smoke PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_compile_features(mkw_macos_host_context_smoke PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_host_context_smoke COMMAND mkw_macos_host_context_smoke)
+
     add_executable(mkw_macos_memory_prototype "${CMAKE_CURRENT_LIST_DIR}/tests/macos_memory_prototype.cpp")
     target_compile_features(mkw_macos_memory_prototype PRIVATE cxx_std_17)
     add_test(NAME mkw_macos_memory_prototype COMMAND mkw_macos_memory_prototype)
@@ -299,6 +311,27 @@ if(MKW_BUILD_PRODUCTS)
     set(MKW_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/PublicProducts.cmake")
 else()
+    if(MKW_PLATFORM_MACOS)
+        # Compile-only audit of native runtime sources. It deliberately avoids
+        # translated products until their host dependencies are portable.
+        # These sources depend on generated/RuntimeConfig.h, which is emitted for
+        # a particular game by the translator and is intentionally unavailable
+        # in this platform-only configuration.
+        set(MKW_MACOS_NATIVE_AUDIT_SOURCES ${SOURCES})
+        list(REMOVE_ITEM MKW_MACOS_NATIVE_AUDIT_SOURCES
+            "${CMAKE_CURRENT_LIST_DIR}/src/abi_bridge.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/src/hle/os/os_alarm.cpp")
+        add_library(mkw_macos_native_compile OBJECT ${MKW_MACOS_NATIVE_AUDIT_SOURCES})
+        target_include_directories(mkw_macos_native_compile PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/src"
+            "${CMAKE_CURRENT_LIST_DIR}/.." "${CMAKE_CURRENT_LIST_DIR}/../aurora-main/include")
+        target_compile_features(mkw_macos_native_compile PRIVATE cxx_std_20)
+        target_compile_definitions(mkw_macos_native_compile PRIVATE SDL_MAIN_HANDLED TARGET_PC)
+        target_link_libraries(mkw_macos_native_compile PRIVATE
+            aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx
+            mkw::pugixml mkw::toml11 mkw::cryptopp)
+        set_target_properties(mkw_macos_native_compile PROPERTIES UNITY_BUILD OFF)
+    endif()
     add_custom_target(mkw_configure_smoke DEPENDS mkw_platform)
     message(STATUS "Translated product targets disabled (MKW_BUILD_PRODUCTS=OFF)")
 endif()

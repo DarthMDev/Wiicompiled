@@ -18,8 +18,13 @@ extern "C" {
 }
 
 namespace MemoryInline {
+#if defined(_MSC_VER) || defined(__MINGW32__)
 #define MKW_MEMORY_FORCE_INLINE __forceinline
 #define MKW_MEMORY_NO_INLINE __declspec(noinline)
+#else
+#define MKW_MEMORY_FORCE_INLINE inline __attribute__((always_inline))
+#define MKW_MEMORY_NO_INLINE __attribute__((noinline))
+#endif
 #define MKW_MEMORY_COLD __attribute__((cold))
 inline constexpr uint32_t kPageShift = 20;
 inline constexpr uint32_t kPageSize = 1u << kPageShift;
