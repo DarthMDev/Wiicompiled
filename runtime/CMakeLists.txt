@@ -253,7 +253,10 @@ if(MKW_PLATFORM_MACOS)
     # These are feasibility gates for the two execution-substrate risks. They
     # intentionally do not link the runtime or change its Windows-only memory
     # and fiber implementations.
-    add_executable(mkw_macos_context_prototype "${CMAKE_CURRENT_LIST_DIR}/tests/macos_context_prototype.cpp")
+    enable_language(ASM)
+    add_executable(mkw_macos_context_prototype
+        "${CMAKE_CURRENT_LIST_DIR}/tests/macos_context_asm_prototype.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
     target_compile_features(mkw_macos_context_prototype PRIVATE cxx_std_17)
     add_test(NAME mkw_macos_context_prototype COMMAND mkw_macos_context_prototype)
 
