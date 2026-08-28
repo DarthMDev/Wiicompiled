@@ -33,7 +33,12 @@ void WriteGuestFloat(uint32_t addr, float value, const char* label) {
 
 void* GuestToHostPtr(uint32_t addr, size_t len) {
     if (addr == 0) return nullptr;
-    try { return Memory::GetPointer(addr, len); } catch (const Memory::AccessViolation& e) { LogMemoryError(RT_TAG_GX, "GX guest pointer", e); return nullptr; }
+    // The macOS flat guest map exposes separate host aliases for cached,
+    // uncached, and physical MEM1/MEM2 addresses. GX resources are identified
+    // by their host pointer, so all aliases of one guest allocation must use
+    // the same physical mapping before they reach Aurora.
+    const uint32_t canonical = CanonicalizeGxMainRamAddress(addr);
+    try { return Memory::GetPointer(canonical, len); } catch (const Memory::AccessViolation& e) { LogMemoryError(RT_TAG_GX, "GX guest pointer", e); return nullptr; }
 }
 
 void WriteGuest32(uint32_t addr, uint32_t value, const char* label) {
