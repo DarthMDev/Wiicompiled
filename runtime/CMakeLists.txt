@@ -268,6 +268,13 @@ if(MKW_PLATFORM_MACOS)
     add_executable(mkw_macos_memory_prototype "${CMAKE_CURRENT_LIST_DIR}/tests/macos_memory_prototype.cpp")
     target_compile_features(mkw_macos_memory_prototype PRIVATE cxx_std_17)
     add_test(NAME mkw_macos_memory_prototype COMMAND mkw_macos_memory_prototype)
+
+    add_executable(mkw_macos_guest_flat_smoke
+        "${CMAKE_CURRENT_LIST_DIR}/tests/macos_guest_flat_smoke.cpp"
+        "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_macos.cpp")
+    target_include_directories(mkw_macos_guest_flat_smoke PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_compile_features(mkw_macos_guest_flat_smoke PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_guest_flat_smoke COMMAND mkw_macos_guest_flat_smoke)
 endif()
 
 # The translator emits the complete, content-addressed source graph. Consuming
