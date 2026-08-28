@@ -515,6 +515,11 @@ MKW_MEMORY_FORCE_INLINE void WriteResolvedFloat64(uint8_t* r, uint32_t o, uint32
 // around `*(T*)(base + addr)`, no page-table load or limit check (interception model documented
 // in guest_flat_memory.h). The one exception kept inline is the MMIO write policy, since the
 // written value can't be recovered from a fault record.
+//
+// Apple Silicon has 16 KiB VM pages, so the macOS path cannot use guest-view
+// protections to distinguish the four 4 KiB Wii pages inside one host page.
+// It therefore uses the existing checked page-table path, which materializes
+// deferred reads and applies executable-write/MMIO policy before touching RAM.
 
 template <typename T>
 MKW_MEMORY_FORCE_INLINE T FlatLoad(uint32_t address) {
@@ -529,51 +534,94 @@ MKW_MEMORY_FORCE_INLINE void FlatStore(uint32_t address, T value) {
     std::memcpy(MKW_FLAT_GUEST_BASE + address, &swapped, sizeof(T));
 }
 
-MKW_MEMORY_FORCE_INLINE uint8_t FlatRead8(uint32_t address) { return FlatLoad<uint8_t>(address); }
-MKW_MEMORY_FORCE_INLINE uint16_t FlatRead16(uint32_t address) { return FlatLoad<uint16_t>(address); }
-MKW_MEMORY_FORCE_INLINE uint32_t FlatRead32(uint32_t address) { return FlatLoad<uint32_t>(address); }
+MKW_MEMORY_FORCE_INLINE uint8_t FlatRead8(uint32_t address) {
+#if defined(__APPLE__)
+    return Memory::Read8(address);
+#else
+    return FlatLoad<uint8_t>(address);
+#endif
+}
+MKW_MEMORY_FORCE_INLINE uint16_t FlatRead16(uint32_t address) {
+#if defined(__APPLE__)
+    return Memory::Read16(address);
+#else
+    return FlatLoad<uint16_t>(address);
+#endif
+}
+MKW_MEMORY_FORCE_INLINE uint32_t FlatRead32(uint32_t address) {
+#if defined(__APPLE__)
+    return Memory::Read32(address);
+#else
+    return FlatLoad<uint32_t>(address);
+#endif
+}
 
 MKW_MEMORY_FORCE_INLINE float FlatReadFloat32(uint32_t address) {
-    const uint32_t bits = FlatLoad<uint32_t>(address);
+    const uint32_t bits = FlatRead32(address);
     float value = 0.0f;
     std::memcpy(&value, &bits, sizeof(value));
     return value;
 }
 
 MKW_MEMORY_FORCE_INLINE double FlatReadFloat64(uint32_t address) {
-    const uint64_t bits = FlatLoad<uint64_t>(address);
+    const uint64_t bits =
+#if defined(__APPLE__)
+        Memory::Read64(address);
+#else
+        FlatLoad<uint64_t>(address);
+#endif
     double value = 0.0;
     std::memcpy(&value, &bits, sizeof(value));
     return value;
 }
 
 MKW_MEMORY_FORCE_INLINE void FlatWrite8(uint32_t address, uint8_t value) {
+#if defined(__APPLE__)
+    Memory::Write8(address, value);
+#else
     if (FlatWriteNeedsPolicy(address)) [[unlikely]] { Write8Slow(address, value); return; }
     FlatStore<uint8_t>(address, value);
+#endif
 }
 
 MKW_MEMORY_FORCE_INLINE void FlatWrite16(uint32_t address, uint16_t value) {
+#if defined(__APPLE__)
+    Memory::Write16(address, value);
+#else
     if (FlatWriteNeedsPolicy(address)) [[unlikely]] { Write16Slow(address, value); return; }
     FlatStore<uint16_t>(address, value);
+#endif
 }
 
 MKW_MEMORY_FORCE_INLINE void FlatWrite32(uint32_t address, uint32_t value) {
+#if defined(__APPLE__)
+    Memory::Write32(address, value);
+#else
     if (FlatWriteNeedsPolicy(address)) [[unlikely]] { Write32Slow(address, value); return; }
     FlatStore<uint32_t>(address, value);
+#endif
 }
 
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteFloat32(uint32_t address, double value) {
+#if defined(__APPLE__)
+    Memory::WriteFloat32(address, value);
+#else
     const uint32_t bits = ConvertPpcDoubleToSingleBits(value);
     if (FlatWriteNeedsPolicy(address)) [[unlikely]] { WriteFloat32Slow(address, value); return; }
     FlatStore<uint32_t>(address, bits);
+#endif
 }
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteFloat64(uint32_t address, double value) {
+#if defined(__APPLE__)
+    Memory::WriteFloat64(address, value);
+#else
     uint64_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
     if (FlatWriteNeedsPolicy(address)) [[unlikely]] { WriteFloat64Slow(address, value); return; }
     FlatStore<uint64_t>(address, bits);
+#endif
 }
 
 // Check-free stores: emitted ONLY for addresses the translator proved at translate time are ordinary guest RAM (r1-relative stack slots, ~45%
@@ -582,26 +630,46 @@ MKW_MEMORY_FORCE_INLINE void FlatWriteFloat64(uint32_t address, double value) {
 // instead of dispatched inline. Never use these for an address the translator hasn't proven.
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteRam8(uint32_t address, uint8_t value) {
+#if defined(__APPLE__)
+    Memory::Write8(address, value);
+#else
     FlatStore<uint8_t>(address, value);
+#endif
 }
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteRam16(uint32_t address, uint16_t value) {
+#if defined(__APPLE__)
+    Memory::Write16(address, value);
+#else
     FlatStore<uint16_t>(address, value);
+#endif
 }
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteRam32(uint32_t address, uint32_t value) {
+#if defined(__APPLE__)
+    Memory::Write32(address, value);
+#else
     FlatStore<uint32_t>(address, value);
+#endif
 }
 
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteRamFloat32(uint32_t address, double value) {
+#if defined(__APPLE__)
+    Memory::WriteFloat32(address, value);
+#else
     FlatStore<uint32_t>(address, ConvertPpcDoubleToSingleBits(value));
+#endif
 }
 
 MKW_MEMORY_FORCE_INLINE void FlatWriteRamFloat64(uint32_t address, double value) {
+#if defined(__APPLE__)
+    Memory::WriteFloat64(address, value);
+#else
     uint64_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
     FlatStore<uint64_t>(address, bits);
+#endif
 }
 
 } // namespace MemoryInline
