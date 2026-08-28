@@ -1220,9 +1220,15 @@ int RuntimeMain(int argc, char** argv) {
             const char* configName;
             AuroraBackend backend;
         };
+#if defined(__APPLE__)
+        static constexpr std::array<GraphicsBackendEntry, 2> kGraphicsBackends{{
+            {"auto", BACKEND_AUTO}, {"metal", BACKEND_METAL},
+        }};
+#else
         static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN},
         }};
+#endif
         const auto backendDisplayName = [](AuroraBackend value) -> const char* {
             for (const auto& entry : kGraphicsBackends) {
                 if (entry.backend == value) {
