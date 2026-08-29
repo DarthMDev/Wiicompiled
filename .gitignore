@@ -28,6 +28,7 @@ Code.pul
 /.build-output/
 /.build-test/
 /native-build/
+/native-build-macos/
 /dist/
 /out/
 [Bb]in/
@@ -71,4 +72,3 @@ project.lock.json
 /test_output/
 *.log
 output.txt
-

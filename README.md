@@ -63,6 +63,8 @@ inputs like paddles, touchpads and share buttons show up when the hardware repor
 - Windows 10 or 11, 64-bit
 - GPU: GTX 1650 / RX 6400 / Arc A310 or higher
 - CPU: Intel Core i5-8400 / AMD Ryzen 5 2600 (4c/6c, ~3.5GHz+) or higher
+- macOS 14 (Sonoma) or later on Apple Silicon
+- On macOS, Apple Xcode Command Line Tools (Setup opens Apple's installer when they are missing)
 - About 20 GB of free disk space during installation
 - A clean, unmodified **PAL `RMCP01`** disc image of Mario Kart Wii, dumped by you. ISO, GCM,
   GCZ, CISO, WBFS, WIA and RVZ are accepted.
@@ -83,6 +85,21 @@ For an easy experience, use [Wheel Wizard](https://github.com/TeamWheelWizard/Wh
 image under Settings, turn on **WiiCompiled (beta)**, and hit install from the Home page.
 Wheel Wizard downloads the setup tool from this repo and walks you through install, updates and
 launching. The backend itself is deliberately command-line only, Wheel Wizard is a wrapper around it.
+
+### macOS
+
+Download `WiiCompiled-Setup.pkg` from this repository's Releases page and open it. It installs
+**WiiCompiled Setup** in Applications; open that app, choose your clean PAL `RMCP01` disc image,
+and select either the base game or Retro Rewind. For Retro Rewind, choose the `RetroRewind6` folder
+or its parent folder.
+
+Setup verifies and extracts the image locally, then translates and compiles the native app on your
+Mac. On a first run it may ask macOS to install Xcode Command Line Tools; complete Apple's installer,
+then open Setup again. When the build completes, Setup asks for administrator approval once to install
+`WiiCompiled.app` (and, if selected, `RetroRewind.app`) in `/Applications`.
+
+Setup opens Terminal while it works, so the extraction and build progress—and any error that needs
+reporting—remain visible.
 
 > [!CAUTION]
 > Only take builds from this repository's

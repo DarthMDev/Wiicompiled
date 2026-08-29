@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Package version
+        required: true
+        default: v0.2.23
+        type: string
 
 permissions:
   contents: read
@@ -34,3 +40,79 @@ jobs:
 
       - name: Test
         run: dotnet test translator/Translator.sln -c Release --no-build --verbosity normal
+
+  macos_setup_package:
+    name: macOS Setup.pkg (Apple Silicon)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Verify Apple Silicon runner tools
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          xcode-select -p
+          command -v ninja
+          file "$(command -v ninja)" | grep -q arm64
+
+      - name: Build nodtool from its locked Cargo package
+        shell: bash
+        run: |
+          mkdir -p Launcher/artifacts/macos
+          if ! command -v cargo >/dev/null; then brew install rust; fi
+          cargo install --locked nodtool --root Launcher/artifacts/macos/nodtool-install
+          mv Launcher/artifacts/macos/nodtool-install/bin/nodtool Launcher/artifacts/macos/nodtool
+          chmod +x Launcher/artifacts/macos/nodtool
+          Launcher/artifacts/macos/nodtool --version
+
+      - name: Publish self-contained translator
+        shell: bash
+        run: |
+          dotnet publish translator/src/Translator.Cli/Translator.Cli.csproj \
+            -c Release -r osx-arm64 --self-contained true \
+            -p:PublishSingleFile=true \
+            -o Launcher/artifacts/macos/translator
+
+      - name: Download pinned portable CMake
+        shell: bash
+        run: |
+          cmake_version=4.4.3
+          archive="cmake-${cmake_version}-macos-universal.tar.gz"
+          base_url="https://github.com/Kitware/CMake/releases/download/v${cmake_version}"
+          curl -fsSL --retry 3 "$base_url/$archive" -o "$archive"
+          curl -fsSL --retry 3 "$base_url/cmake-${cmake_version}-SHA-256.txt" -o cmake-sha256.txt
+          grep " $archive$" cmake-sha256.txt | shasum -a 256 -c -
+          tar -xzf "$archive"
+          mv "cmake-${cmake_version}-macos-universal/CMake.app/Contents" Launcher/artifacts/macos/cmake
+
+      - name: Build Setup.pkg
+        shell: bash
+        run: |
+          mkdir -p Launcher/dist
+          Launcher/macos/build-setup-pkg.command \
+            --nodtool Launcher/artifacts/macos/nodtool \
+            --translator Launcher/artifacts/macos/translator/Translator.Cli \
+            --cmake-root Launcher/artifacts/macos/cmake \
+            --ninja "$(command -v ninja)" \
+            --output Launcher/dist/WiiCompiled-Setup.pkg \
+            --version '${{ inputs.version }}'
+
+      - name: Verify package boundary
+        shell: bash
+        run: |
+          pkgutil --check-signature Launcher/dist/WiiCompiled-Setup.pkg
+          ! pkgutil --payload-files Launcher/dist/WiiCompiled-Setup.pkg | \
+            grep -E '/(Assets|generated|PulsarPacks|WiiCompiled\\.app|RetroRewind\\.app)(/|$)'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WiiCompiled-Setup-macos-arm64
+          path: Launcher/dist/WiiCompiled-Setup.pkg
+          if-no-files-found: error
