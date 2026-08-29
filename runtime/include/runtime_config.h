@@ -56,9 +56,7 @@ struct RuntimeUserConfig {
     std::array<std::optional<std::string>, 12> controllerButtons;
     // One-based physical WUP-028 adapter port assigned to each game port.
     // Zero or a missing value means the adapter does not own that game port.
-    // A newly connected WUP-028 should be usable before the settings overlay
-    // can be opened. Explicit adapter_port_N = 0 still disables that port.
-    std::array<uint32_t, 4> gameCubeAdapterPorts{{1, 2, 3, 4}};
+    std::array<uint32_t, 4> gameCubeAdapterPorts{};
 };
 
 namespace RuntimeConfigFile {
