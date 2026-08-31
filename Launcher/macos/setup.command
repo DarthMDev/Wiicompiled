@@ -72,7 +72,23 @@ profile=base
 build_args=(--workspace "$workspace" --game "$game" --nodtool "$nodtool" --output-dir "$products")
 if [[ -n "$retro_dir" ]]; then
     profile=both
-    build_args+=(--profile both --base-output-dir "$products" --retro-rewind-package-dir "$retro_dir" --skip-retro-wfc-payload)
+    # Online play needs the shared Retro-WFC payload. Keep it in the per-user
+    # support directory rather than the packaged app or build workspace, then
+    # let Translator.Cli validate its pinned signature before it is used.
+    retro_wfc_dir="$support_root/RetroWfcPayload"
+    retro_wfc_payload="$retro_wfc_dir/binary/payload.RMCPD00.bin"
+    if [[ ! -f "$retro_wfc_payload" ]]; then
+        printf 'Downloading the Retro-WFC payload needed for online play...\n'
+        mkdir -p "$retro_wfc_dir/binary"
+        temporary_payload="$retro_wfc_payload.tmp-$$"
+        trap 'rm -f "$temporary_payload"' EXIT
+        /usr/bin/curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+            --retry 1 --output "$temporary_payload" \
+            'http://nas.play.rwfc.net/payload?g=RMCPD00' || fail 'could not download the Retro-WFC payload needed for online play'
+        mv "$temporary_payload" "$retro_wfc_payload"
+        trap - EXIT
+    fi
+    build_args+=(--profile both --base-output-dir "$products" --retro-rewind-package-dir "$retro_dir" --retro-wfc-offline-dir "$retro_wfc_dir")
 fi
 "$workspace/Launcher/local-build-macos.command" "${build_args[@]}" --profile "$profile" --cmake "$cmake_bin" --ninja "$ninja_bin" --translator-bin "$translator"
 

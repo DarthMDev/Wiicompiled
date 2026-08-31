@@ -44,13 +44,9 @@ internal static class AssemblyBlobWriter
             // C/C++ external symbols carry a leading underscore in Mach-O,
             // unlike ELF and COFF.  The generated C++ still names the symbol
             // without that ABI decoration, so emit the platform spelling here.
-            assembly.AppendLine("#ifdef __APPLE__");
-            assembly.AppendLine($".globl _{blob.Symbol}");
-            assembly.AppendLine($"_{blob.Symbol}:");
-            assembly.AppendLine("#else");
-            assembly.AppendLine($".globl {blob.Symbol}");
-            assembly.AppendLine($"{blob.Symbol}:");
-            assembly.AppendLine("#endif");
+            var assemblySymbol = OperatingSystem.IsMacOS() ? $"_{blob.Symbol}" : blob.Symbol;
+            assembly.AppendLine($".globl {assemblySymbol}");
+            assembly.AppendLine($"{assemblySymbol}:");
             var referencePath = Path.Combine(blobReferenceDirectory, blob.FileName);
             assembly.AppendLine($".incbin \"{SanitizeAssemblyPath(referencePath)}\"");
             assembly.AppendLine();
