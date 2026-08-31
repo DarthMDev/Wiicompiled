@@ -74,18 +74,28 @@ if [[ -n "$retro_dir" ]]; then
     profile=both
     # Online play needs the shared Retro-WFC payload. Keep it in the per-user
     # support directory rather than the packaged app or build workspace, then
-    # let Translator.Cli validate its pinned signature before it is used.
+    # verify its pinned signature before publishing it into the local cache.
     retro_wfc_dir="$support_root/RetroWfcPayload"
     retro_wfc_payload="$retro_wfc_dir/binary/payload.RMCPD00.bin"
+    if [[ -f "$retro_wfc_payload" ]] && ! "$translator" validate-retro-wfc-payload --directory "$retro_wfc_dir"; then
+        printf 'Discarding an invalid cached Retro-WFC payload...\n' >&2
+        rm -f "$retro_wfc_payload"
+    fi
     if [[ ! -f "$retro_wfc_payload" ]]; then
         printf 'Downloading the Retro-WFC payload needed for online play...\n'
-        mkdir -p "$retro_wfc_dir/binary"
-        temporary_payload="$retro_wfc_payload.tmp-$$"
-        trap 'rm -f "$temporary_payload"' EXIT
+        mkdir -p "$retro_wfc_dir"
+        payload_stage=$(mktemp -d "$retro_wfc_dir/.payload-download.XXXXXX")
+        temporary_payload="$payload_stage/binary/payload.RMCPD00.bin"
+        mkdir -p "$(dirname "$temporary_payload")"
+        trap 'rm -rf "$payload_stage"' EXIT
         /usr/bin/curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
             --retry 1 --output "$temporary_payload" \
             'http://nas.play.rwfc.net/payload?g=RMCPD00' || fail 'could not download the Retro-WFC payload needed for online play'
+        "$translator" validate-retro-wfc-payload --directory "$payload_stage" || \
+            fail 'downloaded Retro-WFC payload failed signature validation'
+        mkdir -p "$retro_wfc_dir/binary"
         mv "$temporary_payload" "$retro_wfc_payload"
+        rmdir "$payload_stage/binary" "$payload_stage"
         trap - EXIT
     fi
     build_args+=(--profile both --base-output-dir "$products" --retro-rewind-package-dir "$retro_dir" --retro-wfc-offline-dir "$retro_wfc_dir")
