@@ -1524,6 +1524,15 @@ std::vector<PresentationJob> encode_sealed_frame(gfx::SealedFrame& sealedFrame, 
 
 // Phase 3: hand the encoded group to whoever owns presentation.
 void publish_presentations(std::vector<PresentationJob>&& presentationJobs, bool interpolationActive) {
+#if defined(__APPLE__)
+  (void)interpolationActive;
+  // Presenting reaches SDL/AppKit, whose window operations must stay on the
+  // main thread. Interpolation normally starts the presenter worker, so keep
+  // its jobs synchronous on Apple platforms.
+  for (const auto& job : presentationJobs) {
+    present_presentation_job(job);
+  }
+#else
   // Keep presentation on the presenter whenever the async frame worker runs, even with
   // interpolation off, so every mode shares one surface/resize path. RenderDoc keeps the sync path.
   if (frame_worker_requested() || interpolationActive ||
@@ -1534,6 +1543,7 @@ void publish_presentations(std::vector<PresentationJob>&& presentationJobs, bool
       present_presentation_job(job);
     }
   }
+#endif
 }
 
 void record_frame_telemetry() {
