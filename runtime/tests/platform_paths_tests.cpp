@@ -8,12 +8,12 @@ int main() {
         return 1;
     }
 
-    const auto userData = RuntimePlatform::ApplicationDataDirectory("WiiCompiledPlatformSmoke");
-    if (userData.filename() != "WiiCompiledPlatformSmoke") {
+    const auto userData = RuntimePlatform::ApplicationDataDirectory("WiiCompiledPlatformPathsTest");
+    if (userData.filename() != "WiiCompiledPlatformPathsTest") {
         std::cerr << "application-data directory lost its application name: " << userData << '\n';
         return 1;
     }
-    if (RuntimePlatform::LogDirectory("WiiCompiledPlatformSmoke") != userData / "Logs") {
+    if (RuntimePlatform::LogDirectory("WiiCompiledPlatformPathsTest") != userData / "Logs") {
         std::cerr << "log directory is not derived from application data\n";
         return 1;
     }

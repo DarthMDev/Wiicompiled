@@ -3,6 +3,8 @@
 #include <cstdlib>
 
 namespace {
+// The worker yields twice; each return to the scheduler must preserve both
+// context identities and the worker's continuation point.
 HostContext::Handle g_scheduler = nullptr;
 HostContext::Handle g_worker = nullptr;
 int g_steps = 0;

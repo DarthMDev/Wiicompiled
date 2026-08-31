@@ -8,6 +8,8 @@ extern "C" void mkw_co_switch(void** targetSp, void** sourceSp);
 extern "C" void* mkw_co_init(void* stackTop, void (*entry)(void*), void* argument);
 
 namespace {
+// Exercise the raw AArch64 context ABI independently of HostContext so a
+// callee-saved-register or stack-frame regression is localized to this layer.
 
 std::array<std::byte, 64 * 1024> g_workerStack{};
 void* g_schedulerSp = nullptr;

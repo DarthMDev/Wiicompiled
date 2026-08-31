@@ -244,8 +244,8 @@ file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 if(MKW_PLATFORM_MACOS)
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory.cpp")
     # HostContext's Apple Silicon backend is implemented in a small assembly
-    # companion.  It must be part of the product runtime as well as the
-    # standalone smoke test; otherwise the final executable is missing
+    # companion. It must be part of the product runtime as well as the
+    # standalone context test; otherwise the final executable is missing
     # mkw_co_init/mkw_co_switch at link time.
     enable_language(ASM)
     list(APPEND SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
@@ -269,59 +269,53 @@ target_include_directories(mkw_platform PUBLIC "${CMAKE_CURRENT_LIST_DIR}/includ
 target_compile_features(mkw_platform PUBLIC cxx_std_17)
 set_target_properties(mkw_platform PROPERTIES UNITY_BUILD OFF)
 
-# Keep this independent from Aurora's BUILD_TESTING option: it is a host
-# portability gate, not a third-party test suite.
+# Keep these independent from Aurora's BUILD_TESTING option: they validate the
+# project's host-platform contracts, not Aurora's third-party test suite.
 enable_testing()
-add_executable(mkw_platform_smoke "${CMAKE_CURRENT_LIST_DIR}/tests/platform_smoke.cpp")
-target_link_libraries(mkw_platform_smoke PRIVATE mkw_platform)
-target_compile_features(mkw_platform_smoke PRIVATE cxx_std_17)
-add_test(NAME mkw_platform_smoke COMMAND mkw_platform_smoke)
+add_executable(mkw_platform_paths_tests "${CMAKE_CURRENT_LIST_DIR}/tests/platform_paths_tests.cpp")
+target_link_libraries(mkw_platform_paths_tests PRIVATE mkw_platform)
+target_compile_features(mkw_platform_paths_tests PRIVATE cxx_std_17)
+add_test(NAME mkw_platform_paths_tests COMMAND mkw_platform_paths_tests)
 
 # HostContext deliberately keeps the platform-specific context primitive out
 # of fiber_manager.cpp. Exercise the Linux libco handoff directly so future
 # refactors cannot silently remove its headers, implementation, or link edge.
 if(MKW_PLATFORM_LINUX)
-    add_executable(mkw_linux_host_context_smoke
-        "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_smoke.cpp"
+    add_executable(mkw_linux_host_context_tests
+        "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_tests.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp")
-    target_include_directories(mkw_linux_host_context_smoke PRIVATE
+    target_include_directories(mkw_linux_host_context_tests PRIVATE
         "${CMAKE_CURRENT_LIST_DIR}/include"
         "${CMAKE_CURRENT_LIST_DIR}/third_party/libco")
-    target_compile_features(mkw_linux_host_context_smoke PRIVATE cxx_std_17)
-    target_link_libraries(mkw_linux_host_context_smoke PRIVATE mkw::libco)
-    add_test(NAME mkw_linux_host_context_smoke COMMAND mkw_linux_host_context_smoke)
+    target_compile_features(mkw_linux_host_context_tests PRIVATE cxx_std_17)
+    target_link_libraries(mkw_linux_host_context_tests PRIVATE mkw::libco)
+    add_test(NAME mkw_linux_host_context_tests COMMAND mkw_linux_host_context_tests)
 endif()
 
 if(MKW_PLATFORM_MACOS)
-    # Feasibility gates for the Apple Silicon execution substrate. They are
-    # intentionally separate from translated products so they remain useful
-    # while host-portability work is in progress.
+    # Exercise the Apple Silicon context ABI and the public host-memory
+    # contracts separately from translated products.
     enable_language(ASM)
-    add_executable(mkw_macos_context_prototype
-        "${CMAKE_CURRENT_LIST_DIR}/tests/macos_context_asm_prototype.cpp"
+    add_executable(mkw_macos_context_abi_tests
+        "${CMAKE_CURRENT_LIST_DIR}/tests/macos_context_abi_tests.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
-    target_compile_features(mkw_macos_context_prototype PRIVATE cxx_std_17)
-    add_test(NAME mkw_macos_context_prototype COMMAND mkw_macos_context_prototype)
+    target_compile_features(mkw_macos_context_abi_tests PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_context_abi_tests COMMAND mkw_macos_context_abi_tests)
 
-    add_executable(mkw_macos_host_context_smoke
-        "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_smoke.cpp"
+    add_executable(mkw_macos_host_context_tests
+        "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_tests.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
-    target_include_directories(mkw_macos_host_context_smoke PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
-    target_compile_features(mkw_macos_host_context_smoke PRIVATE cxx_std_17)
-    add_test(NAME mkw_macos_host_context_smoke COMMAND mkw_macos_host_context_smoke)
+    target_include_directories(mkw_macos_host_context_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_compile_features(mkw_macos_host_context_tests PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_host_context_tests COMMAND mkw_macos_host_context_tests)
 
-    add_executable(mkw_macos_memory_prototype "${CMAKE_CURRENT_LIST_DIR}/tests/macos_memory_prototype.cpp")
-    target_include_directories(mkw_macos_memory_prototype PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
-    target_compile_features(mkw_macos_memory_prototype PRIVATE cxx_std_17)
-    add_test(NAME mkw_macos_memory_prototype COMMAND mkw_macos_memory_prototype)
-
-    add_executable(mkw_macos_guest_flat_smoke
-        "${CMAKE_CURRENT_LIST_DIR}/tests/macos_guest_flat_smoke.cpp"
+    add_executable(mkw_macos_guest_flat_memory_tests
+        "${CMAKE_CURRENT_LIST_DIR}/tests/macos_guest_flat_memory_tests.cpp"
         "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_macos.cpp")
-    target_include_directories(mkw_macos_guest_flat_smoke PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
-    target_compile_features(mkw_macos_guest_flat_smoke PRIVATE cxx_std_17)
-    add_test(NAME mkw_macos_guest_flat_smoke COMMAND mkw_macos_guest_flat_smoke)
+    target_include_directories(mkw_macos_guest_flat_memory_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    target_compile_features(mkw_macos_guest_flat_memory_tests PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_guest_flat_memory_tests COMMAND mkw_macos_guest_flat_memory_tests)
 endif()
 
 # The translator emits the complete, content-addressed source graph. Consuming
@@ -373,6 +367,6 @@ else()
             mkw::pugixml mkw::toml11 mkw::cryptopp)
         set_target_properties(mkw_macos_native_compile PROPERTIES UNITY_BUILD OFF)
     endif()
-    add_custom_target(mkw_configure_smoke DEPENDS mkw_platform)
+    add_custom_target(mkw_platform_paths_check DEPENDS mkw_platform)
     message(STATUS "Translated product targets disabled (MKW_BUILD_PRODUCTS=OFF)")
 endif()
