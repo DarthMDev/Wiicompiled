@@ -69,8 +69,14 @@ bool IsActive();
 // configuration, guest-view page protection cannot safely represent per-Wii-
 // page MMIO, deferred-read, or executable-write state, so general translated
 // accesses must use the checked Memory::* path.
+#if defined(_WIN32)
+// Windows user-mode pages are always 4 KiB, so make this a compile-time false
+// value. It appears in every flat access and must not become a hot-path load.
+inline constexpr bool RequiresCheckedAccess() noexcept { return false; }
+#else
 extern bool g_requiresCheckedAccess;
 inline bool RequiresCheckedAccess() noexcept { return g_requiresCheckedAccess; }
+#endif
 
 // Reserves the 4 GiB space (once per process) and maps every requested region
 // into both views. Throws std::runtime_error with a precise diagnosis when the

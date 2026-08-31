@@ -36,7 +36,9 @@
 #endif
 
 namespace GuestFlat {
+#if !defined(_WIN32)
 bool g_requiresCheckedAccess = false;
+#endif
 namespace {
 
 #if defined(_WIN32)
@@ -49,17 +51,15 @@ constexpr DWORD kMemPreservePlaceholder = 0x00000002;
 constexpr size_t kAllocationGranularity = 0x10000;  // 64 KiB
 constexpr size_t kHostPageSize = 0x1000;
 
+// Windows user-mode pages are unconditionally 4 KiB. Only platforms that can
+// expose a larger host page need to discover their size at runtime.
+#if !defined(_WIN32)
 size_t HostPageSize()
 {
-#if defined(_WIN32)
-    SYSTEM_INFO info{};
-    GetSystemInfo(&info);
-    return info.dwPageSize;
-#else
     const long size = sysconf(_SC_PAGESIZE);
     return size > 0 ? static_cast<size_t>(size) : kGuestPageSize;
-#endif
 }
+#endif
 
 // Named, platform-neutral protection modes so every fault-interception call site below (the
 // MMIO window, the executable-write guard, deferred-EFB-read protection, the on-demand
@@ -510,7 +510,9 @@ bool IsActive() {
 void Initialize(const std::vector<RegionRequest>& regions) {
     std::lock_guard<std::mutex> lock(StateMutex());
 
+#if !defined(_WIN32)
     g_requiresCheckedAccess = HostPageSize() > kGuestPageSize;
+#endif
 
     if (g_initialized) {
         if (!SameLayout(g_activeRegions, regions)) {
