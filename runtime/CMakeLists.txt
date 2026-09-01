@@ -5,17 +5,34 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" OR NOT CMAKE_SIZEOF_
     message(FATAL_ERROR "WiiCompiled requires a 64-bit Clang toolchain")
 endif()
 
-if(WIN32 AND MINGW AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+# CMake keeps CMAKE_SYSTEM_PROCESSOR set to the build host for a macOS
+# cross-architecture build. The compiler does honor CMAKE_OSX_ARCHITECTURES, so
+# select the product architecture from that one-item target list when present.
+set(MKW_TARGET_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    list(LENGTH CMAKE_OSX_ARCHITECTURES MKW_OSX_ARCHITECTURE_COUNT)
+    if(NOT MKW_OSX_ARCHITECTURE_COUNT EQUAL 1)
+        message(FATAL_ERROR
+            "WiiCompiled currently builds one native macOS architecture at a time; "
+            "configure separate arm64 and x86_64 build directories")
+    endif()
+    list(GET CMAKE_OSX_ARCHITECTURES 0 MKW_TARGET_PROCESSOR)
+endif()
+
+if(WIN32 AND MINGW AND MKW_TARGET_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     set(MKW_PLATFORM_WINDOWS TRUE)
-elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|ARM64)$")
-    # The first native macOS target is Apple Silicon. Intel and universal
-    # binaries remain future compatibility work; do not silently claim them.
+elseif(APPLE AND MKW_TARGET_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|arm64|ARM64)$")
     set(MKW_PLATFORM_MACOS TRUE)
-elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|aarch64|arm64|ARM64)$")
+    if(MKW_TARGET_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+        set(MKW_PLATFORM_MACOS_X86_64 TRUE)
+    else()
+        set(MKW_PLATFORM_MACOS_ARM64 TRUE)
+    endif()
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND MKW_TARGET_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|aarch64|arm64|ARM64)$")
     set(MKW_PLATFORM_LINUX TRUE)
 else()
     message(FATAL_ERROR
-        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS arm64")
+        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS x86_64/arm64")
 endif()
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     message(FATAL_ERROR "WiiCompiled only supports Release builds")
@@ -59,14 +76,15 @@ target_include_directories(mkw_pugixml PUBLIC third_party/pugixml)
 target_compile_features(mkw_pugixml PUBLIC cxx_std_17)
 set_target_properties(mkw_pugixml PROPERTIES UNITY_BUILD OFF)
 
-# Linux guest-fiber scheduling (runtime/src/host_context.cpp) needs a symmetric
+# POSIX x86-64 guest-fiber scheduling (runtime/src/host_context.cpp) needs a symmetric
 # stackful-coroutine primitive to stand in for Win32 Fibers. libco's co_switch() transfers
 # directly to any other created coroutine, matching SwitchToFiber's semantics exactly (unlike
 # asymmetric resume/yield coroutine libraries, which would need every call site restructured).
 # Vendored from upstream (higan-emu/libco @ e18e09d, 2019-10-16, ISC license; valgrind.h is
-# separately BSD-style licensed, see third_party/libco/LICENSE). Windows keeps native Fibers
-# and macOS uses the project's x18-safe AArch64 assembly backend, so this target is Linux-only.
-if(MKW_PLATFORM_LINUX)
+# separately BSD-style licensed, see third_party/libco/LICENSE). Windows keeps native Fibers;
+# Apple Silicon uses the project's x18-safe AArch64 assembly backend, while Intel macOS uses
+# libco's existing System V AMD64 backend.
+if(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
     add_library(mkw_libco STATIC third_party/libco/libco.c)
     add_library(mkw::libco ALIAS mkw_libco)
     target_include_directories(mkw_libco PUBLIC third_party/libco)
@@ -243,12 +261,14 @@ endif()
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS "src/*.cpp")
 if(MKW_PLATFORM_MACOS)
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory.cpp")
-    # HostContext's Apple Silicon backend is implemented in a small assembly
-    # companion. It must be part of the product runtime as well as the
-    # standalone context test; otherwise the final executable is missing
-    # mkw_co_init/mkw_co_switch at link time.
-    enable_language(ASM)
-    list(APPEND SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
+    if(MKW_PLATFORM_MACOS_ARM64)
+        # HostContext's Apple Silicon backend is implemented in a small assembly
+        # companion. It must be part of the product runtime as well as the
+        # standalone context test; otherwise the final executable is missing
+        # mkw_co_init/mkw_co_switch at link time.
+        enable_language(ASM)
+        list(APPEND SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
+    endif()
 else()
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_macos.cpp")
 endif()
@@ -293,20 +313,31 @@ if(MKW_PLATFORM_LINUX)
 endif()
 
 if(MKW_PLATFORM_MACOS)
-    # Exercise the Apple Silicon context ABI and the public host-memory
-    # contracts separately from translated products.
-    enable_language(ASM)
-    add_executable(mkw_macos_context_abi_tests
-        "${CMAKE_CURRENT_LIST_DIR}/tests/macos_context_abi_tests.cpp"
-        "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
-    target_compile_features(mkw_macos_context_abi_tests PRIVATE cxx_std_17)
-    add_test(NAME mkw_macos_context_abi_tests COMMAND mkw_macos_context_abi_tests)
+    # Exercise the public host-memory contracts separately from translated products.
+    if(MKW_PLATFORM_MACOS_ARM64)
+        # Apple Silicon's context ABI is implemented by the local assembly backend.
+        enable_language(ASM)
+        add_executable(mkw_macos_context_abi_tests
+            "${CMAKE_CURRENT_LIST_DIR}/tests/macos_context_abi_tests.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
+        target_compile_features(mkw_macos_context_abi_tests PRIVATE cxx_std_17)
+        add_test(NAME mkw_macos_context_abi_tests COMMAND mkw_macos_context_abi_tests)
 
-    add_executable(mkw_macos_host_context_tests
-        "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_tests.cpp"
-        "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp"
-        "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
-    target_include_directories(mkw_macos_host_context_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+        add_executable(mkw_macos_host_context_tests
+            "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_tests.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
+        target_include_directories(mkw_macos_host_context_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+    else()
+        # Intel macOS follows the same System V AMD64 libco path as Linux.
+        add_executable(mkw_macos_host_context_tests
+            "${CMAKE_CURRENT_LIST_DIR}/tests/host_context_tests.cpp"
+            "${CMAKE_CURRENT_LIST_DIR}/src/host_context.cpp")
+        target_include_directories(mkw_macos_host_context_tests PRIVATE
+            "${CMAKE_CURRENT_LIST_DIR}/include"
+            "${CMAKE_CURRENT_LIST_DIR}/third_party/libco")
+        target_link_libraries(mkw_macos_host_context_tests PRIVATE mkw::libco)
+    endif()
     target_compile_features(mkw_macos_host_context_tests PRIVATE cxx_std_17)
     add_test(NAME mkw_macos_host_context_tests COMMAND mkw_macos_host_context_tests)
 
@@ -365,6 +396,13 @@ else()
         target_link_libraries(mkw_macos_native_compile PRIVATE
             aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx
             mkw::pugixml mkw::toml11 mkw::cryptopp)
+        if(MKW_PLATFORM_MACOS_X86_64)
+            target_link_libraries(mkw_macos_native_compile PRIVATE mkw::libco)
+            # Keep this compile-only audit on the same Haswell-era x86-64-v3
+            # baseline as the translated product. PPC paired FMA helpers use
+            # FMA intrinsics and intentionally cannot compile for plain x86-64.
+            target_compile_options(mkw_macos_native_compile PRIVATE -march=x86-64-v3)
+        endif()
         set_target_properties(mkw_macos_native_compile PROPERTIES UNITY_BUILD OFF)
     endif()
     add_custom_target(mkw_platform_paths_check DEPENDS mkw_platform)

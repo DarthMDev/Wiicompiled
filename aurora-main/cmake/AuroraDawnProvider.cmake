@@ -39,16 +39,28 @@ function(_aurora_dawn_set_platform_backends)
   endif ()
 endfunction()
 
+# CMAKE_SYSTEM_PROCESSOR names the build host for a macOS cross-architecture
+# build. Aurora consumes target binaries, so use CMAKE_OSX_ARCHITECTURES when
+# CMake was configured for one explicit target architecture.
+set(_aurora_dawn_processor "${CMAKE_SYSTEM_PROCESSOR}")
+if (APPLE AND CMAKE_OSX_ARCHITECTURES)
+  list(LENGTH CMAKE_OSX_ARCHITECTURES _aurora_dawn_arch_count)
+  if (NOT _aurora_dawn_arch_count EQUAL 1)
+    message(FATAL_ERROR "aurora requires one macOS architecture per build directory")
+  endif ()
+  list(GET CMAKE_OSX_ARCHITECTURES 0 _aurora_dawn_processor)
+endif ()
+
 # ── Auto: resolve provider based on platform availability ──
 set(_aurora_dawn_provider "${AURORA_DAWN_PROVIDER}")
 if (_aurora_dawn_provider STREQUAL "auto")
   # Prebuilt Dawn packages available for: windows-{amd64,arm64}, linux-{x86_64,aarch64}, darwin-{arm64,x86_64}
   set(_has_package FALSE)
-  if (WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64|ARM64|aarch64)$")
+  if (WIN32 AND _aurora_dawn_processor MATCHES "^(AMD64|x86_64|ARM64|aarch64)$")
     set(_has_package TRUE)
-  elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|aarch64)$")
+  elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux" AND _aurora_dawn_processor MATCHES "^(x86_64|aarch64)$")
     set(_has_package TRUE)
-  elseif (APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|x86_64)$")
+  elseif (APPLE AND _aurora_dawn_processor MATCHES "^(arm64|x86_64)$")
     set(_has_package TRUE)
   endif ()
 
@@ -142,7 +154,7 @@ elseif (_aurora_dawn_provider STREQUAL "package")
   # ── Package: download prebuilt Dawn install tree ──
   if (NOT AURORA_DAWN_PACKAGE_URL)
     string(TOLOWER "${CMAKE_SYSTEM_NAME}" _dawn_system)
-    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" _dawn_arch)
+    string(TOLOWER "${_aurora_dawn_processor}" _dawn_arch)
     if (_dawn_system STREQUAL "windows")
       if (_dawn_arch STREQUAL "x86_64")
         set(_dawn_arch "amd64")

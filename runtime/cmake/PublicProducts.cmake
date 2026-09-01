@@ -84,9 +84,9 @@ target_link_libraries(mkw_runtime_common PRIVATE
 target_link_libraries(mkw_runtime_common PRIVATE mkw_platform mkw::pugixml mkw::toml11 mkw::cryptopp)
 if(MKW_PLATFORM_WINDOWS)
     target_link_libraries(mkw_runtime_common PRIVATE shell32 windowsapp)
-elseif(MKW_PLATFORM_LINUX)
+elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
     # ${CMAKE_DL_LIBS} for music_attenuation.cpp's dlopen of libdbus-1 (MPRIS
-    # media monitoring). Empty string on glibc >= 2.34 where dl* is in libc.
+    # media monitoring). Empty on platforms where dl* is already in libc/libSystem.
     target_link_libraries(mkw_runtime_common PRIVATE mkw::libco ${CMAKE_DL_LIBS})
 endif()
 if(MKW_CPPWINRT_INCLUDE_DIR)
@@ -136,7 +136,7 @@ mkw_apply_common_compile_options(mkw_runtime_common)
 # this object deliberately keeps the plain baseline ISA and checks the CPU
 # before any AVX2/FMA code can execute. AArch64 has no equivalent optional ISA
 # floor to probe: NEON/FMA are architectural requirements.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+if(MKW_TARGET_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     add_library(mkw_cpu_baseline OBJECT "${MKW_CPU_BASELINE_SOURCE}")
     target_compile_features(mkw_cpu_baseline PRIVATE cxx_std_17)
     set_target_properties(mkw_cpu_baseline PROPERTIES UNITY_BUILD OFF)
@@ -181,7 +181,7 @@ function(mkw_configure_product target)
     target_sources(${target} PRIVATE $<TARGET_OBJECTS:mkw_runtime_common>)
     # Startup CPU check. Must stay a separate object library so it keeps the
     # plain baseline ISA while everything around it is built for x86-64-v3.
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+    if(MKW_TARGET_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
         target_sources(${target} PRIVATE $<TARGET_OBJECTS:mkw_cpu_baseline>)
     endif()
     target_include_directories(${target} PRIVATE
@@ -226,7 +226,7 @@ function(mkw_configure_product target)
             dbghelp user32 winmm ws2_32 iphlpapi secur32 crypt32 windowsapp)
 
         set_target_properties(${target} PROPERTIES WIN32_EXECUTABLE TRUE)
-    elseif(MKW_PLATFORM_LINUX)
+    elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
         # mkw_runtime_common is an OBJECT library: WiiCompiled/RetroRewind only pull in its .o
         # files via $<TARGET_OBJECTS:>, which does not propagate mkw_runtime_common's own
         # target_link_libraries (object libraries don't carry usage requirements to a consumer
@@ -317,9 +317,9 @@ endif()
 # object above checks. AArch64 builds are compiled locally for the host that
 # will run them, so both Linux and Apple Silicon use the compiler's native CPU
 # tuning rather than leaving target-specific performance on the table.
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+if(MKW_TARGET_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     set(MKW_BASELINE_ARCH_FLAG -march=x86-64-v3)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+elseif(MKW_TARGET_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     set(MKW_BASELINE_ARCH_FLAG -mcpu=native)
 else()
     set(MKW_BASELINE_ARCH_FLAG "")
