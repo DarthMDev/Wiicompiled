@@ -5,28 +5,36 @@ set -euo pipefail
 fail() { printf 'publish-app.command: error: %s\n' "$*" >&2; exit 1; }
 usage() {
     cat <<'EOF'
-Usage: publish-app.command --build-dir DIR --product {WiiCompiled|RetroRewind} --output-dir DIR
+Usage: publish-app.command --build-dir DIR --product {WiiCompiled|RetroRewind} --output-dir DIR [options]
 
 Copies a locally built product and its runtime assets into OUTPUT-DIR/<product>.app.
 It bundles non-system dylibs, rewrites their install names, and ad-hoc signs the
 result. This is suitable for local use; a release must replace ad-hoc signing
 with the project's Developer ID signing and notarization process.
+
+  --architecture {arm64|x86_64}       Required architecture of the compiled product (default: host)
+  --minimum-system-version VERSION    App bundle minimum macOS version (default: 12.0)
 EOF
 }
 
-build_dir=""; product=""; output_dir=""
+build_dir=""; product=""; output_dir=""; architecture=$(uname -m); minimum_system_version=12.0
 while (($#)); do
     case "$1" in
         --build-dir) build_dir=${2:-}; shift 2 ;;
         --product) product=${2:-}; shift 2 ;;
         --output-dir) output_dir=${2:-}; shift 2 ;;
+        --architecture) architecture=${2:-}; shift 2 ;;
+        --minimum-system-version) minimum_system_version=${2:-}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown option: $1" ;;
     esac
 done
 [[ "$product" == WiiCompiled || "$product" == RetroRewind ]] || fail '--product must be WiiCompiled or RetroRewind'
-for tool in codesign ditto install_name_tool otool; do command -v "$tool" >/dev/null || fail "required macOS tool is unavailable: $tool"; done
+[[ "$architecture" == arm64 || "$architecture" == x86_64 ]] || fail '--architecture must be arm64 or x86_64'
+[[ "$minimum_system_version" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || fail '--minimum-system-version must contain two or three period-separated integers'
+for tool in codesign ditto install_name_tool lipo otool; do command -v "$tool" >/dev/null || fail "required macOS tool is unavailable: $tool"; done
 [[ -x "$build_dir/$product" ]] || fail "missing compiled product: $build_dir/$product"
+lipo -verify_arch "$architecture" "$build_dir/$product" || fail "compiled product is not $architecture: $build_dir/$product"
 for asset in dsp_coef.bin initial_pipeline_cache.db wii_bootstrap; do [[ -e "$build_dir/$asset" ]] || fail "missing runtime asset: $build_dir/$asset"; done
 
 app="$output_dir/$product.app"
@@ -47,7 +55,7 @@ cat > "$app/Contents/Info.plist" <<EOF
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSMinimumSystemVersion</key><string>$minimum_system_version</string>
   <key>NSHighResolutionCapable</key><true/>
 </dict></plist>
 EOF

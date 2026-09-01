@@ -1,4 +1,13 @@
 ﻿cmake_minimum_required(VERSION 3.16)
+
+# Dawn's pinned macOS artifacts target 12.0. Set the same floor before project()
+# initializes the Apple toolchain so direct developer CMake invocations cannot
+# accidentally inherit the running SDK's deployment version. This cache entry
+# is harmless on non-Apple platforms and remains overridable by a caller.
+if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING
+        "Minimum macOS version supported by WiiCompiled" FORCE)
+endif()
 project(mkw_recompiled)
 
 if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
