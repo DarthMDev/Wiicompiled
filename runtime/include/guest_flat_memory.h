@@ -69,9 +69,15 @@ bool IsActive();
 // configuration, guest-view page protection cannot safely represent per-Wii-
 // page MMIO, deferred-read, or executable-write state, so general translated
 // accesses must use the checked Memory::* path.
-#if defined(_WIN32)
-// Windows user-mode pages are always 4 KiB, so make this a compile-time false
-// value. It appears in every flat access and must not become a hot-path load.
+// Windows user mode and x86-64 always use a 4 KiB base page, so those builds
+// fold this to a compile-time false: it appears in every flat access and must
+// not become a hot-path load. Only AArch64, where the page size is a kernel
+// configuration (4/16/64 KiB), has to probe it at runtime.
+#if defined(_WIN32) || defined(__x86_64__)
+#define MKW_GUEST_FLAT_FIXED_PAGE_SIZE 1
+#endif
+
+#if defined(MKW_GUEST_FLAT_FIXED_PAGE_SIZE)
 inline constexpr bool RequiresCheckedAccess() noexcept { return false; }
 #else
 extern bool g_requiresCheckedAccess;
