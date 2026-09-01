@@ -8,6 +8,12 @@ name: Package installers
 # which is proprietary and not present in this repository or in CI.
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Package version
+        required: true
+        default: 0.2.23
+        type: string
 
 permissions:
   contents: read
@@ -74,5 +80,87 @@ jobs:
         with:
           name: WiiCompiled-Setup-windows-x64
           path: Launcher/dist/WiiCompiled-Setup.exe
+          if-no-files-found: error
+          archive: false
+
+  macos-setup-package:
+    name: macOS (Setup.pkg, Apple Silicon)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Verify Apple Silicon runner tools
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          xcode-select -p
+          command -v ninja
+          file "$(command -v ninja)" | grep -q arm64
+
+      - name: Download pinned nodtool release
+        shell: bash
+        run: |
+          mkdir -p Launcher/artifacts/macos
+          nodtool_version=v2.0.0-alpha.10
+          nodtool_asset=nodtool-macos-arm64
+          nodtool_sha256=e23ca466999b720c55e6d29c9683fce8cc74451ba64ead2e543d50129f24528a
+          curl -fsSL --retry 3 \
+            "https://github.com/encounter/nod/releases/download/${nodtool_version}/${nodtool_asset}" \
+            -o Launcher/artifacts/macos/nodtool
+          printf '%s  %s\n' "$nodtool_sha256" Launcher/artifacts/macos/nodtool | shasum -a 256 -c -
+          chmod +x Launcher/artifacts/macos/nodtool
+          Launcher/artifacts/macos/nodtool --version
+
+      - name: Publish self-contained translator
+        shell: bash
+        run: |
+          dotnet publish translator/src/Translator.Cli/Translator.Cli.csproj \
+            -c Release -r osx-arm64 --self-contained true \
+            -p:PublishSingleFile=true \
+            -o Launcher/artifacts/macos/translator
+
+      - name: Download pinned portable CMake
+        shell: bash
+        run: |
+          cmake_version=4.4.3
+          archive="cmake-${cmake_version}-macos-universal.tar.gz"
+          base_url="https://github.com/Kitware/CMake/releases/download/v${cmake_version}"
+          expected_sha256=0c5d65251c14cc884bfa16bdbed3c263ce5bffe2e21c0d0d00962cb0610464fa
+          curl -fsSL --retry 3 "$base_url/$archive" -o "$archive"
+          printf '%s  %s\n' "$expected_sha256" "$archive" | shasum -a 256 -c -
+          tar -xzf "$archive"
+          mv "cmake-${cmake_version}-macos-universal/CMake.app/Contents" Launcher/artifacts/macos/cmake
+
+      - name: Build Setup.pkg
+        env:
+          PACKAGE_VERSION: ${{ inputs.version }}
+        shell: bash
+        run: |
+          mkdir -p Launcher/dist
+          Launcher/macos/build-setup-pkg.command \
+            --nodtool Launcher/artifacts/macos/nodtool \
+            --translator Launcher/artifacts/macos/translator/Translator.Cli \
+            --cmake-root Launcher/artifacts/macos/cmake \
+            --ninja "$(command -v ninja)" \
+            --output Launcher/dist/WiiCompiled-Setup.pkg \
+            --version "$PACKAGE_VERSION"
+
+      - name: Verify package boundary
+        shell: bash
+        run: |
+          pkgutil --check-signature Launcher/dist/WiiCompiled-Setup.pkg
+          ! pkgutil --payload-files Launcher/dist/WiiCompiled-Setup.pkg | \
+            grep -E '/(Assets|generated|PulsarPacks|WiiCompiled\\.app|RetroRewind\\.app)(/|$)'
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: WiiCompiled-Setup-macos-arm64
+          path: Launcher/dist/WiiCompiled-Setup.pkg
           if-no-files-found: error
           archive: false
