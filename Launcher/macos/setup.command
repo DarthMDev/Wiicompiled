@@ -5,10 +5,7 @@ set -euo pipefail
 
 resources=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 workspace_source="$resources/workspace"
-nodtool="$resources/tools/nodtool"
-translator="$resources/tools/Translator.Cli"
 cmake_bin="$resources/tools/cmake/bin/cmake"
-ninja_bin="$resources/tools/ninja"
 support_root="$HOME/Library/Application Support/WiiCompiled"
 workspace="$support_root/BuildWorkspace"
 products="$support_root/Products"
@@ -38,6 +35,10 @@ done
 
 host_arch=$(uname -m)
 case "$host_arch" in arm64|x86_64) ;; *) fail "unsupported macOS architecture: $host_arch" ;; esac
+host_tools="$resources/tools/$host_arch"
+nodtool="$host_tools/nodtool"
+translator="$host_tools/Translator.Cli"
+ninja_bin="$host_tools/ninja"
 
 if [[ -z "$game" ]]; then
     game=$(/usr/bin/osascript <<'APPLESCRIPT'
