@@ -16,13 +16,40 @@ function(aurora_find_package_global)
   set(CMAKE_FIND_PACKAGE_TARGETS_GLOBAL ${_PREV_FIND_PACKAGE_TARGETS_GLOBAL})
 endfunction()
 
+# A macOS cross-architecture configure on an Apple Silicon maintainer machine
+# can otherwise discover arm64 Homebrew libraries and put them on an x86_64
+# link line. Use Aurora's pinned FetchContent dependencies in that situation;
+# a native configure may still use an explicitly installed system package.
+set(AURORA_ALLOW_SYSTEM_PACKAGES TRUE)
+if (APPLE AND CMAKE_OSX_ARCHITECTURES)
+  list(LENGTH CMAKE_OSX_ARCHITECTURES _AURORA_OSX_ARCH_COUNT)
+  if (_AURORA_OSX_ARCH_COUNT EQUAL 1)
+    list(GET CMAKE_OSX_ARCHITECTURES 0 _AURORA_TARGET_ARCH)
+    string(TOLOWER "${_AURORA_TARGET_ARCH}" _AURORA_TARGET_ARCH)
+    string(TOLOWER "${CMAKE_HOST_SYSTEM_PROCESSOR}" _AURORA_HOST_ARCH)
+    if ((_AURORA_TARGET_ARCH STREQUAL "x86_64" AND _AURORA_HOST_ARCH MATCHES "^(arm64|aarch64)$") OR
+        (_AURORA_TARGET_ARCH MATCHES "^(arm64|aarch64)$" AND _AURORA_HOST_ARCH MATCHES "^(x86_64|amd64)$"))
+      set(AURORA_ALLOW_SYSTEM_PACKAGES FALSE)
+      message(STATUS "aurora: cross-architecture macOS build; avoiding host-installed dependencies")
+    endif ()
+  endif ()
+endif ()
+
 if (AURORA_ENABLE_GX)
   include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/AuroraDawnProvider.cmake)
 endif ()
 
+# SDL otherwise discovers Homebrew libusb on Apple Silicon while configuring an
+# x86_64 build. macOS does not need libusb for the supported SDL input paths,
+# and a thin target cannot link the host-only dylib.
+if (NOT AURORA_ALLOW_SYSTEM_PACKAGES)
+  set(SDL_HIDAPI_LIBUSB OFF CACHE BOOL "" FORCE)
+  set(SDL_HIDAPI_LIBUSB_SHARED OFF CACHE BOOL "" FORCE)
+endif ()
+
 # Abseil is needed for core libraries. It normally comes via Dawn's vendor build.
 # Otherwise prefer a system package and only fetch it as a last resort.
-if (NOT TARGET absl::flat_hash_map OR NOT TARGET absl::btree)
+if (AURORA_ALLOW_SYSTEM_PACKAGES AND (NOT TARGET absl::flat_hash_map OR NOT TARGET absl::btree))
   aurora_find_package_global(absl CONFIG QUIET GLOBAL)
 endif ()
 
@@ -98,7 +125,7 @@ if (MINGW AND TARGET fmt)
 endif ()
 
 if (AURORA_ENABLE_GX)
-  if (NOT TARGET ZLIB::ZLIB)
+  if (AURORA_ALLOW_SYSTEM_PACKAGES AND NOT TARGET ZLIB::ZLIB)
     aurora_find_package_global(ZLIB QUIET)
   endif ()
   if (NOT TARGET ZLIB::ZLIB)
@@ -139,7 +166,7 @@ if (AURORA_ENABLE_GX)
       add_library(PNG::PNG ALIAS png_shared)
     elseif (TARGET png_static)
       add_library(PNG::PNG ALIAS png_static)
-    else ()
+    elseif (AURORA_ALLOW_SYSTEM_PACKAGES)
       aurora_find_package_global(PNG QUIET)
     endif ()
   endif ()
@@ -167,7 +194,9 @@ if (AURORA_ENABLE_GX)
     message(STATUS "aurora: Using existing libpng")
   endif ()
 
-  aurora_find_package_global(Freetype QUIET)
+  if (AURORA_ALLOW_SYSTEM_PACKAGES)
+    aurora_find_package_global(Freetype QUIET)
+  endif ()
   if (NOT TARGET Freetype::Freetype)
     message(STATUS "aurora: Fetching Freetype")
     set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
