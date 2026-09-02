@@ -12,9 +12,12 @@ usage() {
 Usage: build-setup-pkg.command --nodtool PATH --translator PATH --cmake-root DIR --ninja PATH --output PKG [options]
 
 Creates a game-code-free WiiCompiled Setup.pkg. The supplied tools must be
-maintainer-verified, redistributable macOS arm64 artifacts. The resulting pkg
-is unsigned unless --installer-identity is supplied; releases should sign and
-notarize it with a Developer ID Installer certificate.
+maintainer-verified, redistributable universal2 macOS artifacts: each must
+contain both arm64 and x86_64 slices. The setup package runs those tools
+natively on either supported host while the game itself is compiled locally
+for that host architecture. The resulting pkg is unsigned unless
+--installer-identity is supplied; releases should sign and notarize it with a
+Developer ID Installer certificate.
 
   --workspace DIR             Repository root (default: script's grandparent)
   --version VERSION           Bundle/package version (default: 0.1.0)
@@ -42,11 +45,20 @@ version=${version#v}
 [[ "$version" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || fail '--version must contain one to three period-separated integers'
 IFS=. read -r version_major version_minor version_patch <<< "$version"
 short_version="$version_major.${version_minor:-0}.${version_patch:-0}"
-for tool in pkgbuild productbuild ditto codesign; do command -v "$tool" >/dev/null || fail "required macOS tool unavailable: $tool"; done
+for tool in pkgbuild productbuild ditto codesign lipo; do command -v "$tool" >/dev/null || fail "required macOS tool unavailable: $tool"; done
 [[ -x "$nodtool" ]] || fail '--nodtool must name an executable'
 [[ -x "$translator" ]] || fail '--translator must name an executable'
 [[ -x "$cmake_root/bin/cmake" ]] || fail '--cmake-root must contain bin/cmake'
 [[ -x "$ninja" ]] || fail '--ninja must name an executable'
+require_universal2() {
+    local artifact=$1 label=$2
+    lipo "$artifact" -verify_arch arm64 x86_64 >/dev/null 2>&1 || \
+        fail "$label must contain arm64 and x86_64 slices: $artifact"
+}
+require_universal2 "$nodtool" '--nodtool'
+require_universal2 "$translator" '--translator'
+require_universal2 "$cmake_root/bin/cmake" '--cmake-root/bin/cmake'
+require_universal2 "$ninja" '--ninja'
 "$nodtool" --version >/dev/null || fail '--nodtool did not run successfully'
 workspace=$(cd "$workspace" && pwd); output=$(cd "$(dirname "$output")" && pwd)/$(basename "$output")
 stage=$(mktemp -d "${TMPDIR:-/tmp}/wiicompiled-pkg.XXXXXX")
@@ -64,7 +76,7 @@ cat > "$app/Contents/Info.plist" <<EOF
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>$short_version</string>
 <key>CFBundleVersion</key><string>$version</string>
-<key>LSMinimumSystemVersion</key><string>14.0</string>
+<key>LSMinimumSystemVersion</key><string>12.0</string>
 </dict></plist>
 EOF
 cat > "$app/Contents/MacOS/WiiCompiledSetup" <<'EOF'

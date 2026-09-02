@@ -34,7 +34,7 @@ done
 [[ "$minimum_system_version" =~ ^[0-9]+(\.[0-9]+){1,2}$ ]] || fail '--minimum-system-version must contain two or three period-separated integers'
 for tool in codesign ditto install_name_tool lipo otool; do command -v "$tool" >/dev/null || fail "required macOS tool is unavailable: $tool"; done
 [[ -x "$build_dir/$product" ]] || fail "missing compiled product: $build_dir/$product"
-lipo -verify_arch "$architecture" "$build_dir/$product" || fail "compiled product is not $architecture: $build_dir/$product"
+lipo "$build_dir/$product" -verify_arch "$architecture" || fail "compiled product is not $architecture: $build_dir/$product"
 for asset in dsp_coef.bin initial_pipeline_cache.db wii_bootstrap; do [[ -e "$build_dir/$asset" ]] || fail "missing runtime asset: $build_dir/$asset"; done
 
 app="$output_dir/$product.app"
