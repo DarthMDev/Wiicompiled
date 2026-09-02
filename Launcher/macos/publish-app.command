@@ -65,17 +65,45 @@ for asset in dsp_coef.bin initial_pipeline_cache.db wii_bootstrap; do
     ln -s "../Resources/$asset" "$macos/$asset"
 done
 
-# Build a closure of Homebrew dylibs. System libraries remain system references.
+# Resolve a non-system dependency from the build product's rpaths. This covers
+# both traditional Homebrew dylibs and the vendored dylibs CMake emits under
+# the local build directory for a cross-architecture build.
+dependency_path() {
+    local current=$1 dependency=$2 name rpath candidate
+    case "$dependency" in
+        /opt/homebrew/*|/usr/local/*)
+            [[ -f "$dependency" ]] && { printf '%s\n' "$dependency"; return 0; }
+            ;;
+        @rpath/*)
+            name=${dependency##*/}
+            while IFS= read -r rpath; do
+                case "$rpath" in
+                    @loader_path/*) rpath="$(dirname "$current")/${rpath#@loader_path/}" ;;
+                    @executable_path/*) rpath="$macos/${rpath#@executable_path/}" ;;
+                esac
+                candidate="$rpath/$name"
+                [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+            done < <(otool -l "$current" | awk '/LC_RPATH/{rpath = 1; next} rpath && /path / { print $2; rpath = 0 }')
+            ;;
+        @loader_path/*)
+            candidate="$(dirname "$current")/${dependency#@loader_path/}"
+            [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+            ;;
+    esac
+    return 1
+}
+
+# Build a closure of non-system dylibs. System libraries remain system
+# references, while every resolved dependency is copied beside the executable.
 queue=("$macos/$product")
 while ((${#queue[@]})); do
     current=${queue[0]}
     queue=("${queue[@]:1}")
     while IFS= read -r dependency; do
-        [[ "$dependency" == /opt/homebrew/* || "$dependency" == /usr/local/* ]] || continue
-        [[ -f "$dependency" ]] || continue
+        dependency_path=$(dependency_path "$current" "$dependency") || continue
         name=$(basename "$dependency")
         if [[ ! -f "$frameworks/$name" ]]; then
-            ditto "$dependency" "$frameworks/$name"
+            ditto "$dependency_path" "$frameworks/$name"
             install_name_tool -id "@rpath/$name" "$frameworks/$name"
             queue+=("$frameworks/$name")
         fi
@@ -83,7 +111,6 @@ while ((${#queue[@]})); do
 done
 while IFS= read -r binary; do
     while IFS= read -r old; do
-        [[ "$old" == /opt/homebrew/* || "$old" == /usr/local/* ]] || continue
         name=$(basename "$old")
         [[ -f "$frameworks/$name" ]] || continue
         if [[ "$binary" == "$macos/$product" ]]; then
