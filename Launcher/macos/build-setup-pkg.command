@@ -9,13 +9,13 @@ fail() { printf 'build-setup-pkg.command: error: %s\n' "$*" >&2; exit 1; }
 copy_clean() { DITTONORSRC=1 ditto --norsrc --noqtn "$@"; }
 usage() {
     cat <<'EOF'
-Usage: build-setup-pkg.command --nodtool PATH --translator PATH --cmake-root DIR --ninja PATH --output PKG [options]
+Usage: build-setup-pkg.command --nodtool-arm64 PATH --nodtool-x86_64 PATH --translator-arm64 PATH --translator-x86_64 PATH --cmake-root DIR --ninja-arm64 PATH --ninja-x86_64 PATH --output PKG [options]
 
 Creates a game-code-free WiiCompiled Setup.pkg. The supplied tools must be
-maintainer-verified, redistributable universal2 macOS artifacts: each must
-contain both arm64 and x86_64 slices. The setup package runs those tools
-natively on either supported host while the game itself is compiled locally
-for that host architecture. The resulting pkg is unsigned unless
+maintainer-verified, redistributable macOS artifacts for both arm64 and
+x86_64. The setup package selects native tools for its host while the game is
+compiled locally for that host architecture. CMake must be universal2. The
+resulting pkg is unsigned unless
 --installer-identity is supplied; releases should sign and notarize it with a
 Developer ID Installer certificate.
 
@@ -26,14 +26,17 @@ EOF
 }
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-workspace=$(cd "$script_dir/../.." && pwd); nodtool=""; translator=""; cmake_root=""; ninja=""; output=""; version=0.1.0; identity=""
+workspace=$(cd "$script_dir/../.." && pwd); nodtool_arm64=""; nodtool_x86_64=""; translator_arm64=""; translator_x86_64=""; cmake_root=""; ninja_arm64=""; ninja_x86_64=""; output=""; version=0.1.0; identity=""
 while (($#)); do
     case "$1" in
         --workspace) workspace=${2:-}; shift 2 ;;
-        --nodtool) nodtool=${2:-}; shift 2 ;;
-        --translator) translator=${2:-}; shift 2 ;;
+        --nodtool-arm64) nodtool_arm64=${2:-}; shift 2 ;;
+        --nodtool-x86_64) nodtool_x86_64=${2:-}; shift 2 ;;
+        --translator-arm64) translator_arm64=${2:-}; shift 2 ;;
+        --translator-x86_64) translator_x86_64=${2:-}; shift 2 ;;
         --cmake-root) cmake_root=${2:-}; shift 2 ;;
-        --ninja) ninja=${2:-}; shift 2 ;;
+        --ninja-arm64) ninja_arm64=${2:-}; shift 2 ;;
+        --ninja-x86_64) ninja_x86_64=${2:-}; shift 2 ;;
         --output) output=${2:-}; shift 2 ;;
         --version) version=${2:-}; shift 2 ;;
         --installer-identity) identity=${2:-}; shift 2 ;;
@@ -46,20 +49,17 @@ version=${version#v}
 IFS=. read -r version_major version_minor version_patch <<< "$version"
 short_version="$version_major.${version_minor:-0}.${version_patch:-0}"
 for tool in pkgbuild productbuild ditto codesign lipo; do command -v "$tool" >/dev/null || fail "required macOS tool unavailable: $tool"; done
-[[ -x "$nodtool" ]] || fail '--nodtool must name an executable'
-[[ -x "$translator" ]] || fail '--translator must name an executable'
+for tool_path in "$nodtool_arm64" "$nodtool_x86_64" "$translator_arm64" "$translator_x86_64" "$ninja_arm64" "$ninja_x86_64"; do [[ -x "$tool_path" ]] || fail 'each architecture-specific tool must name an executable'; done
 [[ -x "$cmake_root/bin/cmake" ]] || fail '--cmake-root must contain bin/cmake'
-[[ -x "$ninja" ]] || fail '--ninja must name an executable'
-require_universal2() {
-    local artifact=$1 label=$2
-    lipo "$artifact" -verify_arch arm64 x86_64 >/dev/null 2>&1 || \
-        fail "$label must contain arm64 and x86_64 slices: $artifact"
+require_arch() {
+    local artifact=$1 arch=$2 label=$3
+    lipo "$artifact" -verify_arch "$arch" >/dev/null 2>&1 || fail "$label must contain a $arch slice: $artifact"
 }
-require_universal2 "$nodtool" '--nodtool'
-require_universal2 "$translator" '--translator'
-require_universal2 "$cmake_root/bin/cmake" '--cmake-root/bin/cmake'
-require_universal2 "$ninja" '--ninja'
-"$nodtool" --version >/dev/null || fail '--nodtool did not run successfully'
+require_arch "$nodtool_arm64" arm64 '--nodtool-arm64'; require_arch "$nodtool_x86_64" x86_64 '--nodtool-x86_64'
+require_arch "$translator_arm64" arm64 '--translator-arm64'; require_arch "$translator_x86_64" x86_64 '--translator-x86_64'
+require_arch "$ninja_arm64" arm64 '--ninja-arm64'; require_arch "$ninja_x86_64" x86_64 '--ninja-x86_64'
+lipo "$cmake_root/bin/cmake" -verify_arch arm64 x86_64 >/dev/null 2>&1 || fail '--cmake-root/bin/cmake must be universal2'
+"$nodtool_arm64" --version >/dev/null || fail '--nodtool-arm64 did not run successfully'
 workspace=$(cd "$workspace" && pwd); output=$(cd "$(dirname "$output")" && pwd)/$(basename "$output")
 stage=$(mktemp -d "${TMPDIR:-/tmp}/wiicompiled-pkg.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
@@ -115,11 +115,14 @@ copy_clean "$workspace/Launcher/local-build-macos.command" "$resources/workspace
 copy_clean "$workspace/Launcher/macos/extract-disc.command" "$resources/workspace/Launcher/macos/extract-disc.command"
 copy_clean "$workspace/Launcher/macos/publish-app.command" "$resources/workspace/Launcher/macos/publish-app.command"
 chmod +x "$resources/workspace/Launcher/local-build-macos.command" "$resources/workspace/Launcher/macos/"*.command
-mkdir -p "$resources/tools/cmake"
-copy_clean "$nodtool" "$resources/tools/nodtool"; chmod +x "$resources/tools/nodtool"
-copy_clean "$translator" "$resources/tools/Translator.Cli"; chmod +x "$resources/tools/Translator.Cli"
+mkdir -p "$resources/tools/cmake" "$resources/tools/arm64" "$resources/tools/x86_64"
+copy_clean "$nodtool_arm64" "$resources/tools/arm64/nodtool"; chmod +x "$resources/tools/arm64/nodtool"
+copy_clean "$nodtool_x86_64" "$resources/tools/x86_64/nodtool"; chmod +x "$resources/tools/x86_64/nodtool"
+copy_clean "$translator_arm64" "$resources/tools/arm64/Translator.Cli"; chmod +x "$resources/tools/arm64/Translator.Cli"
+copy_clean "$translator_x86_64" "$resources/tools/x86_64/Translator.Cli"; chmod +x "$resources/tools/x86_64/Translator.Cli"
 copy_clean "$cmake_root" "$resources/tools/cmake"
-copy_clean "$ninja" "$resources/tools/ninja"; chmod +x "$resources/tools/ninja"
+copy_clean "$ninja_arm64" "$resources/tools/arm64/ninja"; chmod +x "$resources/tools/arm64/ninja"
+copy_clean "$ninja_x86_64" "$resources/tools/x86_64/ninja"; chmod +x "$resources/tools/x86_64/ninja"
 copy_clean "$workspace/LICENSE" "$resources/LICENSE"
 copy_clean "$workspace/THIRD-PARTY-NOTICES.md" "$resources/THIRD-PARTY-NOTICES.md"
 codesign --force --deep --sign - "$app"
