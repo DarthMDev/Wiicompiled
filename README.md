@@ -130,7 +130,10 @@ then open Setup again. When the build completes, Setup asks for administrator ap
 Setup opens Terminal while it works, so the extraction and build progress—and any error that needs
 reporting—remain visible.
 
-
+> [!CAUTION]
+> Only take builds from this repository's
+> [Releases](https://github.com/patchzyy/Wiicompiled/releases) page. If someone's sharing an
+> installer through Discord or some random download site, don't touch it!!
 
 ## A note on related projects
 
