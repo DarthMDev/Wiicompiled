@@ -321,7 +321,7 @@ void ApplyConfiguredMappings() {
 }
 
 bool g_wiiRemotesEnabled = RuntimeConfigFile::WiiRemotesEnabled(true);
-bool g_wiiContinuousScan = RuntimeConfigFile::WiiContinuousScanEnabled(true);
+bool g_wiiContinuousScan = RuntimeConfigFile::WiiContinuousScanEnabled(false);
 
 // Accelerometer readout and zero-point calibration for a bare remote / remote + Nunchuk.
 void DrawWiiRemoteAccelerometer(uint32_t port) {
@@ -393,8 +393,10 @@ void DrawWiiRemoteSettings(uint32_t selectedGamePort) {
     }
     ImGui::EndDisabled();
     ImGui::SameLine();
-    if (WiiRemoteInput::IsScanning()) {
+    if (WiiRemoteInput::IsScanning() && WiiRemoteInput::PeriodicRescanEnabled()) {
         ImGui::TextDisabled("Scanning... (%u so far) - press 1+2 on the remote", WiiRemoteInput::ScanCount());
+    } else if (WiiRemoteInput::IsScanning()) {
+        ImGui::TextDisabled("Waiting for a remote - press 1+2 on the remote");
     } else {
         ImGui::TextDisabled("Not scanning");
     }
