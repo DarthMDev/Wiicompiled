@@ -1,11 +1,15 @@
 ﻿cmake_minimum_required(VERSION 3.16)
 project(mkw_recompiled)
 
-if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+if(CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
+    # The web build starts with an intentionally small, game-free bootstrap
+    # target. Browser execution of the translated product is enabled only after
+    # the runtime's native virtual-memory, fiber, and renderer dependencies
+    # have dedicated web implementations.
+    set(MKW_PLATFORM_WEB TRUE)
+elseif(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "WiiCompiled requires a 64-bit Clang toolchain")
-endif()
-
-if(WIN32 AND MINGW AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+elseif(WIN32 AND MINGW AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     set(MKW_PLATFORM_WINDOWS TRUE)
 elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|ARM64)$")
     # The first native macOS target is Apple Silicon. Intel and universal
@@ -15,13 +19,22 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(
     set(MKW_PLATFORM_LINUX TRUE)
 else()
     message(FATAL_ERROR
-        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS arm64")
+        "WiiCompiled supports Emscripten for the web bootstrap, 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS arm64")
 endif()
-if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
+if(NOT MKW_PLATFORM_WEB AND NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     message(FATAL_ERROR "WiiCompiled only supports Release builds")
 endif()
 
-option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
+if(MKW_PLATFORM_WEB)
+    option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" OFF)
+else()
+    option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
+endif()
+
+if(MKW_PLATFORM_WEB)
+    include("${CMAKE_CURRENT_LIST_DIR}/cmake/Web.cmake")
+    return()
+endif()
 
 # Preprocessor definitions that belong to this project's own code (the runtime,
 # the translated shards and the product glue) and to nothing else. They are

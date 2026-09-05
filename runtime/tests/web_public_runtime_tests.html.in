@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WiiCompiled web public runtime tests</title>
+</head>
+<body>
+  <p id="result">Running web public runtime tests…</p>
+  <script type="module">
+    import createMkwWebPublicRuntimeTests from "./mkw_web_public_runtime_tests.mjs";
+
+    const result = document.querySelector("#result");
+    try {
+      const runtime = await createMkwWebPublicRuntimeTests();
+      const abiVersion = runtime._MkwWebPublicRuntimeAbiVersion();
+      if (abiVersion !== 1) {
+        throw new Error(`expected ABI version 1, got ${abiVersion}`);
+      }
+      result.textContent = `Web public runtime tests passed (ABI ${abiVersion}).`;
+    } catch (error) {
+      result.textContent = `Web public runtime tests failed: ${error.message}`;
+      console.error(error);
+    }
+  </script>
+</body>
+</html>
