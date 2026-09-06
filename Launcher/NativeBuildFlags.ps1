@@ -15,11 +15,16 @@ function Assert-Directory([string]$Path, [string]$Description) {
 }
 
 function Get-MkwFileSha256([string]$Path) {
-    <#
-    Lower-case SHA-256 of one file. -LiteralPath is required: Get-FileHash treats a positional
-    path as a wildcard, so an install directory containing [, ] or * would hash the wrong file.
-    #>
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = [IO.File]::OpenRead($Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+
+    try {
+        $hash = $sha.ComputeHash($stream)
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
 }
 
 function Get-MkwToolchainPath([string]$ToolchainRoot) {
