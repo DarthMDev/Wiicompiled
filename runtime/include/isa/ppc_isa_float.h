@@ -604,10 +604,23 @@ inline double PPC_PsMulNoNiInline(double lhs, double rhs)
 // accumulator-first operand order, unlike x86's _mm_fmadd_ps(a, b, c) = a*b + c - msub is
 // therefore an fma against a negated accumulator. That vneg would flip a sole-NaN subtractor's
 // sign, which x86's vfmsub does not do, so the NaN resolver receives the original subtractor.
-inline PpcPairVec PpcFmaddPairInline(PpcPairVec multiplicand, PpcPairVec multiplier, PpcPairVec addend)
+inline PpcPairVec PpcFmaddPairInline(
+    PpcPairVec multiplicand, PpcPairVec multiplier, PpcPairVec addend)
 {
 #if defined(__x86_64__)
+#if defined(__FMA__)
     return _mm_fmadd_ps(multiplicand, multiplier, addend);
+#else
+    const double a = PpcM128ToPsInline(multiplicand);
+    const double c = PpcM128ToPsInline(multiplier);
+    const double b = PpcM128ToPsInline(addend);
+
+    return PpcPsToM128Inline(PpcPackPairedInline(
+        PpcAccuratePsMaddLaneInline<false>(
+            PpcGetPs0Inline(a), PpcGetPs0Inline(c), PpcGetPs0Inline(b)),
+        PpcAccuratePsMaddLaneInline<false>(
+            PpcGetPs1Inline(a), PpcGetPs1Inline(c), PpcGetPs1Inline(b))));
+#endif
 #elif defined(__aarch64__)
     const PpcPairVec result = vfma_f32(addend, multiplicand, multiplier);
     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
@@ -616,10 +629,23 @@ inline PpcPairVec PpcFmaddPairInline(PpcPairVec multiplicand, PpcPairVec multipl
 #endif
 }
 
-inline PpcPairVec PpcFmsubPairInline(PpcPairVec multiplicand, PpcPairVec multiplier, PpcPairVec subtractor)
+inline PpcPairVec PpcFmsubPairInline(
+    PpcPairVec multiplicand, PpcPairVec multiplier, PpcPairVec subtractor)
 {
 #if defined(__x86_64__)
+#if defined(__FMA__)
     return _mm_fmsub_ps(multiplicand, multiplier, subtractor);
+#else
+    const double a = PpcM128ToPsInline(multiplicand);
+    const double c = PpcM128ToPsInline(multiplier);
+    const double b = PpcM128ToPsInline(subtractor);
+
+    return PpcPsToM128Inline(PpcPackPairedInline(
+        PpcAccuratePsMaddLaneInline<true>(
+            PpcGetPs0Inline(a), PpcGetPs0Inline(c), PpcGetPs0Inline(b)),
+        PpcAccuratePsMaddLaneInline<true>(
+            PpcGetPs1Inline(a), PpcGetPs1Inline(c), PpcGetPs1Inline(b))));
+#endif
 #elif defined(__aarch64__)
     const PpcPairVec result = vfma_f32(vneg_f32(subtractor), multiplicand, multiplier);
     if (PpcPairNanLaneBitsInline(result) != 0) [[unlikely]]
