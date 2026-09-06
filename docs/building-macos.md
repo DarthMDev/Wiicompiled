@@ -24,12 +24,12 @@ brew install cmake ninja
 brew install --cask dotnet-sdk@8
 ```
 
-Verify that Clang, CMake, Ninja, and .NET are available:
+Verify that Clang, CMake, Ninja, and the .NET 8 runtime are available:
 ```bash
 clang --version
 cmake --version
 ninja --version
-dotnet --version   # Must be .NET 8 or newer
+dotnet --list-runtimes   # Must list Microsoft.NETCore.App 8.x
 ```
 
 ---
@@ -98,9 +98,11 @@ Compile the static recompiler CLI:
 dotnet build translator/src/Translator.Cli/Translator.Cli.csproj -c Release
 ```
 
-Set a shell variable pointing to the compiled assembly for the next steps:
+Define a shell function to invoke the translator (ensuring paths with spaces are handled safely):
 ```bash
-TRANSLATOR="dotnet $(pwd)/translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll"
+translator() {
+  dotnet "$(pwd)/translator/src/Translator.Cli/bin/Release/net8.0/Translator.Cli.dll" "$@"
+}
 ```
 
 ---
@@ -111,7 +113,7 @@ TRANSLATOR="dotnet $(pwd)/translator/src/Translator.Cli/bin/Release/net8.0/Trans
 ```bash
 mkdir -p generated/functions build/base
 
-$TRANSLATOR translate-recursive 0x8000629c \
+translator translate-recursive 0x8000629c \
   --project projects/mkwii/recomp.yml \
   --outdir generated/functions \
   --output-metadata generated/base_translation_output.json \
@@ -123,7 +125,7 @@ $TRANSLATOR translate-recursive 0x8000629c \
 
 ### B. Emit Base Manifest
 ```bash
-$TRANSLATOR emit-base-manifest \
+translator emit-base-manifest \
   --project projects/mkwii/recomp.yml \
   --out build/base \
   --functions-dir generated/functions \
@@ -150,14 +152,14 @@ $TRANSLATOR emit-base-manifest \
      -o build/retro-wfc/binary/payload.RMCPD00.bin
 
    # Validate payload signature and integrity
-   $TRANSLATOR validate-retro-wfc-payload --directory build/retro-wfc
+   translator validate-retro-wfc-payload --directory build/retro-wfc
    ```
 
 3. Run Retro Rewind translation:
    ```bash
    mkdir -p build/mods/retro_rewind_full_cpp
 
-   $TRANSLATOR translate-mod \
+   translator translate-mod \
      --project projects/mkwii/recomp.yml \
      --profile retro-rewind \
      --base-manifest build/base/mkwii_base_manifest.json \
@@ -181,7 +183,7 @@ $TRANSLATOR emit-base-manifest \
 
 First, generate the embedded game data initializer:
 ```bash
-$TRANSLATOR generate-data-init --project projects/mkwii/recomp.yml
+translator generate-data-init --project projects/mkwii/recomp.yml
 ```
 
 Next, generate the CMake build shards using **one** of the following options:
@@ -189,7 +191,7 @@ Next, generate the CMake build shards using **one** of the following options:
 #### Option 1: Base Game Only (WiiCompiled)
 ```bash
 mkdir -p generated/build_shards
-$TRANSLATOR emit-build-shards \
+translator emit-build-shards \
   --project projects/mkwii/recomp.yml \
   --base-metadata generated/base_translation_output.json \
   --base-functions-dir generated/functions \
@@ -200,7 +202,7 @@ $TRANSLATOR emit-build-shards \
 #### Option 2: Base Game + Retro Rewind
 ```bash
 mkdir -p generated/build_shards
-$TRANSLATOR emit-build-shards \
+translator emit-build-shards \
   --project projects/mkwii/recomp.yml \
   --base-metadata generated/base_translation_output.json \
   --base-functions-dir generated/functions \
