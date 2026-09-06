@@ -31,15 +31,29 @@ $downloads = Join-Path $PSScriptRoot 'artifacts\downloads'
 [IO.Directory]::CreateDirectory($Destination) | Out-Null
 [IO.Directory]::CreateDirectory($downloads) | Out-Null
 
+function Get-Sha256([string]$Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+
+    try {
+        $hash = $sha.ComputeHash($stream)
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    }
+    finally {
+        $stream.Dispose()
+        $sha.Dispose()
+    }
+}
+
 foreach ($package in $packages) {
     $archive = Join-Path $downloads $package.File
     if (-not (Test-Path -LiteralPath $archive -PathType Leaf) -or
-        (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $package.Sha256) {
+        (Get-Sha256 $archive) -ne $package.Sha256) {
         Write-Host "Downloading $($package.Name)..."
         $temporary = $archive + '.partial'
         Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
         Invoke-WebRequest -UseBasicParsing -Uri $package.Uri -OutFile $temporary
-        $actual = (Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash.ToLowerInvariant()
+        $actual = Get-Sha256 $temporary
         if ($actual -ne $package.Sha256) { throw "$($package.Name) hash mismatch: $actual" }
         Move-Item -LiteralPath $temporary -Destination $archive -Force
     }
