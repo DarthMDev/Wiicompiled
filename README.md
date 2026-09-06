@@ -1,7 +1,9 @@
 
 # WiiCompiled
 
-A native PC port of Mario Kart Wii, made with static recompilation.
+A native PC port of Mario Kart Wii, made with static recompilation. 
+
+This version is modified to run on older hardware (!!!)
 
 There's no emulator in the loop, no interpreter, no JIT, no PowerPC
 anywhere at runtime.
