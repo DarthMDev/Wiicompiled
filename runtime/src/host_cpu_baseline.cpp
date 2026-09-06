@@ -64,20 +64,11 @@ struct CpuFeature {
 constexpr CpuFeature kRequiredFeatures[] = {
     {"SSE3", 1, 0, 2, 0, false},
     {"SSSE3", 1, 0, 2, 9, false},
-    {"FMA", 1, 0, 2, 12, false},
     {"CMPXCHG16B", 1, 0, 2, 13, false},
     {"SSE4.1", 1, 0, 2, 19, false},
     {"SSE4.2", 1, 0, 2, 20, false},
-    {"MOVBE", 1, 0, 2, 22, false},
     {"POPCNT", 1, 0, 2, 23, false},
-    {"OSXSAVE", 1, 0, 2, 27, true},
-    {"AVX", 1, 0, 2, 28, false},
-    {"F16C", 1, 0, 2, 29, false},
-    {"BMI1", 7, 0, 1, 3, false},
-    {"AVX2", 7, 0, 1, 5, false},
-    {"BMI2", 7, 0, 1, 8, false},
     {"LAHF-SAHF", 0x80000001u, 0, 2, 0, false},
-    {"LZCNT", 0x80000001u, 0, 2, 5, false},
 };
 
 // Fixed-capacity text accumulation: no allocation, no exceptions, nothing that
