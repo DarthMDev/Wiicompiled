@@ -289,6 +289,11 @@ target_include_directories(mkw_nand_settings_tests PRIVATE "${CMAKE_CURRENT_LIST
 target_compile_features(mkw_nand_settings_tests PRIVATE cxx_std_17)
 add_test(NAME mkw_nand_settings_tests COMMAND mkw_nand_settings_tests)
 
+add_executable(mkw_sc_serial_tests "${CMAKE_CURRENT_LIST_DIR}/tests/sc_serial_tests.cpp")
+target_include_directories(mkw_sc_serial_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+target_compile_features(mkw_sc_serial_tests PRIVATE cxx_std_17)
+add_test(NAME mkw_sc_serial_tests COMMAND mkw_sc_serial_tests)
+
 # The input expression engine is self-contained, so it can be exercised without
 # linking the runtime or SDL.
 add_executable(mkw_input_expr_tests
