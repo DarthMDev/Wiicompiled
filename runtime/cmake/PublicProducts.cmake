@@ -132,7 +132,7 @@ set_target_properties(mkw_runtime_common PROPERTIES UNITY_BUILD ON UNITY_BUILD_M
 target_precompile_headers(mkw_runtime_common PRIVATE "${MKW_RUNTIME_SOURCE_DIR}/include/mkw_pch.h")
 mkw_apply_common_compile_options(mkw_runtime_common)
 
-# Host ISA guard. Windows and Linux x86_64 product targets use x86-64-v3, so
+# Host ISA guard. Windows and Linux x86_64 product targets use x86-64-v2, so
 # this object deliberately keeps the plain baseline ISA and checks the CPU
 # before any AVX2/FMA code can execute. AArch64 has no equivalent optional ISA
 # floor to probe: NEON/FMA are architectural requirements.
@@ -180,7 +180,7 @@ endif()
 function(mkw_configure_product target)
     target_sources(${target} PRIVATE $<TARGET_OBJECTS:mkw_runtime_common>)
     # Startup CPU check. Must stay a separate object library so it keeps the
-    # plain baseline ISA while everything around it is built for x86-64-v3.
+    # plain baseline ISA while everything around it is built for x86-64-v2.
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
         target_sources(${target} PRIVATE $<TARGET_OBJECTS:mkw_cpu_baseline>)
     endif()
@@ -313,12 +313,12 @@ else()
     message(STATUS "RetroRewind target disabled (run translate-mod and emit-build-shards)")
 endif()
 
-# Windows and Linux x86_64 share the x86-64-v3 floor that the CPU baseline
+# Windows and Linux x86_64 share the x86-64-v2 floor that the CPU baseline
 # object above checks. AArch64 builds are compiled locally for the host that
 # will run them, so both Linux and Apple Silicon use the compiler's native CPU
 # tuning rather than leaving target-specific performance on the table.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
-    set(MKW_BASELINE_ARCH_FLAG -march=x86-64-v3)
+    set(MKW_BASELINE_ARCH_FLAG -march=x86-64-v2)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
     set(MKW_BASELINE_ARCH_FLAG -mcpu=native)
 else()
