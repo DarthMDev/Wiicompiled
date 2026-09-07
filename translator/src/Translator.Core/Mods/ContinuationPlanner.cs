@@ -432,13 +432,15 @@ public static class ContinuationPlanner
             {
                 if (loadBase == "r1")
                 {
+                    var targetSlot = nextState.SpDelta + loadDisp;
+                    var hasStackOffset = nextState.StackOffsets.TryGetValue(targetSlot, out var offset);
+
                     if (loadDest == "r1")
                     {
                         nextState = nextState.WithClearedStackOffsets();
                     }
 
-                    var targetSlot = nextState.SpDelta + loadDisp;
-                    nextState = nextState.StackOffsets.TryGetValue(targetSlot, out var offset)
+                    nextState = hasStackOffset
                         ? nextState.WithLrOffset(loadDest, offset)
                         : nextState.WithoutLrOffset(loadDest);
                 }
