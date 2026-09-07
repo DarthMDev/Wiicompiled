@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Immutable;
 using System.Text.Json;
 using Translator.Core.Disassembly;
 using Translator.Core.Parsing.Kamek;
@@ -276,20 +277,75 @@ public static class ContinuationPlanner
 
     public static IEnumerable<int> DiscoverLrRelativeIndirectJumpOffsets(IReadOnlyList<PpcInstruction> instructions)
     {
-        var lrOffsets = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        int? ctrOffset = null;
-        int? lrReturnOffset = null;
-
-        foreach (var instruction in instructions)
+        if (instructions.Count == 0)
         {
-            var mnemonic = instruction.Mnemonic.ToLowerInvariant();
-            if (mnemonic == "mflr" && TryGetInstructionReg(instruction, 0, out var lrDest))
+            yield break;
+        }
+
+        var indexByAddress = new Dictionary<uint, int>(instructions.Count);
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            indexByAddress.TryAdd(instructions[i].Address, i);
+        }
+
+        var visited = new HashSet<PathState>[instructions.Count];
+        for (var i = 0; i < instructions.Count; i++)
+        {
+            visited[i] = new HashSet<PathState>();
+        }
+
+        var seenOffsets = new HashSet<int>();
+        var worklist = new PriorityQueue<(int Index, PathState State), (uint Address, long Sequence)>(
+            AddressSequenceComparer.Instance);
+        long sequence = 0;
+        const int MaxEvaluationSteps = 10000;
+        var evaluationSteps = 0;
+
+        void Enqueue(int targetIndex, PathState stateToEnqueue)
+        {
+            var targetAddress = instructions[targetIndex].Address;
+            worklist.Enqueue((targetIndex, stateToEnqueue), (targetAddress, ++sequence));
+        }
+
+        int? GetFallthroughIndex(int currentIndex, PpcInstruction instruction)
+        {
+            if (indexByAddress.TryGetValue(instruction.EndAddress, out var nextIndex))
             {
-                lrOffsets[lrDest] = 0;
+                return nextIndex;
+            }
+
+            if (currentIndex + 1 < instructions.Count)
+            {
+                return currentIndex + 1;
+            }
+
+            return null;
+        }
+
+        Enqueue(0, PathState.Empty);
+
+        while (worklist.Count > 0)
+        {
+            var (idx, state) = worklist.Dequeue();
+            if (!visited[idx].Add(state))
+            {
                 continue;
             }
 
-            if ((mnemonic == "mr" || mnemonic == "or") &&
+            if (++evaluationSteps > MaxEvaluationSteps)
+            {
+                break;
+            }
+
+            var instruction = instructions[idx];
+            var mnemonic = instruction.Mnemonic.ToLowerInvariant();
+            var nextState = state;
+
+            if (mnemonic == "mflr" && TryGetInstructionReg(instruction, 0, out var lrDest))
+            {
+                nextState = nextState.WithLrOffset(lrDest, 0);
+            }
+            else if ((mnemonic == "mr" || mnemonic == "or") &&
                 TryGetInstructionReg(instruction, 0, out var moveDest) &&
                 TryGetInstructionReg(instruction, 1, out var moveSource) &&
                 (mnemonic == "mr" ||
@@ -297,73 +353,107 @@ public static class ContinuationPlanner
                   instruction.Operands[2] is PpcRegisterOperand moveSource2 &&
                   string.Equals(NormalizeInstructionReg(moveSource2.Name), moveSource, StringComparison.OrdinalIgnoreCase))))
             {
-                if (lrOffsets.TryGetValue(moveSource, out var sourceOffset))
-                {
-                    lrOffsets[moveDest] = sourceOffset;
-                }
-                else
-                {
-                    lrOffsets.Remove(moveDest);
-                }
-                continue;
+                nextState = nextState.LrOffsets.TryGetValue(moveSource, out var sourceOffset)
+                    ? nextState.WithLrOffset(moveDest, sourceOffset)
+                    : nextState.WithoutLrOffset(moveDest);
             }
-
-            if (mnemonic == "addi" &&
+            else if (mnemonic == "addi" &&
                 TryGetInstructionReg(instruction, 0, out var addDest) &&
                 TryGetInstructionReg(instruction, 1, out var addBase) &&
                 TryGetInstructionImm(instruction, 2, out var imm))
             {
-                if (lrOffsets.TryGetValue(addBase, out var baseOffset))
-                {
-                    lrOffsets[addDest] = checked(baseOffset + imm);
-                }
-                else
-                {
-                    lrOffsets.Remove(addDest);
-                }
-                continue;
+                nextState = nextState.LrOffsets.TryGetValue(addBase, out var baseOffset)
+                    ? nextState.WithLrOffset(addDest, checked(baseOffset + imm))
+                    : nextState.WithoutLrOffset(addDest);
             }
-
-            if (mnemonic == "mtctr" && TryGetInstructionReg(instruction, 0, out var ctrSource))
+            else if (mnemonic == "mtctr" && TryGetInstructionReg(instruction, 0, out var ctrSource))
             {
-                ctrOffset = lrOffsets.TryGetValue(ctrSource, out var sourceOffset) ? sourceOffset : null;
-                continue;
+                var newCtrOffset = nextState.LrOffsets.TryGetValue(ctrSource, out var sourceOffset) ? sourceOffset : (int?)null;
+                nextState = nextState.WithCtrOffset(newCtrOffset);
             }
-
-            if (mnemonic == "bctr")
+            else if (mnemonic == "mtlr" && TryGetInstructionReg(instruction, 0, out var lrSource))
             {
-                if (ctrOffset.HasValue)
+                var newLrReturnOffset = nextState.LrOffsets.TryGetValue(lrSource, out var sourceOffset) ? sourceOffset : (int?)null;
+                nextState = nextState.WithLrReturnOffset(newLrReturnOffset);
+            }
+            else
+            {
+                if (TryInstructionWritesDest(instruction, out var dest))
                 {
-                    yield return ctrOffset.Value;
+                    nextState = nextState.WithoutLrOffset(dest);
                 }
-                ctrOffset = null;
-                continue;
-            }
-
-            if (mnemonic == "mtlr" && TryGetInstructionReg(instruction, 0, out var lrSource))
-            {
-                lrReturnOffset = lrOffsets.TryGetValue(lrSource, out var sourceOffset) ? sourceOffset : null;
-                continue;
-            }
-
-            if (instruction.IsReturn || mnemonic == "blr" || mnemonic == "bclr" || (mnemonic.StartsWith("b", StringComparison.Ordinal) && mnemonic.EndsWith("lr", StringComparison.Ordinal)))
-            {
-                if (lrReturnOffset.HasValue && lrReturnOffset.Value != 0)
-                {
-                    yield return lrReturnOffset.Value;
-                }
-                lrReturnOffset = null;
-                continue;
             }
 
             if (instruction.IsCall || mnemonic == "bl" || mnemonic == "blrl")
             {
-                lrReturnOffset = null;
+                nextState = nextState.WithLrReturnOffset(null);
             }
 
-            if (TryInstructionWritesDest(instruction, out var dest))
+            if (mnemonic == "bctr")
             {
-                lrOffsets.Remove(dest);
+                if (state.CtrOffset.HasValue && seenOffsets.Add(state.CtrOffset.Value))
+                {
+                    yield return state.CtrOffset.Value;
+                }
+
+                nextState = nextState.WithCtrOffset(null);
+                if (instruction.BranchTargets.Count == 0)
+                {
+                    continue;
+                }
+            }
+
+            var isReturn = instruction.IsReturn || mnemonic == "blr" || mnemonic == "bclr" ||
+                (mnemonic.StartsWith("b", StringComparison.Ordinal) && mnemonic.EndsWith("lr", StringComparison.Ordinal));
+            if (isReturn)
+            {
+                if (state.LrReturnOffset.HasValue && state.LrReturnOffset.Value != 0 && seenOffsets.Add(state.LrReturnOffset.Value))
+                {
+                    yield return state.LrReturnOffset.Value;
+                }
+
+                if (!instruction.IsConditionalBranch)
+                {
+                    continue;
+                }
+            }
+
+            if (instruction.IsUnconditionalBranch)
+            {
+                foreach (var target in instruction.BranchTargets)
+                {
+                    if (indexByAddress.TryGetValue(target, out var targetIndex))
+                    {
+                        Enqueue(targetIndex, nextState);
+                    }
+                }
+            }
+            else if (instruction.IsConditionalBranch)
+            {
+                if (!isReturn)
+                {
+                    foreach (var target in instruction.BranchTargets)
+                    {
+                        if (indexByAddress.TryGetValue(target, out var targetIndex))
+                        {
+                            Enqueue(targetIndex, nextState);
+                        }
+                    }
+                }
+
+                var fallthrough = GetFallthroughIndex(idx, instruction);
+                if (fallthrough.HasValue)
+                {
+                    Enqueue(fallthrough.Value, nextState);
+                }
+            }
+            else
+            {
+                var fallthrough = GetFallthroughIndex(idx, instruction);
+                if (fallthrough.HasValue)
+                {
+                    Enqueue(fallthrough.Value, nextState);
+                }
             }
         }
 
@@ -412,5 +502,82 @@ public static class ContinuationPlanner
         }
 
         static string NormalizeInstructionReg(string register) => register.ToLowerInvariant();
+    }
+
+    private sealed class PathState : IEquatable<PathState>
+    {
+        public ImmutableDictionary<string, int> LrOffsets { get; }
+        public int? CtrOffset { get; }
+        public int? LrReturnOffset { get; }
+
+        public PathState(ImmutableDictionary<string, int> lrOffsets, int? ctrOffset, int? lrReturnOffset)
+        {
+            LrOffsets = lrOffsets;
+            CtrOffset = ctrOffset;
+            LrReturnOffset = lrReturnOffset;
+        }
+
+        public static readonly PathState Empty = new(
+            ImmutableDictionary<string, int>.Empty.WithComparers(StringComparer.OrdinalIgnoreCase),
+            null,
+            null);
+
+        public PathState WithLrOffset(string register, int offset) =>
+            new(LrOffsets.SetItem(register, offset), CtrOffset, LrReturnOffset);
+
+        public PathState WithoutLrOffset(string register) =>
+            LrOffsets.ContainsKey(register)
+                ? new(LrOffsets.Remove(register), CtrOffset, LrReturnOffset)
+                : this;
+
+        public PathState WithCtrOffset(int? ctrOffset) =>
+            new(LrOffsets, ctrOffset, LrReturnOffset);
+
+        public PathState WithLrReturnOffset(int? lrReturnOffset) =>
+            new(LrOffsets, CtrOffset, lrReturnOffset);
+
+        public bool Equals(PathState? other)
+        {
+            if (ReferenceEquals(this, other)) return true;
+            if (other is null) return false;
+            if (CtrOffset != other.CtrOffset || LrReturnOffset != other.LrReturnOffset) return false;
+            if (LrOffsets.Count != other.LrOffsets.Count) return false;
+            foreach (var (k, v) in LrOffsets)
+            {
+                if (!other.LrOffsets.TryGetValue(k, out var otherV) || v != otherV)
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        public override bool Equals(object? obj) => obj is PathState other && Equals(other);
+
+        public override int GetHashCode()
+        {
+            var hash = new HashCode();
+            hash.Add(CtrOffset);
+            hash.Add(LrReturnOffset);
+            hash.Add(LrOffsets.Count);
+            var regHash = 0;
+            foreach (var (k, v) in LrOffsets)
+            {
+                regHash ^= HashCode.Combine(StringComparer.OrdinalIgnoreCase.GetHashCode(k), v);
+            }
+            hash.Add(regHash);
+            return hash.ToHashCode();
+        }
+    }
+
+    private sealed class AddressSequenceComparer : IComparer<(uint Address, long Sequence)>
+    {
+        public static readonly AddressSequenceComparer Instance = new();
+
+        public int Compare((uint Address, long Sequence) x, (uint Address, long Sequence) y)
+        {
+            var cmp = x.Address.CompareTo(y.Address);
+            return cmp != 0 ? cmp : x.Sequence.CompareTo(y.Sequence);
+        }
     }
 }
