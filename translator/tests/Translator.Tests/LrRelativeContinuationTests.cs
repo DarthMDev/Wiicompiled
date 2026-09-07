@@ -114,6 +114,102 @@ public class LrRelativeContinuationTests
         Assert.Empty(offsets);
     }
 
+    [Fact]
+    public void LoadMultipleWordOverwritesSavedRegistersThroughR31()
+    {
+        var offsets = DiscoverOffsets(
+            0x7FE802A6u, // mflr r31
+            0x3BFF0014u, // addi r31,r31,20
+            0xBB610008u, // lmw r30,8(r1)
+            0x7FE803A6u, // mtlr r31
+            0x4E800020u);// blr
+
+        Assert.Empty(offsets);
+    }
+
+    [Fact]
+    public void BlrlCallIsNotTreatedAsReturn()
+    {
+        var offsets = DiscoverOffsets(
+            0x7FE802A6u, // mflr r31
+            0x4E800021u, // blrl
+            0x3BFF0014u, // addi r31,r31,20
+            0x7FE803A6u, // mtlr r31
+            0x4E800020u);// blr
+
+        Assert.Equal(new[] { 20 }, offsets);
+    }
+
+    [Fact]
+    public void MflrAfterCallDoesNotTreatClobberedLrAsIncomingLr()
+    {
+        var offsets = DiscoverOffsets(
+            0x48000101u, // bl helper
+            0x7FE802A6u, // mflr r31
+            0x3BFF0014u, // addi r31,r31,20
+            0x7FE803A6u, // mtlr r31
+            0x4E800020u);// blr
+
+        Assert.Empty(offsets);
+    }
+
+    [Fact]
+    public void RestoredIncomingLrBeforeCtrSkipStillDiscoversOffset()
+    {
+        // The helper replaces LR, but the stack save/restore recovers the
+        // incoming LR before the hook jumps to the caller's continuation.
+        var offsets = DiscoverOffsets(
+            0x7C0802A6u, // mflr r0
+            0x90010004u, // stw r0,4(r1)
+            0x9421FFF0u, // stwu r1,-16(r1)
+            0x48000101u, // bl helper outside this function
+            0x38210010u, // addi r1,r1,16
+            0x80010004u, // lwz r0,4(r1)
+            0x7C0803A6u, // mtlr r0
+            0x7D6802A6u, // mflr r11
+            0x396B0008u, // addi r11,r11,8
+            0x7D6903A6u, // mtctr r11
+            0x4E800420u);// bctr
+
+        Assert.Equal(new[] { 8 }, offsets);
+    }
+
+    [Fact]
+    public void BoundedLoopBeforeCtrSkipStillDiscoversOffset()
+    {
+        // Updating an LR-derived register in a two-iteration loop must not
+        // starve analysis of the exit, whose target uses unchanged r31.
+        var offsets = DiscoverOffsets(
+            0x7FE802A6u, // mflr r31
+            0x7FC802A6u, // mflr r30
+            0x38600002u, // li r3,2
+            0x7C6903A6u, // mtctr r3
+            0x3BDE0004u, // addi r30,r30,4
+            0x4200FFFCu, // bdnz -4
+            0x397F0008u, // addi r11,r31,8
+            0x7D6903A6u, // mtctr r11
+            0x4E800420u);// bctr
+
+        Assert.Equal(new[] { 8 }, offsets);
+    }
+
+    [Fact]
+    public void UntrackedR1WriteInvalidatesStackTracking()
+    {
+        // If r1 is overwritten from an untracked source, previously saved stack slots
+        // must not be used to recover LR state.
+        var offsets = DiscoverOffsets(
+            0x7FE802A6u, // mflr r31
+            0x3BFF0014u, // addi r31,r31,20
+            0x93E10008u, // stw r31,8(r1)
+            0x80230000u, // lwz r1,0(r3)
+            0x80010008u, // lwz r0,8(r1)
+            0x7C0803A6u, // mtlr r0
+            0x4E800020u);// blr
+
+        Assert.Empty(offsets);
+    }
+
     private static uint AddiR31(int offset) => 0x3BFF0000u | (uint)(offset & 0xFFFF);
 
     private static int[] DiscoverOffsets(params uint[] words)
