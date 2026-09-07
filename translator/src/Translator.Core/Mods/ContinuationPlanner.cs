@@ -273,4 +273,144 @@ public static class ContinuationPlanner
         Or,
         AddSigned
     }
+
+    public static IEnumerable<int> DiscoverLrRelativeIndirectJumpOffsets(IReadOnlyList<PpcInstruction> instructions)
+    {
+        var lrOffsets = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        int? ctrOffset = null;
+        int? lrReturnOffset = null;
+
+        foreach (var instruction in instructions)
+        {
+            var mnemonic = instruction.Mnemonic.ToLowerInvariant();
+            if (mnemonic == "mflr" && TryGetInstructionReg(instruction, 0, out var lrDest))
+            {
+                lrOffsets[lrDest] = 0;
+                continue;
+            }
+
+            if ((mnemonic == "mr" || mnemonic == "or") &&
+                TryGetInstructionReg(instruction, 0, out var moveDest) &&
+                TryGetInstructionReg(instruction, 1, out var moveSource) &&
+                (mnemonic == "mr" ||
+                 (instruction.Operands.Count >= 3 &&
+                  instruction.Operands[2] is PpcRegisterOperand moveSource2 &&
+                  string.Equals(NormalizeInstructionReg(moveSource2.Name), moveSource, StringComparison.OrdinalIgnoreCase))))
+            {
+                if (lrOffsets.TryGetValue(moveSource, out var sourceOffset))
+                {
+                    lrOffsets[moveDest] = sourceOffset;
+                }
+                else
+                {
+                    lrOffsets.Remove(moveDest);
+                }
+                continue;
+            }
+
+            if (mnemonic == "addi" &&
+                TryGetInstructionReg(instruction, 0, out var addDest) &&
+                TryGetInstructionReg(instruction, 1, out var addBase) &&
+                TryGetInstructionImm(instruction, 2, out var imm))
+            {
+                if (lrOffsets.TryGetValue(addBase, out var baseOffset))
+                {
+                    lrOffsets[addDest] = checked(baseOffset + imm);
+                }
+                else
+                {
+                    lrOffsets.Remove(addDest);
+                }
+                continue;
+            }
+
+            if (mnemonic == "mtctr" && TryGetInstructionReg(instruction, 0, out var ctrSource))
+            {
+                ctrOffset = lrOffsets.TryGetValue(ctrSource, out var sourceOffset) ? sourceOffset : null;
+                continue;
+            }
+
+            if (mnemonic == "bctr")
+            {
+                if (ctrOffset.HasValue)
+                {
+                    yield return ctrOffset.Value;
+                }
+                ctrOffset = null;
+                continue;
+            }
+
+            if (mnemonic == "mtlr" && TryGetInstructionReg(instruction, 0, out var lrSource))
+            {
+                lrReturnOffset = lrOffsets.TryGetValue(lrSource, out var sourceOffset) ? sourceOffset : null;
+                continue;
+            }
+
+            if (instruction.IsReturn || mnemonic == "blr" || mnemonic == "bclr" || (mnemonic.StartsWith("b", StringComparison.Ordinal) && mnemonic.EndsWith("lr", StringComparison.Ordinal)))
+            {
+                if (lrReturnOffset.HasValue && lrReturnOffset.Value != 0)
+                {
+                    yield return lrReturnOffset.Value;
+                }
+                lrReturnOffset = null;
+                continue;
+            }
+
+            if (instruction.IsCall || mnemonic == "bl" || mnemonic == "blrl")
+            {
+                lrReturnOffset = null;
+            }
+
+            if (TryInstructionWritesDest(instruction, out var dest))
+            {
+                lrOffsets.Remove(dest);
+            }
+        }
+
+        static bool TryGetInstructionReg(PpcInstruction instruction, int index, out string register)
+        {
+            if (instruction.Operands.Count > index && instruction.Operands[index] is PpcRegisterOperand operand)
+            {
+                register = NormalizeInstructionReg(operand.Name);
+                return true;
+            }
+
+            register = string.Empty;
+            return false;
+        }
+
+        static bool TryGetInstructionImm(PpcInstruction instruction, int index, out int immediate)
+        {
+            if (instruction.Operands.Count > index && instruction.Operands[index] is PpcImmediateOperand operand)
+            {
+                immediate = operand.Value;
+                return true;
+            }
+
+            immediate = 0;
+            return false;
+        }
+
+        static bool TryInstructionWritesDest(PpcInstruction instruction, out string destination)
+        {
+            destination = string.Empty;
+            if (instruction.Operands.Count == 0 || instruction.Operands[0] is not PpcRegisterOperand operand)
+            {
+                return false;
+            }
+
+            var mnemonic = instruction.Mnemonic.ToLowerInvariant();
+            if (mnemonic.StartsWith("st", StringComparison.Ordinal) ||
+                mnemonic.StartsWith("b", StringComparison.Ordinal) ||
+                mnemonic.StartsWith("cmp", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            destination = NormalizeInstructionReg(operand.Name);
+            return true;
+        }
+
+        static string NormalizeInstructionReg(string register) => register.ToLowerInvariant();
+    }
 }
