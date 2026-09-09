@@ -148,7 +148,7 @@ translator emit-base-manifest \
    Online play in Retro Rewind requires the shared Retro-WFC payload. Download and validate it:
    ```bash
    mkdir -p build/retro-wfc/binary
-   curl -fsSL --retry 3 "http://nas.play.rwfc.net/payload?g=RMCPD00" \
+   curl -fsSL --retry 3 "https://nas.play.rwfc.net/payload?g=RMCPD00" \
      -o build/retro-wfc/binary/payload.RMCPD00.bin
 
    # Validate payload signature and integrity
