@@ -83,7 +83,15 @@ dependency_path() {
                 esac
                 candidate="$rpath/$name"
                 [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
-            done < <(otool -l "$current" | awk '/LC_RPATH/{rpath = 1; next} rpath && /path / { print $2; rpath = 0 }')
+            done < <(otool -l "$current" | awk '
+                /LC_RPATH/ { rpath = 1; next }
+                rpath && /^[[:space:]]*path / {
+                    sub(/^[[:space:]]*path /, "")
+                    sub(/ \(offset [0-9]+\)$/, "")
+                    print
+                    rpath = 0
+                }
+            ')
             ;;
         @loader_path/*)
             candidate="$(dirname "$current")/${dependency#@loader_path/}"
@@ -105,7 +113,9 @@ while ((${#queue[@]})); do
         if [[ ! -f "$frameworks/$name" ]]; then
             ditto "$dependency_path" "$frameworks/$name"
             install_name_tool -id "@rpath/$name" "$frameworks/$name"
-            queue+=("$frameworks/$name")
+            # Resolve transitive @loader_path dependencies relative to the
+            # original dylib, not its copied Frameworks location.
+            queue+=("$dependency_path")
         fi
     done < <(otool -L "$current" | tail -n +2 | awk '{print $1}')
 done
