@@ -297,8 +297,6 @@ public static class ContinuationPlanner
         var seenOffsets = new HashSet<int>();
         var worklist = new Queue<(int Index, PathState State)>();
         const int MaxStatesPerInstruction = 16;
-        const int MaxEvaluationSteps = 10000;
-        var evaluationSteps = 0;
 
         void Enqueue(int targetIndex, PathState stateToEnqueue)
         {
@@ -333,11 +331,6 @@ public static class ContinuationPlanner
             if (visited[idx].Count > MaxStatesPerInstruction)
             {
                 continue;
-            }
-
-            if (++evaluationSteps > MaxEvaluationSteps)
-            {
-                break;
             }
 
             var instruction = instructions[idx];
@@ -426,6 +419,16 @@ public static class ContinuationPlanner
                     nextState = nextState.WithoutLrOffset(stwuBase);
                 }
             }
+            else if (TryGetStackStoreRange(instruction, out var storeOffset, out var storeSize, out var updatesStackPointer))
+            {
+                nextState = nextState.WithoutStackOffsetsInRange(
+                    nextState.SpDelta + storeOffset,
+                    storeSize);
+                if (updatesStackPointer)
+                {
+                    nextState = nextState.WithSpDelta(checked(nextState.SpDelta + storeOffset));
+                }
+            }
             else if (mnemonic == "lwz" &&
                 TryGetInstructionReg(instruction, 0, out var loadDest) &&
                 TryGetInstructionDisplacement(instruction, 1, out var loadDisp, out var loadBase, out _))
@@ -470,7 +473,14 @@ public static class ContinuationPlanner
 
             if (instruction.IsCall || mnemonic == "bl" || mnemonic == "blrl")
             {
-                nextState = nextState.WithLrReturnOffset(null);
+                nextState = nextState.WithLrReturnOffset(null).WithCtrOffset(null);
+                for (var register = 0; register <= 12; register++)
+                {
+                    if (register != 1 && register != 2)
+                    {
+                        nextState = nextState.WithoutLrOffset($"r{register}");
+                    }
+                }
             }
 
             if (mnemonic == "bctr")
@@ -614,6 +624,41 @@ public static class ContinuationPlanner
             return true;
         }
 
+        static bool TryGetStackStoreRange(PpcInstruction instruction, out int offset, out int size, out bool updatesStackPointer)
+        {
+            offset = 0;
+            size = 0;
+            updatesStackPointer = false;
+            if (!TryGetInstructionDisplacement(instruction, 1, out offset, out var baseRegister, out _) ||
+                baseRegister != "r1")
+            {
+                return false;
+            }
+
+            switch (instruction.Mnemonic.ToLowerInvariant())
+            {
+                case "stfs":
+                    size = 4;
+                    return true;
+                case "stfsu":
+                    size = 4;
+                    updatesStackPointer = true;
+                    return true;
+                case "stfd":
+                    size = 8;
+                    return true;
+                case "stfdu":
+                    size = 8;
+                    updatesStackPointer = true;
+                    return true;
+                case "stmw" when instruction.Operands[0] is PpcRegisterOperand register:
+                    size = checked((32 - Math.Clamp(register.Number, 0, 31)) * 4);
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         static string NormalizeInstructionReg(string register) => register.ToLowerInvariant();
     }
 
@@ -680,6 +725,23 @@ public static class ContinuationPlanner
             StackOffsets.ContainsKey(slot)
                 ? new(LrOffsets, CtrOffset, LrReturnOffset, SpDelta, StackOffsets.Remove(slot))
                 : this;
+
+        public PathState WithoutStackOffsetsInRange(int start, int size)
+        {
+            var end = checked(start + size);
+            var remaining = StackOffsets;
+            foreach (var slot in StackOffsets.Keys)
+            {
+                if (slot < end && start < checked(slot + 4))
+                {
+                    remaining = remaining.Remove(slot);
+                }
+            }
+
+            return remaining.Count == StackOffsets.Count
+                ? this
+                : new(LrOffsets, CtrOffset, LrReturnOffset, SpDelta, remaining);
+        }
 
         public PathState WithClearedStackOffsets() =>
             StackOffsets.IsEmpty
