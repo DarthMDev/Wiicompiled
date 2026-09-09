@@ -210,6 +210,112 @@ public class LrRelativeContinuationTests
         Assert.Empty(offsets);
     }
 
+    [Fact]
+    public void LargeStraightLineHandlerStillDiscoversSkipReturn()
+    {
+        // The analyzer's global step budget is spent one step per (instruction,
+        // state) pair, so a long enough handler exhausts it before reaching the
+        // return and silently reports no continuation at all. Main's linear
+        // scanner had no budget and always found the offset.
+        var words = new List<uint>
+        {
+            0x7FE802A6u, // mflr r31
+            0x3BFF0014u  // addi r31,r31,20
+        };
+        for (var i = 0; i < 10_010; i++)
+        {
+            words.Add(0x60000000u); // nop
+        }
+        words.Add(0x7FE803A6u); // mtlr r31
+        words.Add(0x4E800020u); // blr
+
+        Assert.Equal(new[] { 20 }, DiscoverOffsets(words.ToArray()));
+    }
+
+    [Fact]
+    public void LargeBranchingHandlerStillDiscoversCtrSkip()
+    {
+        // Same budget, reached far sooner once the handler branches: this is the
+        // bctr shape the pre-PR scanner discovered at any function size.
+        var words = new List<uint> { 0x7FE802A6u }; // mflr r31
+        for (var i = 0; i < 160; i++)
+        {
+            var displacement = (uint)((i + 1) * 4 & 0xFFFF);
+            words.Add(0x2C030000u);                  // cmpwi r3,0
+            words.Add(0x4182000Cu);                  // beq +0xC
+            words.Add(0x3BDF0000u | displacement);   // addi r30,r31,disp
+            words.Add(0x48000008u);                  // b +8
+            words.Add(0x3BBF0000u | displacement);   // addi r29,r31,disp
+        }
+        words.Add(0x397F0008u); // addi r11,r31,8
+        words.Add(0x7D6903A6u); // mtctr r11
+        words.Add(0x4E800420u); // bctr
+
+        Assert.Equal(new[] { 8 }, DiscoverOffsets(words.ToArray()));
+    }
+
+    [Fact]
+    public void FloatStoreOverSavedSlotInvalidatesStackTracking()
+    {
+        // stfd writes 0x10..0x17, which covers the slot the adjusted LR was
+        // saved to. Only stw/stwu invalidate slots today, so the reload is
+        // credited with a return address the stack no longer holds.
+        var offsets = DiscoverOffsets(
+            0x7FE802A6u, // mflr r31
+            0x3BFF0014u, // addi r31,r31,20
+            0x93E10014u, // stw r31,0x14(r1)
+            0xD8410010u, // stfd f2,0x10(r1)
+            0x80010014u, // lwz r0,0x14(r1)
+            0x7C0803A6u, // mtlr r0
+            0x4E800020u);// blr
+
+        Assert.Empty(offsets);
+    }
+
+    [Fact]
+    public void StoreMultipleOverSavedSlotInvalidatesStackTracking()
+    {
+        var offsets = DiscoverOffsets(
+            0x7FE802A6u, // mflr r31
+            0x3BFF0014u, // addi r31,r31,20
+            0x93E10008u, // stw r31,8(r1)
+            0xBFC10008u, // stmw r30,8(r1)
+            0x80010008u, // lwz r0,8(r1)
+            0x7C0803A6u, // mtlr r0
+            0x4E800020u);// blr
+
+        Assert.Empty(offsets);
+    }
+
+    [Fact]
+    public void VolatileRegisterDoesNotSurviveHelperCall()
+    {
+        // r3 is caller-saved, so the callee is free to destroy the adjusted
+        // return address this hook staged before the call.
+        var offsets = DiscoverOffsets(
+            0x7C6802A6u, // mflr r3
+            0x38630014u, // addi r3,r3,20
+            0x48000101u, // bl helper outside this function
+            0x7C6803A6u, // mtlr r3
+            0x4E800020u);// blr
+
+        Assert.Empty(offsets);
+    }
+
+    [Fact]
+    public void CtrDoesNotSurviveHelperCall()
+    {
+        // CTR is volatile across a call for the same reason.
+        var offsets = DiscoverOffsets(
+            0x7FE802A6u, // mflr r31
+            0x3BFF0014u, // addi r31,r31,20
+            0x7FE903A6u, // mtctr r31
+            0x48000101u, // bl helper outside this function
+            0x4E800420u);// bctr
+
+        Assert.Empty(offsets);
+    }
+
     private static uint AddiR31(int offset) => 0x3BFF0000u | (uint)(offset & 0xFFFF);
 
     private static int[] DiscoverOffsets(params uint[] words)
