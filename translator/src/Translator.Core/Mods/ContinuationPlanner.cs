@@ -426,6 +426,18 @@ public static class ContinuationPlanner
                     storeSize);
                 if (updatesStackPointer)
                 {
+                    if (nextState.LrOffsets.TryGetValue("r1", out var lrOffset))
+                    {
+                        try
+                        {
+                            nextState = nextState.WithLrOffset("r1", checked(lrOffset + storeOffset));
+                        }
+                        catch (OverflowException)
+                        {
+                            nextState = nextState.WithoutLrOffset("r1");
+                        }
+                    }
+
                     nextState = nextState.WithSpDelta(checked(nextState.SpDelta + storeOffset));
                 }
             }

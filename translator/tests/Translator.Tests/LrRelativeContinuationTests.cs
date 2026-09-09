@@ -288,6 +288,18 @@ public class LrRelativeContinuationTests
     }
 
     [Fact]
+    public void StackPointerUpdatePreservesAdjustedLrOffset()
+    {
+        var offsets = DiscoverOffsets(
+            0x7C2802A6u, // mflr r1
+            0xDC410004u, // stfdu f2,4(r1)
+            0x7C2803A6u, // mtlr r1
+            0x4E800020u);// blr
+
+        Assert.Equal(new[] { 4 }, offsets);
+    }
+
+    [Fact]
     public void VolatileRegisterDoesNotSurviveHelperCall()
     {
         // r3 is caller-saved, so the callee is free to destroy the adjusted
