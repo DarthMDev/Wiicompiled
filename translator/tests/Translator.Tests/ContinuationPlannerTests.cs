@@ -136,9 +136,9 @@ public class ContinuationPlannerTests
         var instructions = new[]
         {
             PpcDecoder.Decode(0x8180D8E8, 0x7FE802A6u), // mflr r31
-            PpcDecoder.Decode(0x8180D8FC, 0x3BFF0014u), // addi r31, r31, 20
-            PpcDecoder.Decode(0x8180D900, 0x7FE803A6u), // mtlr r31
-            PpcDecoder.Decode(0x8180D910, 0x4E800020u), // blr
+            PpcDecoder.Decode(0x8180D8EC, 0x3BFF0014u), // addi r31, r31, 20
+            PpcDecoder.Decode(0x8180D8F0, 0x7FE803A6u), // mtlr r31
+            PpcDecoder.Decode(0x8180D8F4, 0x4E800020u), // blr
         };
 
         var offsets = ContinuationPlanner.DiscoverLrRelativeIndirectJumpOffsets(instructions).ToArray();
@@ -153,9 +153,9 @@ public class ContinuationPlannerTests
         {
             PpcDecoder.Decode(0x8180D8E8, 0x7FE802A6u), // mflr r31
             PpcDecoder.Decode(0x8180D8EC, 0x93E10008u), // stw r31, 8(r1)
-            PpcDecoder.Decode(0x8180D904, 0x83E10008u), // lwz r31, 8(r1)
-            PpcDecoder.Decode(0x8180D908, 0x7FE803A6u), // mtlr r31
-            PpcDecoder.Decode(0x8180D910, 0x4E800020u), // blr
+            PpcDecoder.Decode(0x8180D8F0, 0x83E10008u), // lwz r31, 8(r1)
+            PpcDecoder.Decode(0x8180D8F4, 0x7FE803A6u), // mtlr r31
+            PpcDecoder.Decode(0x8180D8F8, 0x4E800020u), // blr
         };
 
         var offsets = ContinuationPlanner.DiscoverLrRelativeIndirectJumpOffsets(instructions);

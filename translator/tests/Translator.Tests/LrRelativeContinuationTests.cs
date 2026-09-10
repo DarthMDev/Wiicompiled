@@ -328,6 +328,50 @@ public class LrRelativeContinuationTests
         Assert.Empty(offsets);
     }
 
+    [Fact]
+    public void MflrR1InvalidatesOldStackSlots()
+    {
+        // After mflr r1, 8(r1) refers to incoming LR + 8, not the old
+        // stack slot. Its contents are unknown; do not invent a +20 return.
+        Assert.Empty(DiscoverOffsets(
+            0x7FE802A6u, // mflr r31
+            0x3BFF0014u, // addi r31,r31,20
+            0x93E10008u, // stw r31,8(r1)
+            0x7C2802A6u, // mflr r1
+            0x80010008u, // lwz r0,8(r1)
+            0x7C0803A6u, // mtlr r0
+            0x4E800020u)); // blr
+    }
+
+    [Fact]
+    public void AddiR1UpdatesLrRelativeOffset()
+    {
+        // Like StackPointerUpdatePreservesAdjustedLrOffset, r1 holds incoming
+        // LR here. Updating r1 must update that relation as well as stack state.
+        Assert.Equal(new[] { 4 }, DiscoverOffsets(
+            0x7C2802A6u, // mflr r1
+            0x38210004u, // addi r1,r1,4
+            0x7C2803A6u, // mtlr r1
+            0x4E800020u)); // blr
+    }
+
+    [Fact]
+    public void IncompleteInstructionListDoesNotInventFallthroughAcrossGap()
+    {
+        // Defensive incomplete-input test, not a production disassembly trace:
+        // the missing instruction could overwrite r31 or branch elsewhere.
+        // Address sorting alone does not establish a fallthrough edge.
+        var instructions = new[]
+        {
+            PpcDecoder.Decode(0x81800000u, 0x7FE802A6u), // mflr r31
+            PpcDecoder.Decode(0x81800008u, 0x3BFF0014u), // addi r31,r31,20
+            PpcDecoder.Decode(0x8180000Cu, 0x7FE803A6u), // mtlr r31
+            PpcDecoder.Decode(0x81800010u, 0x4E800020u), // blr
+        };
+
+        Assert.Empty(ContinuationPlanner.DiscoverLrRelativeIndirectJumpOffsets(instructions));
+    }
+
     private static uint AddiR31(int offset) => 0x3BFF0000u | (uint)(offset & 0xFFFF);
 
     private static int[] DiscoverOffsets(params uint[] words)
