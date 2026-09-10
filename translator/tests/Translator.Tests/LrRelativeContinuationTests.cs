@@ -355,6 +355,57 @@ public class LrRelativeContinuationTests
             0x4E800020u)); // blr
     }
 
+    [Theory]
+    [InlineData(0x38210004u, 4)] // addi r1,r1,4
+    [InlineData(0x30210004u, 4)] // addic r1,r1,4
+    [InlineData(0x94210004u, 4)] // stwu r1,4(r1)
+    [InlineData(0xD4410004u, 4)] // stfsu f2,4(r1)
+    [InlineData(0xDC410004u, 4)] // stfdu f2,4(r1)
+    [InlineData(0x3821FFFCu, -4)] // addi r1,r1,-4
+    public void StackPointerUpdatesPreserveLrRelation(uint update, int expectedOffset)
+    {
+        Assert.Equal(new[] { expectedOffset }, DiscoverOffsets(
+            0x7C2802A6u, // mflr r1
+            update,
+            0x7C2803A6u, // mtlr r1
+            0x4E800020u)); // blr
+    }
+
+    [Theory]
+    [InlineData(0x7FE1FB78u)] // mr r1,r31
+    [InlineData(0x383F0000u)] // addi r1,r31,0
+    public void CopyingLrIntoR1PreservesReturnButInvalidatesOldStack(uint copy)
+    {
+        var prefix = new uint[]
+        {
+            0x7FE802A6u, // mflr r31
+            0x3BFF0014u, // addi r31,r31,20
+            0x93E10008u, // stw r31,8(r1)
+            copy,
+        };
+        Assert.Equal(new[] { 20 }, DiscoverOffsets(
+            prefix.Concat(new uint[] { 0x7C2803A6u, 0x4E800020u }).ToArray()));
+        Assert.Empty(DiscoverOffsets(prefix.Concat(new uint[]
+        {
+            0x80010008u, // lwz r0,8(r1): no longer the old stack slot
+            0x7C0803A6u, // mtlr r0
+            0x4E800020u,
+        }).ToArray()));
+    }
+
+    [Fact]
+    public void StackPointerSelfMovePreservesSavedLr()
+    {
+        Assert.Equal(new[] { 20 }, DiscoverOffsets(
+            0x7FE802A6u, // mflr r31
+            0x3BFF0014u, // addi r31,r31,20
+            0x93E10008u, // stw r31,8(r1)
+            0x7C210B78u, // mr r1,r1
+            0x80010008u, // lwz r0,8(r1)
+            0x7C0803A6u, // mtlr r0
+            0x4E800020u));
+    }
+
     [Fact]
     public void IncompleteInstructionListDoesNotInventFallthroughAcrossGap()
     {
