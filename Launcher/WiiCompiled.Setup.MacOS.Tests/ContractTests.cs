@@ -6,9 +6,20 @@ using Xunit;
 public sealed class ContractTests : IDisposable
 {
     readonly string root = Path.Combine(Path.GetTempPath(), "mkwc-tests-" + Guid.NewGuid().ToString("N"));
+    readonly string originalToolkitDirectory = MacSetup.ToolkitDirectory;
     string Install => Path.Combine(root, "Install");
-    public ContractTests() => Directory.CreateDirectory(root);
-    public void Dispose() => Directory.Delete(root, true);
+    public ContractTests()
+    {
+        Directory.CreateDirectory(root);
+        MacSetup.ToolkitDirectory = Path.Combine(root, "Toolkit");
+        Directory.CreateDirectory(MacSetup.ToolkitDirectory);
+        File.WriteAllText(Path.Combine(MacSetup.ToolkitDirectory, "fixture.txt"), "stable toolkit fixture");
+    }
+    public void Dispose()
+    {
+        MacSetup.ToolkitDirectory = originalToolkitDirectory;
+        Directory.Delete(root, true);
+    }
 
     [Fact]
     public void RejectsAmbiguousOrIncompleteCommands()
@@ -71,7 +82,7 @@ public sealed class ContractTests : IDisposable
         var retroBinary = MakeProduct("RetroRewind");
         var state = new State { SchemaVersion = 1, SetupVersion = MacSetup.Version, InstallDir = Install,
             RetroRewindInstalled = true, RetroRoot = retro, CompileHash = CompileInputsFingerprint.Compute(retro).CompileInputsSha256,
-            ToolkitHash = MacSetup.ToolkitHash(), BaseHash = MacSetup.HashTree(Path.Combine(Install, "WiiCompiled.app")), RetroHash = MacSetup.HashTree(Path.Combine(Install, "RetroRewind.app")) };
+            ToolkitHash = MacSetup.ToolkitHash(), ToolkitKey = MacSetup.ToolkitKey(), BaseHash = MacSetup.HashTree(Path.Combine(Install, "WiiCompiled.app")), RetroHash = MacSetup.HashTree(Path.Combine(Install, "RetroRewind.app")) };
         Assert.False(MacSetup.Check(Install, state, retro).NeedsRepair);
         File.WriteAllText(Path.Combine(retro, "track.szs"), "asset update");
         Assert.False(MacSetup.Check(Install, state, retro).NeedsRepair);
@@ -99,6 +110,21 @@ public sealed class ContractTests : IDisposable
         Assert.True(File.Exists(Path.Combine(Install, "previous.txt")));
         Assert.False(File.Exists(Path.Combine(Install, "partial.txt")));
         Assert.Equal("old config", File.ReadAllText(config));
+        Assert.False(File.Exists(Install + ".config-backup"));
+    }
+
+    [Theory]
+    [InlineData("{")]
+    [InlineData("null")]
+    public void MalformedRecoveryJournalPreservesCurrentInstall(string journalContents)
+    {
+        Directory.CreateDirectory(Install);
+        File.WriteAllText(Path.Combine(Install, "current.txt"), "current product");
+        File.WriteAllText(Install + ".config-backup", journalContents);
+
+        MacSetup.Recover(Install);
+
+        Assert.True(File.Exists(Path.Combine(Install, "current.txt")));
         Assert.False(File.Exists(Install + ".config-backup"));
     }
 

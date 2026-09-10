@@ -17,6 +17,16 @@ else()
     message(FATAL_ERROR
         "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS arm64")
 endif()
+
+# Do not inherit the host SDK's deployment target (macOS 26 on current
+# toolchains). The supported Apple Silicon release is macOS 14 and the app
+# bundle advertises that same minimum. This remains arm64-only until the Intel
+# support work is merged.
+if(MKW_PLATFORM_MACOS)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0" CACHE STRING
+        "Minimum macOS version for the Apple Silicon build" FORCE)
+endif()
+
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     message(FATAL_ERROR "WiiCompiled only supports Release builds")
 endif()
@@ -276,6 +286,15 @@ add_executable(mkw_platform_paths_tests "${CMAKE_CURRENT_LIST_DIR}/tests/platfor
 target_link_libraries(mkw_platform_paths_tests PRIVATE mkw_platform)
 target_compile_features(mkw_platform_paths_tests PRIVATE cxx_std_17)
 add_test(NAME mkw_platform_paths_tests COMMAND mkw_platform_paths_tests)
+
+# The input expression engine is self-contained, so it can be exercised without
+# linking the runtime or SDL.
+add_executable(mkw_input_expr_tests
+    "${CMAKE_CURRENT_LIST_DIR}/tests/test_expr.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/input_expr.cpp")
+target_include_directories(mkw_input_expr_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+target_compile_features(mkw_input_expr_tests PRIVATE cxx_std_17)
+add_test(NAME mkw_input_expr_tests COMMAND mkw_input_expr_tests)
 
 # HostContext deliberately keeps the platform-specific context primitive out
 # of fiber_manager.cpp. Exercise the Linux libco handoff directly so future

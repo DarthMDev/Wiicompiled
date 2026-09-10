@@ -15,6 +15,7 @@ internal static class MacSetup
     internal static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, PropertyNameCaseInsensitive = true };
     static CancellationToken cancellation;
     static readonly string Resources = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+    internal static string ToolkitDirectory { get; set; } = Resources;
     static void Emit(object value) => Console.WriteLine(JsonSerializer.Serialize(value, Json));
     static int lastPercent;
     static void Progress(string message, int percent = 10)
@@ -103,14 +104,34 @@ internal static class MacSetup
         }
         return Convert.ToHexString(hash.GetHashAndReset());
     }
-    internal static string ToolkitHash() => HashTree(Resources);
+    internal static string ToolkitHash() => HashTree(ToolkitDirectory);
+
+    internal static string ToolkitKey()
+    {
+        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+        var count = 0;
+        foreach (var path in Directory.EnumerateFiles(ToolkitDirectory, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
+        {
+            var file = new FileInfo(path);
+            hash.AppendData(System.Text.Encoding.UTF8.GetBytes(
+                $"{Path.GetRelativePath(ToolkitDirectory, path)}\0{file.Length}\0{file.LastWriteTimeUtc.Ticks}\n"));
+            count++;
+        }
+        return $"{count}:{Convert.ToHexString(hash.GetHashAndReset())}";
+    }
 
     internal static Report Check(string install, State? state, string? retro)
     {
         if (state is null || state.SchemaVersion != 1 || state.SetupVersion != Version || state.InstallDir != install)
             return new(new("toolkit-changed", "The installation identity does not match this setup."), new("toolkit-changed", "Install the current setup."));
-        if (state.ToolkitHash != ToolkitHash())
-            return new(new("toolkit-changed", "The installed source or build tools changed."), new("toolkit-changed", "Repair using a verified setup."));
+        var toolkitKey = ToolkitKey();
+        if (state.ToolkitKey != toolkitKey)
+        {
+            if (state.ToolkitHash != ToolkitHash())
+                return new(new("toolkit-changed", "The installed source or build tools changed."), new("toolkit-changed", "Repair using a verified setup."));
+            state.ToolkitKey = toolkitKey;
+            FileSystemUtilities.WriteAtomic(StatePath(install), JsonSerializer.Serialize(state, Json));
+        }
         Product CheckProduct(string name, string? expected)
         {
             var binary = Executable(install, name);
@@ -208,7 +229,7 @@ internal static class MacSetup
         File.WriteAllText(Path.Combine(staging, "WiiCompiled-Setup.run"), "#!/bin/bash\nexec \"$(cd \"$(dirname \"$0\")\" && pwd)/Setup/WiiCompiled.Setup.MacOS\" \"$@\"\n");
         var state = new State { SchemaVersion = 1, SetupVersion = Version, InstallDir = install, GamePath = game,
             RetroRewindInstalled = retro is not null, RetroWfcPayloadMode = retro is null ? null : options.Skip ? "skipped" : "downloaded",
-            RetroRoot = retro, CompileHash = inputs?.CompileInputsSha256, ToolkitHash = ToolkitHash(), BaseHash = HashTree(Path.Combine(staging, "WiiCompiled.app")),
+            RetroRoot = retro, CompileHash = inputs?.CompileInputsSha256, ToolkitHash = ToolkitHash(), ToolkitKey = ToolkitKey(), BaseHash = HashTree(Path.Combine(staging, "WiiCompiled.app")),
             RetroHash = retro is null ? null : HashTree(Path.Combine(staging, "RetroRewind.app")) };
         File.WriteAllText(StatePath(staging), JsonSerializer.Serialize(state, Json));
         cancellation.ThrowIfCancellationRequested();
@@ -216,7 +237,7 @@ internal static class MacSetup
         var config = RuntimeConfiguration.ResolveConfigPath(install);
         var oldConfig = RuntimeConfiguration.Capture(config);
         // Store the config snapshot before moving anything, allowing the next invocation to recover after a killed process.
-        File.WriteAllText(install + ".config-backup", JsonSerializer.Serialize(oldConfig, Json));
+        FileSystemUtilities.WriteAtomic(install + ".config-backup", JsonSerializer.Serialize(oldConfig, Json));
         var backup = install + ".previous";
         try
         {
@@ -237,7 +258,10 @@ internal static class MacSetup
         var backup = install + ".previous";
         if (File.Exists(journal))
         {
-            var snapshot = JsonSerializer.Deserialize<RuntimeConfigSnapshot>(File.ReadAllText(journal), Json)!;
+            RuntimeConfigSnapshot? snapshot;
+            try { snapshot = JsonSerializer.Deserialize<RuntimeConfigSnapshot>(File.ReadAllText(journal), Json); }
+            catch (JsonException) { File.Delete(journal); return; }
+            if (snapshot is null) { File.Delete(journal); return; }
             RuntimeConfiguration.Restore(RuntimeConfiguration.ResolveConfigPath(install), snapshot);
             if (Directory.Exists(backup))
             {
@@ -296,6 +320,7 @@ internal sealed class State
     public string? RetroRoot { get; set; }
     public string? CompileHash { get; set; }
     public string? ToolkitHash { get; set; }
+    public string? ToolkitKey { get; set; }
     public string? BaseHash { get; set; }
     public string? RetroHash { get; set; }
 }
