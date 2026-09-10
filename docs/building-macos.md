@@ -49,7 +49,7 @@ Due to legal requirements, no proprietary Nintendo assets or code are included i
 3. **Retro Rewind Distribution** *(Skip if only building WiiCompiled)*:
    - Download the [Retro Rewind](https://wiki.tockdom.com/wiki/Retro_Rewind) release package. You will need the `RetroRewind6` folder (which contains `Binaries/Code.pul`).
 4. **Retro-WFC Payload** *(Skip if only building WiiCompiled or building offline)*:
-   - Required for online multiplayer on Retro Rewind. Downloaded during setup from `http://nas.play.rwfc.net/payload?g=RMCPD00`.
+   - Required for online multiplayer on Retro Rewind. Downloaded during setup from `https://rwfc.net/api/wfc/payload?g=RMCPD00`.
 
 ---
 
@@ -320,7 +320,7 @@ Launcher/local-build-macos.command \
 ```bash
 # 1. Download Retro-WFC payload into a staging directory:
 mkdir -p build/retro-wfc/binary
-curl -fsSL --retry 3 "http://nas.play.rwfc.net/payload?g=RMCPD00" \
+curl -fsSL --retry 3 "https://rwfc.net/api/wfc/payload?g=RMCPD00" \
   -o build/retro-wfc/binary/payload.RMCPD00.bin
 
 # 2. Run the automated build with the payload directory:
