@@ -45,6 +45,9 @@ short_version="$version_major.${version_minor:-0}.${version_patch:-0}"
 for tool in pkgbuild productbuild ditto codesign; do command -v "$tool" >/dev/null || fail "required macOS tool unavailable: $tool"; done
 [[ -x "$nodtool" ]] || fail '--nodtool must name an executable'
 [[ -x "$translator" ]] || fail '--translator must name an executable'
+translator_dir=$(cd "$(dirname "$translator")" && pwd)
+[[ -f "$translator_dir/Translator.Cli.dll" ]] || \
+    fail '--translator must be the self-contained Translator.Cli executable beside Translator.Cli.dll'
 [[ -x "$cmake_root/bin/cmake" ]] || fail '--cmake-root must contain bin/cmake'
 [[ -x "$ninja" ]] || fail '--ninja must name an executable'
 "$nodtool" --version >/dev/null || fail '--nodtool did not run successfully'
@@ -108,7 +111,12 @@ chmod +x "$resources/workspace/Launcher/local-build-macos.command" "$resources/w
 printf '%s\n' "$version" > "$resources/workspace/.bundle-version"
 mkdir -p "$resources/tools/cmake"
 copy_clean "$nodtool" "$resources/tools/nodtool"; chmod +x "$resources/tools/nodtool"
-copy_clean "$translator" "$resources/tools/Translator.Cli"; chmod +x "$resources/tools/Translator.Cli"
+# The native Translator.Cli launcher is a .NET host, not a single-file binary:
+# it requires Translator.Cli.dll, its runtimeconfig and bundled runtime files in
+# the same directory.  Copying only the launcher makes the installed Setup app
+# fail before it can validate/download the Retro-WFC payload.
+copy_clean "$translator_dir/." "$resources/tools"
+chmod +x "$resources/tools/Translator.Cli"
 copy_clean "$cmake_root" "$resources/tools/cmake"
 copy_clean "$ninja" "$resources/tools/ninja"; chmod +x "$resources/tools/ninja"
 copy_clean "$workspace/LICENSE" "$resources/LICENSE"
