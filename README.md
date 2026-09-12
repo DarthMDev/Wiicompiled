@@ -77,12 +77,12 @@ for the main stick, left mouse for A (accelerate), Space for B (brake), right mo
 Keys and mouse buttons can be remapped, including both sticks and triggers; mouse movement
 is not used. These settings are saved in `keyboard_bindings.dat` and restored next launch.
 
-**Dolphin-compatible input expressions.** 
+**Dolphin-compatible input expressions.**
 Each GameCube control can carry an expression in Dolphin's input syntax, with the same operators
 and the same functions.
 A Dolphin `GCPadNew.ini` can be imported directly from the F10 bar.
 
-**Vibration toggle.** 
+**Vibration toggle.**
 Force feedback can be turned off for every port at once.
 The official Wii U / Switch GameCube adapter (WUP-028) works too; as with Dolphin, on Windows the
 adapter must be switched to the WinUSB driver once (Zadig).
