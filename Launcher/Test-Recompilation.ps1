@@ -141,6 +141,7 @@ try {
     Invoke-Checked $cmake @('--build', $nativeBuild, '--target', 'WiiCompiled', '--parallel', "$Parallel") `
         'Compiling and linking the synthetic product with the full runtime' `
         -WaitForProcessTree $false
+
     Assert-File (Join-Path $nativeBuild 'WiiCompiled.exe') 'Linked synthetic product'
 } finally {
     $env:PATH = $oldPath

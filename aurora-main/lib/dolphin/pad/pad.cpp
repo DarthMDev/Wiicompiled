@@ -740,6 +740,7 @@ u32 PADRead(PADStatus* status) {
       std::for_each(g_keyboardBindings[i].m_buttonMapping.begin(), g_keyboardBindings[i].m_buttonMapping.end(),
                     [&kbState, &numKeys, &i, &status](const PADKeyButtonBinding& mapping) {
             if (mapping.scancode > PAD_KEY_INVALID && mapping.scancode < numKeys && kbState[mapping.scancode]) {
+
               status[i].button |= mapping.padButton;
             } else if (is_mouse_scancode(mapping.scancode) && is_mouse_button_pressed(mapping.scancode)) {
               status[i].button |= mapping.padButton;
@@ -847,7 +848,9 @@ u32 PADRead(PADStatus* status) {
       bool rightTriggerSet = false;
       std::for_each(controller->m_buttonMapping.begin(), controller->m_buttonMapping.end(),
                     [&controller, &i, &status, &leftTriggerSet, &rightTriggerSet](const auto& mapping) {
-        if (is_native_binding_pressed(controller->m_controller, mapping.nativeButton)) {
+        if (is_native_binding_pressed(controller->m_controller, mapping.nativeButton) ||
+            SDL_GetGamepadButton(controller->m_controller, static_cast<SDL_GamepadButton>(mapping.nativeButton))) {
+
           status[i].button |= mapping.padButton;
         }
 

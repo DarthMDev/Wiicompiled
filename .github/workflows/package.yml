@@ -130,6 +130,13 @@ jobs:
           printf '%s  %s\n' "$nodtool_arm64_sha256" Launcher/artifacts/macos/nodtool-arm64 | shasum -a 256 -c -
           printf '%s  %s\n' "$nodtool_x86_64_sha256" Launcher/artifacts/macos/nodtool-x86_64 | shasum -a 256 -c -
           chmod +x Launcher/artifacts/macos/nodtool-arm64 Launcher/artifacts/macos/nodtool-x86_64
+      - name: Publish self-contained Translator tools
+        shell: bash
+        run: |
+          printf '%s  %s\n' "$nodtool_arm64_sha256" Launcher/artifacts/macos/nodtool-arm64 | shasum -a 256 -c -
+          printf '%s  %s\n' "$nodtool_x86_64_sha256" Launcher/artifacts/macos/nodtool-x86_64 | shasum -a 256 -c -
+          chmod +x Launcher/artifacts/macos/nodtool-arm64 Launcher/artifacts/macos/nodtool-x86_64
+
         shell: bash
         run: |
           dotnet publish translator/src/Translator.Cli/Translator.Cli.csproj \
@@ -139,10 +146,22 @@ jobs:
             -c Release -r osx-arm64 --self-contained true \
             -p:PublishSingleFile=true \
             -o Launcher/artifacts/macos/translator-arm64
+
+            -o Launcher/artifacts/macos/translator-arm64
           dotnet publish translator/src/Translator.Cli/Translator.Cli.csproj \
             -c Release -r osx-x64 --self-contained true \
             -p:PublishSingleFile=true \
             -o Launcher/artifacts/macos/translator-x86_64
+      - name: Download pinned universal Ninja
+        shell: bash
+        run: |
+          ninja_version=1.13.2
+          ninja_sha256=c99048673aa765960a99cf10c6ddb9f1fad506099ff0a0e137ad8960a88f321b
+          curl -fsSL --retry 3 "https://github.com/ninja-build/ninja/releases/download/v${ninja_version}/ninja-mac.zip" -o ninja-mac.zip
+          printf '%s  %s\n' "$ninja_sha256" ninja-mac.zip | shasum -a 256 -c -
+          unzip -q ninja-mac.zip -d Launcher/artifacts/macos/ninja
+          chmod +x Launcher/artifacts/macos/ninja/ninja
+
 
       - name: Download pinned portable CMake
         shell: bash
@@ -175,6 +194,11 @@ jobs:
             --ninja-x86_64 Launcher/artifacts/macos/ninja/ninja \
             --output Launcher/dist/WiiCompiled-Setup.pkg \
             --version "$package_version"
+      - name: Verify package layout and architecture-specific tools
+        shell: bash
+        run: |
+          pkgutil --check-signature Launcher/dist/WiiCompiled-Setup.pkg
+
         shell: bash
         run: |
           pkgutil --check-signature Launcher/dist/WiiCompiled-Setup.pkg
