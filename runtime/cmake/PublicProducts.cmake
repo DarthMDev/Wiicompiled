@@ -28,6 +28,7 @@ list(REMOVE_DUPLICATES SOURCES)
 if(MKW_PLATFORM_MACOS)
     find_library(MKW_IOKIT_FRAMEWORK IOKit REQUIRED)
     find_library(MKW_COREFOUNDATION_FRAMEWORK CoreFoundation REQUIRED)
+    find_library(MKW_COREAUDIO_FRAMEWORK CoreAudio REQUIRED)
 endif()
 
 function(mkw_apply_common_compile_options target)
@@ -84,11 +85,22 @@ target_link_libraries(mkw_runtime_common PRIVATE
 target_link_libraries(mkw_runtime_common PRIVATE mkw_platform mkw::pugixml mkw::toml11 mkw::cryptopp mkw::mbedtls)
 if(MKW_PLATFORM_WINDOWS)
     target_link_libraries(mkw_runtime_common PRIVATE shell32 windowsapp)
-elseif(MKW_PLATFORM_LINUX OR MKW_PLATFORM_MACOS_X86_64)
+elseif(MKW_PLATFORM_LINUX)
     # ${CMAKE_DL_LIBS} for music_attenuation.cpp's dlopen of libdbus-1 (MPRIS
-    # media monitoring). Empty on platforms where dl* is already in libc/libSystem.
+    # media monitoring).
     target_link_libraries(mkw_runtime_common PRIVATE mkw::libco ${CMAKE_DL_LIBS})
 endif()
+
+if(MKW_PLATFORM_MACOS)
+    # CoreAudio framework is required for automatic music muting on macOS.
+    target_link_libraries(mkw_runtime_common PRIVATE "${MKW_COREAUDIO_FRAMEWORK}")
+    if(MKW_PLATFORM_MACOS_X86_64)
+        # libco is used by Intel macOS. Apple Silicon uses the local
+        # x18-safe assembly backend and therefore does not define mkw::libco.
+        target_link_libraries(mkw_runtime_common PRIVATE mkw::libco)
+    endif()
+endif()
+
 if(MKW_CPPWINRT_INCLUDE_DIR)
     if(NOT EXISTS "${MKW_CPPWINRT_INCLUDE_DIR}/winrt/base.h")
         message(FATAL_ERROR
@@ -205,7 +217,7 @@ function(mkw_configure_product target)
         aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx)
     if(MKW_PLATFORM_MACOS)
         target_link_libraries(${target} PRIVATE
-            "${MKW_IOKIT_FRAMEWORK}" "${MKW_COREFOUNDATION_FRAMEWORK}")
+            "${MKW_IOKIT_FRAMEWORK}" "${MKW_COREFOUNDATION_FRAMEWORK}" "${MKW_COREAUDIO_FRAMEWORK}")
         target_link_options(${target} PRIVATE
             "LINKER:-U,_OBJC_CLASS_$_MTLLogStateDescriptor")
     endif()
