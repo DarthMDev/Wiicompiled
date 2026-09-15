@@ -16,6 +16,10 @@ bool g_hasSample = false;
 CMMotionManager* g_manager = nil;
 NSOperationQueue* g_queue = nil;
 
+// Core Motion timestamps and NSProcessInfo.systemUptime use the same monotonic clock.
+// A stalled delivery queue must not leave steering driven by an old orientation sample.
+constexpr NSTimeInterval kMaximumSampleAge = 0.25;
+
 bool IsFinite(const CMAcceleration value) {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
 }
@@ -55,7 +59,11 @@ void Start() {
         ClearSample();
         [g_manager startDeviceMotionUpdatesToQueue:g_queue
                                         withHandler:^(CMDeviceMotion* motion, NSError* error) {
-            if (motion == nil || error != nil || !IsFinite(motion.gravity) ||
+            if (error != nil) {
+                ClearSample();
+                return;
+            }
+            if (motion == nil || !IsFinite(motion.gravity) ||
                 !IsFinite(motion.userAcceleration) || !std::isfinite(motion.timestamp)) {
                 return;
             }
@@ -88,6 +96,9 @@ void Stop() {
 bool Read(Sample& sample) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_hasSample) {
+        return false;
+    }
+    if (NSProcessInfo.processInfo.systemUptime - g_sample.timestamp > kMaximumSampleAge) {
         return false;
     }
     sample = g_sample;
