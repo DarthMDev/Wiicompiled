@@ -7,6 +7,7 @@
 #include "../internal.hpp"
 #include "../webgpu/gpu.hpp"
 #include "../gx/pipeline.hpp"
+#include "../gx/raytracing_scene.hpp"
 #include "pipeline_cache.hpp"
 #include "tex_copy_conv.hpp"
 #include "tex_palette_conv.hpp"
@@ -229,6 +230,7 @@ static void recycle_render_passes(std::vector<RenderPass>& passes) noexcept {
 
 struct SealedFrameData {
   std::vector<RenderPass> passes;
+  std::unique_ptr<gx::raytracing::SceneSnapshot> raytracing;
 };
 
 SealedFrame::SealedFrame() : m_data(std::make_unique<SealedFrameData>()) {}
@@ -1035,6 +1037,7 @@ static bool begin_frame_impl(bool clearEfb) {
 
   g_drawCallCount = 0;
   g_mergedDrawCallCount = 0;
+  gx::raytracing::begin_frame();
   if (clearEfb) {
     gx::begin_frame_interpolation();
   }
@@ -1068,6 +1071,7 @@ bool begin_frame() { return begin_frame_impl(true); }
 bool resume_frame() { return begin_frame_impl(false); }
 
 void abort_frame() noexcept {
+  gx::raytracing::discard_frame();
   efb_ram::cancel();
   efb_ram::abort_async();
   g_verts.release();
@@ -1349,7 +1353,12 @@ void seal_frame(SealedFrame& out) noexcept {
   // capacity included, back to the producer.
   recycle_render_passes(passes);
   passes.swap(g_renderPasses);
+  out.data().raytracing = gx::raytracing::seal_frame();
   g_currentRenderPass = UINT32_MAX;
+}
+
+const gx::raytracing::SceneSnapshot* raytracing_scene(const SealedFrame& frame) noexcept {
+  return frame.data().raytracing.get();
 }
 
 void render(SealedFrame& frame, wgpu::CommandEncoder& cmd, int32_t interpolatedFrame, bool finalize) {

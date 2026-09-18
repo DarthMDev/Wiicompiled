@@ -16,6 +16,7 @@ if (AURORA_ENABLE_GX)
   # Compile GX sources directly to avoid pulling in the full renderer/WebGPU runtime
   add_executable(gx_fifo_tests
     gx_fifo_test.cpp
+    raytracing_scene_test.cpp
     gx_test_stubs.cpp
     texture_bind_group_cache_key_test.cpp
     ../lib/gfx/efb_ram_encoder.cpp
@@ -43,6 +44,7 @@ if (AURORA_ENABLE_GX)
     ../lib/gx/command_processor.cpp
     ../lib/gx/shader_info.cpp
     ../lib/gx/frame_interpolation.cpp
+    ../lib/gx/raytracing_scene.cpp
   )
 
   target_include_directories(gx_fifo_tests PRIVATE

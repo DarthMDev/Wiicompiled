@@ -223,6 +223,10 @@ private:
 };
 } // namespace aurora
 
+namespace aurora::gx::raytracing {
+struct SceneSnapshot;
+}
+
 namespace aurora::gfx {
 inline constexpr bool UseTextureBuffer = false;
 inline constexpr uint64_t UniformBufferSize = 25165824;  // 24mb
@@ -309,6 +313,8 @@ private:
 // Detach the recorded passes of the frame that just ended into `out`. Must be
 // called with the renderer GPU mutex held; see SealedFrame.
 void seal_frame(SealedFrame& out) noexcept;
+// Null when hardware-RT capture was disabled or the sealed frame had no eligible draws.
+const gx::raytracing::SceneSnapshot* raytracing_scene(const SealedFrame& frame) noexcept;
 
 // Encode a sealed frame. Never touches the producer-visible recording state,
 // so this may run concurrently with the producer's FIFO drains.
