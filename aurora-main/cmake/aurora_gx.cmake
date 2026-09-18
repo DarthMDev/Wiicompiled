@@ -15,6 +15,7 @@ add_library(aurora_gx STATIC
         lib/gx/fifo.cpp
         lib/gx/frame_interpolation.cpp
         lib/gx/gx.cpp
+        lib/gx/metal_raytracing.cpp
         lib/gx/pipeline.cpp
         lib/gx/raytracing_scene.cpp
         lib/gx/shader.cpp
@@ -40,6 +41,13 @@ add_library(aurora_gx STATIC
         lib/gfx/png_io.cpp
         lib/gfx/png_io.hpp
 )
+if (APPLE AND DAWN_ENABLE_METAL)
+    target_sources(aurora_gx PRIVATE lib/gx/metal_raytracing.mm)
+    set_source_files_properties(lib/gx/metal_raytracing.mm PROPERTIES COMPILE_FLAGS -fobjc-arc)
+    target_link_libraries(aurora_gx PRIVATE "-framework Metal")
+else ()
+    target_sources(aurora_gx PRIVATE lib/gx/metal_raytracing_stub.cpp)
+endif ()
 add_library(aurora::gx ALIAS aurora_gx)
 set_target_properties(aurora_gx PROPERTIES FOLDER "aurora")
 
