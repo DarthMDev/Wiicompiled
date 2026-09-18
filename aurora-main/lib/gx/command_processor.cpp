@@ -2030,7 +2030,7 @@ static bool raytracing_capture_eligible(GXPrimitive prim, GXVtxFmt fmt) noexcept
 }
 
 static void capture_raytracing_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices,
-                                    uint16_t vtxCount, uint32_t vertexStride) noexcept {
+                                    uint16_t vtxCount, uint32_t vertexStride, bool bigEndian) noexcept {
   if (!raytracing::capture_enabled() || !raytracing_capture_eligible(prim, fmt)) {
     return;
   }
@@ -2050,6 +2050,7 @@ static void capture_raytracing_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_
       .stride = static_cast<u8>(vertexStride),
       .frac = position.frac,
   };
+  input.bigEndian = bigEndian;
   input.perVertexPnMtx = g_gxState.vtxDesc[GX_VA_PNMTXIDX] == GX_DIRECT;
   input.vertices = vertices;
   input.vertexBytes = static_cast<size_t>(vtxCount) * vertexStride;
@@ -2163,7 +2164,7 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
   // This entry point bypasses process(), so it owns the renderer lock itself.
   std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
   const gfx::Range vertRange = gfx::push_verts(vertices, vertexBytes);
-  capture_raytracing_draw(prim, fmt, vertices, vtxCount, vtxSize);
+  capture_raytracing_draw(prim, fmt, vertices, vtxCount, vtxSize, false);
   const bool interpolationIdentityActive = frame_interpolation_identity_needed();
   const PnMtxUsage matrixUsage = interpolationIdentityActive
                                      ? pn_mtx_usage(vertices, vtxCount, vtxSize)
@@ -2204,7 +2205,9 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
   const uint8_t* vertices = data + pos;
   gfx::Range vertRange = gfx::push_verts(vertices, totalVtxBytes);
   pos += totalVtxBytes;
-  capture_raytracing_draw(prim, fmt, vertices, vtxCount, vtxSize);
+  // Capture before possible raster draw merging. The ray scene keeps each GX
+  // primitive independently so its indices stay local to its vertex bytes.
+  capture_raytracing_draw(prim, fmt, vertices, vtxCount, vtxSize, bigEndian);
 
   // Try to merge with previous draw call
   if (!g_gxState.stateDirty) LIKELY {

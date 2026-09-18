@@ -21,11 +21,28 @@ struct Draw {
   uint32_t positionOffset = 0;
   uint32_t currentPnMtx = 0;
   AttrConfig position{};
+  // FIFO command draws are big-endian; raw bridge draws are native-endian.
+  bool bigEndian = false;
   bool perVertexPnMtx = false;
   std::array<Mat3x4<float>, MaxPnMtx> positionMatrices{};
   Mat4x4<float> projection{};
   std::vector<uint8_t> vertices;
   std::vector<uint16_t> indices;
+};
+
+// Triangles use GX's model-view coordinate system. Keeping the build inputs in
+// view space avoids a second transform during a same-frame native RT build.
+struct Triangle {
+  Vec3<float> a{};
+  Vec3<float> b{};
+  Vec3<float> c{};
+};
+
+struct DecodedScene {
+  std::vector<Triangle> triangles;
+  uint32_t rejectedDraws = 0;
+  uint32_t rejectedTriangles = 0;
+  uint32_t cappedTriangles = 0;
 };
 
 struct SceneSnapshot {
@@ -43,6 +60,7 @@ struct CaptureInput {
   uint32_t vertexStride = 0;
   uint32_t positionOffset = 0;
   AttrConfig position{};
+  bool bigEndian = false;
   bool perVertexPnMtx = false;
   const uint8_t* vertices = nullptr;
   size_t vertexBytes = 0;
@@ -61,4 +79,5 @@ void begin_frame() noexcept;
 void discard_frame() noexcept;
 bool record_opaque_draw(const CaptureInput& input) noexcept;
 std::unique_ptr<SceneSnapshot> seal_frame() noexcept;
+std::unique_ptr<DecodedScene> decode_view_space_triangles(const SceneSnapshot& snapshot) noexcept;
 } // namespace aurora::gx::raytracing

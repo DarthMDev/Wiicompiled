@@ -67,5 +67,40 @@ TEST(RaytracingScene, RejectsMalformedOrDisabledInput) {
   EXPECT_EQ(snapshot->rejectedDraws, 1u);
   set_capture_enabled(false);
 }
+
+TEST(RaytracingScene, DecodesBigEndianFixedPointPositionsAndPaletteTransforms) {
+  SceneSnapshot snapshot{};
+  Draw draw{};
+  draw.primitive = GX_TRIANGLES;
+  draw.vertexCount = 3;
+  draw.vertexStride = 7;
+  draw.positionOffset = 1;
+  draw.position = {.attrType = GX_DIRECT, .cnt = 3, .compType = GX_U16, .frac = 1};
+  draw.bigEndian = true;
+  draw.perVertexPnMtx = true;
+  draw.vertices = {
+      0, 0, 2, 0, 0, 0, 0,
+      0, 0, 0, 0, 2, 0, 0,
+      0, 0, 0, 0, 0, 0, 2,
+  };
+  draw.indices = {0, 1, 2};
+  auto& matrix = draw.positionMatrices[0];
+  matrix.m0.x() = 1.0f;
+  matrix.m1.y() = 1.0f;
+  matrix.m2.z() = 1.0f;
+  matrix.m0.w() = 10.0f;
+  matrix.m1.w() = 20.0f;
+  matrix.m2.w() = 30.0f;
+  snapshot.draws.emplace_back(std::move(draw));
+
+  const auto decoded = decode_view_space_triangles(snapshot);
+  ASSERT_NE(decoded, nullptr);
+  ASSERT_EQ(decoded->triangles.size(), 1u);
+  const Triangle& triangle = decoded->triangles.front();
+  EXPECT_EQ(triangle.a, (Vec3<float>{11.0f, 20.0f, 30.0f}));
+  EXPECT_EQ(triangle.b, (Vec3<float>{10.0f, 21.0f, 30.0f}));
+  EXPECT_EQ(triangle.c, (Vec3<float>{10.0f, 20.0f, 31.0f}));
+  EXPECT_EQ(decoded->rejectedTriangles, 0u);
+}
 } // namespace
 } // namespace aurora::gx::raytracing
