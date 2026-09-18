@@ -4,6 +4,8 @@
 #include "gfx/common.hpp"
 #include "gfx/efb_ram_copy.hpp"
 #include "gx/fifo.hpp"
+#include "gx/metal_raytracing.hpp"
+#include "gx/raytracing_scene.hpp"
 #include "gx/shader_info.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
@@ -64,6 +66,10 @@ std::atomic<uint64_t> g_presentScheduleIntervalNanos{0};
 std::atomic<bool> g_metalfxRequested{false};
 std::atomic<bool> g_metalfxSupported{false};
 std::atomic<AuroraMetalFXStatus> g_metalfxStatus{AURORA_METALFX_DISABLED};
+std::atomic<bool> g_metalRayTracingRequested{false};
+std::atomic<bool> g_metalRayTracingSupported{false};
+std::atomic<AuroraMetalRayTracingStatus> g_metalRayTracingStatus{AURORA_METAL_RAYTRACING_DISABLED};
+std::unique_ptr<gx::metal_raytracing::Builder> g_metalRayTracingBuilder;
 
 namespace {
 Module Log("aurora");
@@ -753,6 +759,9 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) noexce
 
   g_metalfxSupported.store(webgpu::metalfx::supported(g_device, webgpu::g_backendType));
   g_metalfxStatus.store(AURORA_METALFX_DISABLED);
+  g_metalRayTracingSupported.store(
+      gx::metal_raytracing::supported(g_device, webgpu::g_backendType));
+  g_metalRayTracingStatus.store(AURORA_METAL_RAYTRACING_DISABLED);
 
   imgui::create_context();
 #endif
@@ -1357,6 +1366,11 @@ void shutdown() noexcept {
   g_metalfxRequested.store(false);
   g_metalfxSupported.store(false);
   g_metalfxStatus.store(AURORA_METALFX_DISABLED);
+  g_metalRayTracingBuilder.reset();
+  g_metalRayTracingRequested.store(false);
+  g_metalRayTracingSupported.store(false);
+  g_metalRayTracingStatus.store(AURORA_METAL_RAYTRACING_DISABLED);
+  gx::raytracing::set_capture_enabled(false);
   imgui::shutdown();
   gfx::shutdown();
   webgpu::shutdown();
@@ -1445,6 +1459,8 @@ bool begin_frame_render_state_impl(ImGuiFramePolicy imguiPolicy, bool* imguiNewF
   } else if (imguiNewFrameOwed != nullptr) {
     *imguiNewFrameOwed = true;
   }
+  gx::raytracing::set_capture_enabled(g_metalRayTracingRequested.load() &&
+                                      g_metalRayTracingSupported.load());
   if (!gfx::begin_frame()) {
     return false;
   }
@@ -1471,6 +1487,37 @@ struct SealedFrameContext {
   bool replayInterpolatedFrames = false;
   bool metalfxEnabled = false;
 };
+
+void build_metal_raytracing_scene(const gfx::SealedFrame& frame) {
+  if (!g_metalRayTracingRequested.load()) {
+    g_metalRayTracingStatus.store(AURORA_METAL_RAYTRACING_DISABLED);
+    return;
+  }
+  if (!g_metalRayTracingSupported.load()) {
+    g_metalRayTracingStatus.store(AURORA_METAL_RAYTRACING_UNSUPPORTED);
+    return;
+  }
+  const auto* snapshot = gfx::raytracing_scene(frame);
+  if (snapshot == nullptr) {
+    return;
+  }
+  const auto decoded = gx::raytracing::decode_view_space_triangles(*snapshot);
+  if (!g_metalRayTracingBuilder) {
+    std::string error;
+    g_metalRayTracingBuilder = gx::metal_raytracing::create(g_device, webgpu::g_backendType, error);
+    if (!g_metalRayTracingBuilder) {
+      Log.warn("Metal ray-tracing scene builder initialization failed: {}", error);
+      g_metalRayTracingStatus.store(AURORA_METAL_RAYTRACING_ERROR);
+      return;
+    }
+  }
+  if (!g_metalRayTracingBuilder->build(*decoded)) {
+    Log.warn("Metal ray-tracing scene build failed: {}", g_metalRayTracingBuilder->error());
+    g_metalRayTracingStatus.store(AURORA_METAL_RAYTRACING_ERROR);
+    return;
+  }
+  g_metalRayTracingStatus.store(AURORA_METAL_RAYTRACING_ACTIVE);
+}
 
 // Phase 1: everything that touches producer-shared renderer state. Needs g_rendererGpuMutex and
 // a FIFO already drained into the recorded pass list.
@@ -1510,6 +1557,7 @@ void seal_frame_locked(gfx::SealedFrame& sealedFrame, SealedFrameContext& ctx) {
   // Detach the recorded passes. From here the producer's list is empty and the
   // encode phase reads only worker-private state.
   gfx::seal_frame(sealedFrame);
+  build_metal_raytracing_scene(sealedFrame);
   gfx::expire_bind_group_cache();
 }
 
@@ -2089,3 +2137,11 @@ void aurora_set_metalfx_spatial(bool enabled) { aurora::g_metalfxRequested.store
 bool aurora_get_metalfx_spatial() { return aurora::g_metalfxRequested.load(); }
 bool aurora_is_metalfx_spatial_supported() { return aurora::g_metalfxSupported.load(); }
 AuroraMetalFXStatus aurora_get_metalfx_status() { return aurora::g_metalfxStatus.load(); }
+void aurora_set_metal_raytracing_scene_build(bool enabled) {
+  aurora::g_metalRayTracingRequested.store(enabled);
+}
+bool aurora_get_metal_raytracing_scene_build() { return aurora::g_metalRayTracingRequested.load(); }
+bool aurora_is_metal_raytracing_supported() { return aurora::g_metalRayTracingSupported.load(); }
+AuroraMetalRayTracingStatus aurora_get_metal_raytracing_status() {
+  return aurora::g_metalRayTracingStatus.load();
+}

@@ -177,6 +177,21 @@ bool aurora_get_metalfx_spatial();
 bool aurora_is_metalfx_spatial_supported();
 AuroraMetalFXStatus aurora_get_metalfx_status();
 
+typedef enum {
+  AURORA_METAL_RAYTRACING_DISABLED,
+  AURORA_METAL_RAYTRACING_UNSUPPORTED,
+  AURORA_METAL_RAYTRACING_ACTIVE,
+  AURORA_METAL_RAYTRACING_ERROR,
+} AuroraMetalRayTracingStatus;
+
+// Experimental scene-build switch. It captures eligible opaque GX geometry
+// and builds a native Metal acceleration structure, but does not yet change
+// the raster image. Its first visible consumer will be ray-traced AO.
+void aurora_set_metal_raytracing_scene_build(bool enabled);
+bool aurora_get_metal_raytracing_scene_build();
+bool aurora_is_metal_raytracing_supported();
+AuroraMetalRayTracingStatus aurora_get_metal_raytracing_status();
+
 AuroraBackend aurora_get_backend();
 const AuroraBackend* aurora_get_available_backends(size_t* count);
 
