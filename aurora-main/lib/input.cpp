@@ -414,6 +414,14 @@ SDL_JoystickID add_controller(SDL_JoystickID which) noexcept {
     g_GameControllers[instance] = controller;
     ensure_player_index(g_GameControllers[instance]);
     apply_port_preferences();
+#if defined(SDL_PLATFORM_MACOS)
+    // First-use convenience only: never override a saved assignment or None.
+    if (g_portPreferences[0].state == PortPreferenceState::Unset &&
+        get_controller_for_player(0) == nullptr) {
+      assign_player_index(g_GameControllers[instance], 0);
+      persist_controller_for_player(0, &g_GameControllers[instance]);
+    }
+#endif
     return instance;
   }
 
