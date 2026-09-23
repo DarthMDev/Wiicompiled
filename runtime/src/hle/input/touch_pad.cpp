@@ -314,6 +314,10 @@ bool PollFpsTap(const ImVec2& size) {
         return false;  // readout hidden - caller falls back to its own button
     }
 
+    const bool controlsActive = IsActive();
+    const float aspect = CurrentAspect();
+    const Layout L = LayoutFor(aspect);
+
     static bool wasDown = false;
     bool down = false;
     int deviceCount = 0;
@@ -326,8 +330,23 @@ bool PollFpsTap(const ImVec2& size) {
                 continue;
             }
             for (int f = 0; f < fingerCount; ++f) {
-                const float px = fingers[f]->x * size.x;
-                const float py = fingers[f]->y * size.y;
+                const float normX = fingers[f]->x;
+                const float normY = fingers[f]->y;
+                if (controlsActive) {
+                    if (L.stick.Contains(normX, normY, aspect) ||
+                        L.shoulderL.Contains(normX, normY, aspect) ||
+                        L.shoulderR.Contains(normX, normY, aspect) ||
+                        L.a.Contains(normX, normY, aspect) ||
+                        L.b.Contains(normX, normY, aspect) ||
+                        L.item.Contains(normX, normY, aspect) ||
+                        L.start.Contains(normX, normY, aspect) ||
+                        L.menu.Contains(normX, normY, aspect) ||
+                        L.dpad.Contains(normX, normY, aspect)) {
+                        continue;
+                    }
+                }
+                const float px = normX * size.x;
+                const float py = normY * size.y;
                 if (px >= minX && px <= maxX && py >= minY && py <= maxY) {
                     down = true;
                     break;
@@ -458,8 +477,8 @@ bool Read(std::array<PADStatus, 4>& statuses) {
     // Screen y grows downward, the guest stick grows upward.
     pad.stickX = static_cast<int8_t>(std::clamp(frame.stickDx * 127.0f, -127.0f, 127.0f));
     pad.stickY = static_cast<int8_t>(std::clamp(-frame.stickDy * 127.0f, -127.0f, 127.0f));
-    pad.triggerLeft = frame.l ? 255 : 0;
-    pad.triggerRight = frame.r ? 255 : 0;
+    pad.triggerL = frame.l ? 255 : 0;
+    pad.triggerR = frame.r ? 255 : 0;
     return true;
 }
 
