@@ -1,5 +1,6 @@
 #include "touch_pad.h"
 #include "touch_art.h"
+#include "runtime_config.h"
 
 #include "hle/controller_status_contract.h"
 #include "settings_overlay.h"
@@ -11,11 +12,35 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <string>
 
 namespace TouchPad {
 namespace {
+
+bool s_autoAccelerateEnabled = true;
+bool s_autoAccelerateLoaded = false;
+bool s_gasLocked = false;
+bool s_aPhysicallyPressedLast = false;
+bool s_unlockingTap = false;
+uint64_t s_aPressStartTimeMs = 0;
+
+uint64_t CurrentTimeMs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count()
+    );
+}
+
+void EnsureAutoAccelerateConfigLoaded() {
+    if (!s_autoAccelerateLoaded) {
+        s_autoAccelerateEnabled = RuntimeConfigFile::TouchAutoAccelerate(true);
+        s_autoAccelerateLoaded = true;
+    }
+}
 
 
 struct Circle {
@@ -189,7 +214,7 @@ ImU32 WithAlpha(ImU32 colour, int alpha) {
 }
 
 void DrawCircle(ImDrawList* list, const Circle& c, const ImVec2& size, const char* label,
-                bool pressed, ImU32 colour, const char* art) {
+                bool pressed, ImU32 colour, const char* art, bool locked = false) {
     const ImVec2 centre{c.x * size.x, c.y * size.y};
     const float radius = c.r * size.y;
     const ImVec2 lo{centre.x - radius, centre.y - radius};
@@ -200,22 +225,36 @@ void DrawCircle(ImDrawList* list, const Circle& c, const ImVec2& size, const cha
     if (art != nullptr) {
         const ImTextureID fill = TouchArt::Get((std::string(art) + "_fill").c_str());
         if (fill != ImTextureID{}) {
-            list->AddImage(fill, lo, hi, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
-                           IM_COL32(0, 0, 0, pressed ? 165 : 120));
+            const ImU32 fillColor = locked
+                ? IM_COL32(0, 195, 230, pressed ? 210 : 160)
+                : IM_COL32(0, 0, 0, pressed ? 165 : 120);
+            list->AddImage(fill, lo, hi, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), fillColor);
         }
         const ImTextureID line = TouchArt::Get(art);
         if (line != ImTextureID{}) {
-            list->AddImage(line, lo, hi, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
-                           IM_COL32(255, 255, 255, pressed ? 250 : 175));
+            const ImU32 lineColor = locked
+                ? IM_COL32(230, 255, 255, 255)
+                : IM_COL32(255, 255, 255, pressed ? 250 : 175);
+            list->AddImage(line, lo, hi, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), lineColor);
+            if (locked) {
+                // Outer cyan glow ring indicating latched acceleration
+                list->AddCircle(centre, radius + 2.5f, IM_COL32(0, 240, 255, 240), 48, 3.0f);
+            }
             return;
         }
     }
 
     // Vector fallback, used when the artwork is missing.
-    list->AddCircleFilled(centre, radius + 3.0f, IM_COL32(0, 0, 0, pressed ? 150 : 110), 48);
-    list->AddCircleFilled(centre, radius, WithAlpha(colour, pressed ? 235 : 130), 48);
-    list->AddCircle(centre, radius, WithAlpha(IM_COL32(255, 255, 255, 255), pressed ? 255 : 170),
-                    48, 2.5f);
+    const ImU32 baseColor = locked ? IM_COL32(0, 210, 240, 255) : colour;
+    list->AddCircleFilled(centre, radius + 3.0f,
+                          locked ? IM_COL32(0, 240, 255, 120) : IM_COL32(0, 0, 0, pressed ? 150 : 110), 48);
+    list->AddCircleFilled(centre, radius, WithAlpha(baseColor, pressed ? 235 : 130), 48);
+    list->AddCircle(centre, radius,
+                    locked ? IM_COL32(255, 255, 255, 255) : WithAlpha(IM_COL32(255, 255, 255, 255), pressed ? 255 : 170),
+                    48, locked ? 3.0f : 2.5f);
+    if (locked) {
+        list->AddCircle(centre, radius + 3.0f, IM_COL32(0, 240, 255, 230), 48, 2.5f);
+    }
     if (label != nullptr && *label != '\0') {
         const ImVec2 text = ImGui::CalcTextSize(label);
         const ImVec2 at{centre.x - text.x * 0.5f, centre.y - text.y * 0.5f};
@@ -316,6 +355,7 @@ bool IsActive() {
         SDL_free(gamepads);
     }
     if (gamepadCount > 0) {
+        Reset();
         return false;
     }
 
@@ -327,28 +367,92 @@ bool IsActive() {
     return deviceCount > 0;
 }
 
+bool AutoAccelerateEnabled() {
+    EnsureAutoAccelerateConfigLoaded();
+    return s_autoAccelerateEnabled;
+}
+
+void SetAutoAccelerate(bool enabled) {
+    EnsureAutoAccelerateConfigLoaded();
+    s_autoAccelerateEnabled = enabled;
+    RuntimeConfigFile::SetTouchAutoAccelerate(enabled);
+    if (!enabled && s_gasLocked) {
+        s_gasLocked = false;
+        s_unlockingTap = false;
+    }
+}
+
+bool IsGasLocked() {
+    return s_gasLocked;
+}
+
+void Reset() {
+    g_stickFinger = 0;
+    s_gasLocked = false;
+    s_unlockingTap = false;
+    s_aPhysicallyPressedLast = false;
+    s_aPressStartTimeMs = 0;
+}
+
+void UpdateAutoAccelerate(bool aPhysicalDown, uint64_t nowMs, bool autoAccelerateEnabled) {
+    if (!autoAccelerateEnabled) {
+        s_gasLocked = false;
+        s_unlockingTap = false;
+        s_aPhysicallyPressedLast = aPhysicalDown;
+        return;
+    }
+
+    if (aPhysicalDown) {
+        if (!s_aPhysicallyPressedLast) {
+            // New touch down on button A
+            if (s_gasLocked) {
+                // Tapping while locked immediately unlocks
+                s_gasLocked = false;
+                s_unlockingTap = true;
+            } else {
+                s_unlockingTap = false;
+                s_aPressStartTimeMs = nowMs;
+            }
+        } else {
+            // Continuous hold on button A
+            if (!s_gasLocked && !s_unlockingTap) {
+                if (nowMs >= s_aPressStartTimeMs && (nowMs - s_aPressStartTimeMs) >= 1000) {
+                    s_gasLocked = true;
+                }
+            }
+        }
+    } else {
+        // Finger lifted
+        s_unlockingTap = false;
+    }
+
+    s_aPhysicallyPressedLast = aPhysicalDown;
+}
 
 bool Read(std::array<PADStatus, 4>& statuses) {
     if (!IsActive()) {
         return false;
     }
     const Frame frame = SampleFingers(CurrentAspect());
+    UpdateAutoAccelerate(frame.a, CurrentTimeMs(), AutoAccelerateEnabled());
 
     PADStatus& pad = statuses[0];
     pad = PADStatus{};
     pad.err = PAD_ERR_NONE;
 
+    const bool aActive = frame.a || s_gasLocked;
+
     uint16_t buttons = 0;
-    if (frame.a)     buttons |= PAD_BUTTON_A;
-    if (frame.b)     buttons |= PAD_BUTTON_B;
-    if (frame.item)  buttons |= PAD_TRIGGER_Z;
-    if (frame.start) buttons |= PAD_BUTTON_START;
-    if (frame.l)     buttons |= PAD_TRIGGER_L;
-    if (frame.r)     buttons |= PAD_TRIGGER_R;
-    if (frame.up)    buttons |= PAD_BUTTON_UP;
-    if (frame.down)  buttons |= PAD_BUTTON_DOWN;
-    if (frame.left)  buttons |= PAD_BUTTON_LEFT;
-    if (frame.right) buttons |= PAD_BUTTON_RIGHT;
+    if (aActive)      buttons |= PAD_BUTTON_A;
+    if (frame.b)      buttons |= PAD_BUTTON_B;
+    if (frame.item)   buttons |= PAD_TRIGGER_Z;
+    if (frame.start)  buttons |= PAD_BUTTON_START;
+    if (frame.l)      buttons |= PAD_TRIGGER_L;
+    if (frame.r)      buttons |= PAD_TRIGGER_R;
+    if (frame.up)     buttons |= PAD_BUTTON_UP;
+    if (frame.down)   buttons |= PAD_BUTTON_DOWN;
+    if (frame.left)   buttons |= PAD_BUTTON_LEFT;
+    if (frame.right)  buttons |= PAD_BUTTON_RIGHT;
     pad.button = buttons;
 
     // Screen y grows downward, the guest stick grows upward.
@@ -395,7 +499,8 @@ void Draw() {
                       knobRadius / size.y};
     DrawCircle(list, knob, size, "", frame.stickHeld, kColStick, "control_stick");
 
-    DrawCircle(list, L.a, size, "A", frame.a, kColA, "a");
+    const bool aPressed = frame.a || s_gasLocked;
+    DrawCircle(list, L.a, size, "A", aPressed, kColA, "a", s_gasLocked);
     DrawCircle(list, L.b, size, "B", frame.b, kColB, "b");
     DrawCircle(list, L.item, size, "Z", frame.item, kColZ, "right_bumper");
     DrawCircle(list, L.start, size, "START", frame.start, kColGrey, "start_pause");
@@ -406,3 +511,4 @@ void Draw() {
 }
 
 } // namespace TouchPad
+
