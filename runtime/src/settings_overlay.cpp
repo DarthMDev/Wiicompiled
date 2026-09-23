@@ -485,6 +485,16 @@ void DrawControllerSettings() {
     ImGui::Separator();
     controller_mapping_wizard::DrawSetupList();
     DrawWiiRemoteSettings(selectedGamePort);
+
+    ImGui::SeparatorText("Touch controls");
+    bool autoAccelerate = TouchPad::AutoAccelerateEnabled();
+    if (ImGui::Checkbox("Auto-accelerate", &autoAccelerate)) {
+        TouchPad::SetAutoAccelerate(autoAccelerate);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Hold A for one second to lock acceleration. Tap again to unlock.");
+    }
+
     const uint32_t controllerCount = PADCount();
     if (controllerCount == 0) {
         ImGui::TextDisabled("No controller connected");

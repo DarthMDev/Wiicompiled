@@ -89,6 +89,8 @@ struct RuntimeUserConfig {
     // comma-separated SDL-style physical button names ("south", or
     // "dpad_up,left_shoulder") as values; pressing either bound button counts.
     std::array<std::optional<std::string>, 12> controllerButtons;
+    // On-screen mobile touch controls: auto-accelerate locks A after a 1-second hold.
+    std::optional<bool> touchAutoAccelerate;
 };
 
 namespace RuntimeConfigFile {
@@ -321,6 +323,9 @@ inline void EnsureConfigFile() {
               "# guest can observe it. Set to false to mix inline on the guest\n"
               "# thread exactly as the runtime did before.\n"
               "mix_worker = true\n\n"
+              "[controller]\n"
+              "# On-screen touch controls auto-accelerate latch (hold A for 1 second to lock)\n"
+              "touch_auto_accelerate = true\n\n"
               "[network]\n"
               "enabled = true\n\n"
               "[discord]\n"
@@ -467,6 +472,8 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     config.wiiAccelOffsetY = FindConfigValue<double>(document, "controller", "wii_accel_offset_y");
     config.wiiAccelOffsetZ = FindConfigValue<double>(document, "controller", "wii_accel_offset_z");
     config.wiiAccelTrace = FindConfigValue<bool>(document, "controller", "wii_accel_trace");
+    config.touchAutoAccelerate =
+        FindConfigValue<bool>(document, "controller", "touch_auto_accelerate");
     config.networkEnabled = FindConfigValue<bool>(document, "network", "enabled");
     config.discordPresenceEnabled = FindConfigValue<bool>(document, "discord", "enabled");
     config.discordClientId = FindConfigValue<std::string>(document, "discord", "client_id");
@@ -849,6 +856,16 @@ inline bool SetWiiAccelOffset(const std::array<double, 3>& offset) {
     return ok;
 }
 
+// On-screen mobile touch controls: auto-accelerate locks A after a 1-second hold.
+inline bool TouchAutoAccelerate(bool fallback = true) {
+    return Get().touchAutoAccelerate.value_or(fallback);
+}
+
+inline bool SetTouchAutoAccelerate(bool value) {
+    Mutable().touchAutoAccelerate = value;
+    return WriteSetting("controller", "touch_auto_accelerate", value ? "true" : "false");
+}
+
 // Target frame rate for frame interpolation, or 0 to disable it.
 inline uint32_t FrameInterpolationFps(uint32_t fallback = 0) {
     return Get().frameInterpolationFps.value_or(fallback);
@@ -1000,6 +1017,9 @@ inline void LogLoadedConfig() {
             }
             if (config.retroRewindRoot) {
                 std::cout << " retro_rewind_root=" << *config.retroRewindRoot;
+            }
+            if (config.touchAutoAccelerate) {
+                std::cout << " touch_auto_accelerate=" << (*config.touchAutoAccelerate ? "true" : "false");
             }
         }
         std::cout << std::endl;
