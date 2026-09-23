@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.16)
-
 # Dawn's pinned macOS artifacts target 12.0. Set the same floor before project()
 # initializes the Apple toolchain so direct developer CMake invocations cannot
 # accidentally inherit the running SDK's deployment version. This cache entry
@@ -389,6 +388,26 @@ add_executable(mkw_ios_motion_steering_tests
 target_include_directories(mkw_ios_motion_steering_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 target_compile_features(mkw_ios_motion_steering_tests PRIVATE cxx_std_17)
 add_test(NAME mkw_ios_motion_steering_tests COMMAND mkw_ios_motion_steering_tests)
+
+add_executable(mkw_touch_auto_accelerate_tests
+    "${CMAKE_CURRENT_LIST_DIR}/tests/touch_auto_accelerate_tests.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/hle/input/touch_pad.cpp")
+target_include_directories(mkw_touch_auto_accelerate_tests PRIVATE
+    "${CMAKE_CURRENT_LIST_DIR}/include"
+    "${CMAKE_CURRENT_LIST_DIR}/src"
+    "${CMAKE_CURRENT_LIST_DIR}/third_party/toml11/single_include"
+    "${CMAKE_CURRENT_LIST_DIR}/third_party/toml11"
+    "${MKW_AURORA_DIR}/include"
+    "${CMAKE_BINARY_DIR}/_deps/imgui-src"
+    "${CMAKE_BINARY_DIR}/_deps/sdl-src/include")
+if(TARGET mkw_native_prebuilt)
+    target_include_directories(mkw_touch_auto_accelerate_tests PRIVATE
+        $<TARGET_PROPERTY:mkw_native_prebuilt,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
+target_compile_features(mkw_touch_auto_accelerate_tests PRIVATE cxx_std_20)
+target_compile_definitions(mkw_touch_auto_accelerate_tests PRIVATE SDL_MAIN_HANDLED TARGET_PC)
+target_link_libraries(mkw_touch_auto_accelerate_tests PRIVATE mkw_platform)
+add_test(NAME mkw_touch_auto_accelerate_tests COMMAND mkw_touch_auto_accelerate_tests)
 
 # HostContext deliberately keeps the platform-specific context primitive out
 # of fiber_manager.cpp. Exercise the Linux libco handoff directly so future
