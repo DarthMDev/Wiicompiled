@@ -276,7 +276,19 @@ inline std::filesystem::path ApplicationDataDirectory() {
     return std::filesystem::current_path() / kApplicationDirectoryName;
 }
 
+inline std::filesystem::path& ConfigPathOverride() {
+    static std::filesystem::path path;
+    return path;
+}
+
+inline void SetConfigPathOverride(std::filesystem::path path) {
+    ConfigPathOverride() = std::move(path);
+}
+
 inline std::filesystem::path ResolveConfigPath() {
+    if (!ConfigPathOverride().empty()) {
+        return ConfigPathOverride();
+    }
     return ApplicationDataDirectory() / kConfigFileName;
 }
 

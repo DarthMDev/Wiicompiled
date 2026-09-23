@@ -323,6 +323,10 @@ target_include_directories(mkw_touch_auto_accelerate_tests PRIVATE
     "${MKW_AURORA_DIR}/include"
     "${CMAKE_BINARY_DIR}/_deps/imgui-src"
     "${CMAKE_BINARY_DIR}/_deps/sdl-src/include")
+if(TARGET mkw_native_prebuilt)
+    target_include_directories(mkw_touch_auto_accelerate_tests PRIVATE
+        $<TARGET_PROPERTY:mkw_native_prebuilt,INTERFACE_INCLUDE_DIRECTORIES>)
+endif()
 target_compile_features(mkw_touch_auto_accelerate_tests PRIVATE cxx_std_20)
 target_compile_definitions(mkw_touch_auto_accelerate_tests PRIVATE SDL_MAIN_HANDLED TARGET_PC)
 target_link_libraries(mkw_touch_auto_accelerate_tests PRIVATE mkw_platform)
