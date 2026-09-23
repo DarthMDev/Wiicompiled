@@ -136,7 +136,7 @@ def load_map(path):
 def load_validated_map(project):
     path = os.path.join(ROOT, "projects", project, "MAP.txt")
     if not os.path.exists(path):
-        return None
+        sys.exit(f"missing {path} (produced by tools/region/port_map.py)")
     return load_map(path)
 
 
@@ -245,11 +245,10 @@ def port_region(region, identities, pal_entries, provisional):
     chunks = load_chunks(region.project)
     data_table, _ = load_data_table(region.project)
     validated_entries = load_validated_map(region.project)
-    validated = {a for a, _ in validated_entries} if validated_entries is not None else None
+    validated = {a for a, _ in validated_entries}
     validated_by_name = {}
-    if validated_entries is not None:
-        for a, n in validated_entries:
-            validated_by_name.setdefault(n, a)
+    for a, n in validated_entries:
+        validated_by_name.setdefault(n, a)
 
     mapping, problems, provisional_data = {}, [], []
     for pal in identities:
@@ -258,7 +257,7 @@ def port_region(region, identities, pal_entries, provisional):
             if ported is None:
                 problems.append(f"  {pal:08X}: code address outside every port chunk")
                 continue
-            if validated is not None and ported not in validated:
+            if ported not in validated:
                 # Not a function entry: a jump-table label or a mid-function hook. It is right
                 # exactly when it sits at the same offset inside a validated containing function.
                 start, name, offset = containing_function(pal_entries, pal)
