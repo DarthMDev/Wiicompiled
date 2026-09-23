@@ -1,4 +1,5 @@
 #include "settings_overlay.h"
+#include "touch_pad.h"
 #include "audio_backend.h"
 #include "aurora_events.h"
 #include "controller_button_names.h"
@@ -9,6 +10,9 @@
 #include "runtime_config.h"
 #include "runtime_log.h"
 #include "wii_remote_input.h"
+#ifdef MKW_PLATFORM_IOS
+#include "ios_motion_input.h"
+#endif
 
 #include <imgui.h>
 #include <SDL3/SDL_events.h>
@@ -74,6 +78,8 @@ const char* GraphicsApiDisplayName() {
 bool g_topBarVisible = false;
 bool g_exitPromptOpen = false;
 bool g_rumbleEnabled = RuntimeConfigFile::RumbleEnabled(true);
+float g_fpsBounds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+bool g_fpsBoundsValid = false;
 int g_controllerPort = 0;
 float g_resolutionScale = RuntimeConfigFile::ResolutionMultiplier(1.0f);
 int g_audioVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::AudioVolume(1.0f) * 100.0f));
@@ -160,7 +166,12 @@ constexpr std::array<std::string_view, 3> kDisplayModeConfigNames = {
 uint64_t g_presentedFrame = 0;
 std::atomic_bool g_strapInputAccepted = false;
 std::atomic_uint64_t g_startupDismissFrame = UINT64_MAX;
-constexpr uint64_t kStrapTransitionCoverFrames = 60;
+// The strap screen is accepted the instant it becomes eligible, so the frames
+// it would have spent waiting for A are still rendered underneath this cover.
+// One second was not enough on an Apple TV 4K or an iPhone loading from the
+// app container: the scene change landed after the cover lifted and the strap
+// warning flashed through. Three seconds covers the slowest device measured.
+constexpr uint64_t kStrapTransitionCoverFrames = 180;
 
 constexpr std::array<ResolutionItem, 8> kResolutions = {{
     {"Auto (window size)", 0.0f}, {"Native (1x)", 1.0f}, {"1.5x", 1.5f}, {"2x", 2.0f},
@@ -287,6 +298,9 @@ void ApplyConfiguredMappings() {
 
 bool g_wiiRemotesEnabled = RuntimeConfigFile::WiiRemotesEnabled(true);
 bool g_wiiContinuousScan = RuntimeConfigFile::WiiContinuousScanEnabled(false);
+#ifdef MKW_PLATFORM_IOS
+bool g_iosMotionControls = RuntimeConfigFile::IosMotionControlsEnabled(false);
+#endif
 
 // Accelerometer readout and zero-point calibration for a bare remote / remote + Nunchuk.
 void DrawWiiRemoteAccelerometer(uint32_t port) {
@@ -758,6 +772,37 @@ void DrawControllerSettings() {
         g_configuredControllerIndices.fill(std::numeric_limits<int32_t>::min());
     }
     ImGui::Separator();
+#ifdef MKW_PLATFORM_IOS
+    if (ImGui::Checkbox("Use phone as a Wii Wheel", &g_iosMotionControls)) {
+        RuntimeConfigFile::SetIosMotionControlsEnabled(g_iosMotionControls);
+        if (!g_iosMotionControls) {
+            IosMotionInput::Stop();
+        }
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Tilt to steer. Phone motion is sent to Mario Kart Wii as a Wii Remote, including shake actions.");
+    }
+    ImGui::BeginDisabled(!g_iosMotionControls);
+    bool motionGameCube = RuntimeConfigFile::IosMotionGameCubeEnabled();
+    if (ImGui::Checkbox("GameCube-style motion", &motionGameCube)) {
+        RuntimeConfigFile::SetIosMotionGameCubeEnabled(motionGameCube);
+        TouchPad::ResetMotionRemote();
+    }
+    if (ImGui::Button(motionGameCube ? "Recenter motion steering" : "Recenter Wii Wheel")) {
+        TouchPad::RecenterMotionRemote();
+    }
+    ImGui::SameLine();
+    bool motionInverted = RuntimeConfigFile::IosMotionInverted();
+    if (ImGui::Checkbox("Invert tilt", &motionInverted)) {
+        RuntimeConfigFile::SetIosMotionInverted(motionInverted);
+    }
+    float motionSensitivity = RuntimeConfigFile::IosMotionSensitivity();
+    if (ImGui::SliderFloat("Wii Wheel sensitivity", &motionSensitivity, 0.5f, 2.0f, "%.1fx")) {
+        RuntimeConfigFile::SetIosMotionSensitivity(motionSensitivity);
+    }
+    ImGui::EndDisabled();
+    ImGui::Separator();
+#endif
     controller_mapping_wizard::DrawSetupList();
     DrawWiiRemoteSettings(selectedGamePort);
     const uint32_t controllerCount = PADCount();
@@ -1109,6 +1154,9 @@ void DrawGraphicsSettings() {
 void DrawFpsOverlay() {
     AuroraPresentTiming presentTiming{};
     aurora_get_present_timing(&presentTiming);
+    // Before the early return: a stale rectangle would keep swallowing taps
+    // meant for the menu button, leaving no way into settings.
+    g_fpsBoundsValid = false;
     if (!g_showFps) {
         return;
     }
@@ -1126,6 +1174,13 @@ void DrawFpsOverlay() {
                                          ImGuiWindowFlags_NoNav |
                                          ImGuiWindowFlags_NoSavedSettings;
     if (ImGui::Begin("FPS Overlay", nullptr, kFlags)) {
+        const ImVec2 wpos = ImGui::GetWindowPos();
+        const ImVec2 wsize = ImGui::GetWindowSize();
+        constexpr float kTouchPad = 14.0f;
+        g_fpsBounds[0] = wpos.x - kTouchPad;  g_fpsBounds[1] = wpos.y - kTouchPad;
+        g_fpsBounds[2] = wpos.x + wsize.x + kTouchPad;
+        g_fpsBounds[3] = wpos.y + wsize.y + kTouchPad;
+        g_fpsBoundsValid = true;
         if (presentTiming.sampleCount == 0) {
             ImGui::TextUnformatted("FPS: --");
         } else {
@@ -1380,6 +1435,11 @@ void HandleEvents(const AuroraEvent* events) noexcept {
         if (ev->type == AURORA_CONTROLLER_ADDED || ev->type == AURORA_CONTROLLER_REMOVED) {
             g_configuredControllerIndices.fill(std::numeric_limits<int32_t>::min());
         }
+#ifdef MKW_PLATFORM_IOS
+        if (ev->type == AURORA_PAUSED) {
+            TouchPad::ResetMotionRemote();
+        }
+#endif
         if (ev->type != AURORA_SDL_EVENT) {
             continue;
         }
@@ -1428,6 +1488,14 @@ void ReleaseControllers() noexcept {
     if (queued) SDL_Delay(120);
 }
 
+void ToggleTopBar() noexcept { SetTopBarVisible(!g_topBarVisible); }
+bool TopBarVisible() noexcept { return g_topBarVisible; }
+bool FpsOverlayBounds(float* a, float* b, float* c, float* d) noexcept {
+    if (!g_fpsBoundsValid) return false;
+    *a = g_fpsBounds[0]; *b = g_fpsBounds[1]; *c = g_fpsBounds[2]; *d = g_fpsBounds[3];
+    return true;
+}
+
 void Draw() noexcept {
     // Wait for the frame worker's DONE phase: it has replayed the previous frame's ImGui draw lists
     // and started the next ImGui frame, so all overlay callers can now safely issue ImGui commands.
@@ -1447,8 +1515,13 @@ void Draw() noexcept {
     DrawTopBar();
     DrawExitPrompt();
     controller_mapping_wizard::Draw();
-    // The wizard captures raw presses; keep them out of the game.
-    const bool inputBlocked = controller_mapping_wizard::IsActive() || g_rebind.active;
+#ifdef MKW_PLATFORM_IOS
+    TouchPad::Draw();
+#endif
+    // The wizard captures raw presses; keep them out of the game even when the
+    // top bar is hidden mid-setup. The top bar matters for touch too: while it
+    // is open, taps belong to the bar and must not drive the guest.
+    const bool inputBlocked = g_topBarVisible || controller_mapping_wizard::IsActive() || g_rebind.active;
     PADBlockInput(inputBlocked);
     InputBindings::SetInputBlocked(inputBlocked);
     DrawStartupScreen();

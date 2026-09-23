@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.16)
 
 # Dawn's pinned macOS artifacts target 12.0. Set the same floor before project()
 # initializes the Apple toolchain so direct developer CMake invocations cannot
@@ -25,6 +25,14 @@ endif()
 
 if(WIN32 AND MINGW AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     set(MKW_PLATFORM_WINDOWS TRUE)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # Checked before macOS: APPLE is true for iOS too, so the macOS branch would
+    # otherwise claim an iOS build and select a backend that cannot compile
+    # there (<mach/mach_vm.h> is absent from the iOS SDK) or run there (/tmp is
+    # outside the sandbox).
+    set(MKW_PLATFORM_IOS TRUE)
+    set(MKW_PLATFORM_MACOS TRUE)   # shares the Apple arm64 substrate
+    set(MKW_PLATFORM_MACOS_ARM64 TRUE)
 elseif(APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|arm64|ARM64)$")
     set(MKW_PLATFORM_MACOS TRUE)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
@@ -36,7 +44,7 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(
     set(MKW_PLATFORM_LINUX TRUE)
 else()
     message(FATAL_ERROR
-        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS x86_64/arm64")
+        "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, or Apple Clang on macOS x86_64/arm64 or iOS arm64")
 endif()
 
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -44,6 +52,8 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
+set(MKW_IOS_BUNDLE_ID_PREFIX "it.tobyfox" CACHE STRING
+    "Reverse-DNS prefix for the iOS bundle identifier")
 
 # Preprocessor definitions that belong to this project's own code (the runtime,
 # the translated shards and the product glue) and to nothing else. They are
@@ -52,8 +62,27 @@ option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
 # libraries and the products in cmake/PublicProducts.cmake) inherits them while
 # aurora-main and its third-party tree stay unaffected.
 set(MKW_PROJECT_COMPILE_DEFINITIONS NOMINMAX)
+if(MKW_PLATFORM_IOS)
+    # One project-wide answer to "is this iOS", so sources do not each pull in
+    # TargetConditionals.h and spell out the __APPLE__ && TARGET_OS_IPHONE dance.
+    list(APPEND MKW_PROJECT_COMPILE_DEFINITIONS MKW_PLATFORM_IOS=1)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
+
+# CMake's iOS platform module discovers AppleClang for Objective-C++ but does
+# not populate the generic language rules itself. Set them before Aurora is
+# added, because Aurora's iOS targets also contain Objective-C++ sources.
+if(MKW_PLATFORM_IOS)
+    enable_language(OBJCXX)
+    if(NOT CMAKE_OBJCXX_COMPILE_OBJECT)
+        set(CMAKE_OBJCXX_COMPILE_OBJECT
+            "<CMAKE_OBJCXX_COMPILER> <DEFINES> <INCLUDES> -x objective-c++ <FLAGS> -o <OBJECT> -c <SOURCE>")
+        set(CMAKE_OBJCXX_ARCHIVE_CREATE "<CMAKE_AR> qc <TARGET> <LINK_FLAGS> <OBJECTS>")
+        set(CMAKE_OBJCXX_ARCHIVE_APPEND "<CMAKE_AR> q <TARGET> <LINK_FLAGS> <OBJECTS>")
+        set(CMAKE_OBJCXX_ARCHIVE_FINISH "<CMAKE_RANLIB> <TARGET>")
+    endif()
+endif()
 
 # Declared before the vendored libraries so the third-party block below can
 # branch on it and so cmake/NativePrebuilt.cmake is included after the names it
@@ -158,6 +187,16 @@ if(MKW_NATIVE_PREBUILT_DIR)
 else()
     if(NOT EXISTS ${MKW_AURORA_DIR}/CMakeLists.txt)
         message(FATAL_ERROR "Requested aurora-main but ${MKW_AURORA_DIR} is missing")
+    endif()
+    # aurora picks shared third-party libraries whenever BUILD_SHARED_LIBS is
+    # merely undefined, and its extern/ tree calls unset(BUILD_SHARED_LIBS CACHE)
+    # while working around xxhash, which deletes any -D the user passed. Defining
+    # it here, before aurora is added, is what actually sticks across
+    # reconfigures. Apple builds ship a self-contained bundle, so a dylib
+    # resolved from the build tree or from Homebrew cannot be allowed to leak
+    # into the link.
+    if(APPLE)
+        set(BUILD_SHARED_LIBS OFF)
     endif()
     set(DAWN_ENABLE_D3D11 OFF CACHE BOOL "" FORCE)
     if(MKW_PLATFORM_WINDOWS)
@@ -273,9 +312,25 @@ if(MKW_PLATFORM_MACOS)
         # mkw_co_init/mkw_co_switch at link time.
         enable_language(ASM)
         list(APPEND SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S")
+        set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/platform/macos/co_switch.S"
+            PROPERTIES LANGUAGE ASM SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
+    endif()
+    # iOS cannot use the macOS backend: <mach/mach_vm.h> is absent from that SDK
+    # and /tmp is outside the sandbox.
+    if(MKW_PLATFORM_IOS)
+        list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_macos.cpp")
+        # Core Motion is exposed through Objective-C++, kept in an iOS-only
+        # source so shared runtime code does not acquire an Apple framework
+        # dependency.
+        list(APPEND SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/platform/ios/ios_motion_input.mm")
+        set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/src/platform/ios/ios_motion_input.mm"
+            PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+    else()
+        list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_ios.cpp")
     endif()
 else()
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_macos.cpp")
+    list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/guest_flat_memory_ios.cpp")
 endif()
 set(MKW_PLATFORM_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/platform/host_platform.cpp")
 set(MKW_BASE_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/base_product.cpp")
@@ -328,6 +383,13 @@ target_include_directories(mkw_input_expr_tests PRIVATE "${CMAKE_CURRENT_LIST_DI
 target_compile_features(mkw_input_expr_tests PRIVATE cxx_std_17)
 add_test(NAME mkw_input_expr_tests COMMAND mkw_input_expr_tests)
 
+add_executable(mkw_ios_motion_steering_tests
+    "${CMAKE_CURRENT_LIST_DIR}/tests/ios_motion_steering_tests.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/platform/ios/ios_motion_steering.cpp")
+target_include_directories(mkw_ios_motion_steering_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+target_compile_features(mkw_ios_motion_steering_tests PRIVATE cxx_std_17)
+add_test(NAME mkw_ios_motion_steering_tests COMMAND mkw_ios_motion_steering_tests)
+
 # HostContext deliberately keeps the platform-specific context primitive out
 # of fiber_manager.cpp. Exercise the Linux libco handoff directly so future
 # refactors cannot silently remove its headers, implementation, or link edge.
@@ -343,8 +405,11 @@ if(MKW_PLATFORM_LINUX)
     add_test(NAME mkw_linux_host_context_tests COMMAND mkw_linux_host_context_tests)
 endif()
 
-if(MKW_PLATFORM_MACOS)
+if(MKW_PLATFORM_MACOS AND NOT MKW_PLATFORM_IOS)
     # Exercise the public host-memory contracts separately from translated products.
+    # Host-only: the flat memory test pulls in guest_flat_memory_macos.cpp, whose
+    # <mach/mach_vm.h> does not exist in the iOS SDK, and none of these can run
+    # on a device anyway.
     if(MKW_PLATFORM_MACOS_ARM64)
         # Apple Silicon's context ABI is implemented by the local assembly backend.
         enable_language(ASM)
@@ -433,7 +498,7 @@ else()
         target_compile_definitions(mkw_macos_native_compile PRIVATE SDL_MAIN_HANDLED TARGET_PC)
         target_link_libraries(mkw_macos_native_compile PRIVATE
             aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx
-            mkw::pugixml mkw::toml11 mkw::cryptopp)
+            PNG::PNG mkw::pugixml mkw::toml11 mkw::cryptopp)
         if(MKW_PLATFORM_MACOS_X86_64)
             target_link_libraries(mkw_macos_native_compile PRIVATE mkw::libco)
             # Keep this compile-only audit on the same Haswell-era x86-64-v3
