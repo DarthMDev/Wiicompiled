@@ -486,6 +486,7 @@ void DrawControllerSettings() {
     controller_mapping_wizard::DrawSetupList();
     DrawWiiRemoteSettings(selectedGamePort);
 
+#ifdef MKW_PLATFORM_IOS
     ImGui::SeparatorText("Touch controls");
     bool autoAccelerate = TouchPad::AutoAccelerateEnabled();
     if (ImGui::Checkbox("Auto-accelerate", &autoAccelerate)) {
@@ -494,6 +495,7 @@ void DrawControllerSettings() {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Hold A for one second to lock acceleration. Tap again to unlock.");
     }
+#endif
 
     const uint32_t controllerCount = PADCount();
     if (controllerCount == 0) {
