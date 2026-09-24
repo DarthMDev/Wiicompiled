@@ -344,7 +344,7 @@ try {
 
             Invoke-Checked $translator @(
                 'emit-base-manifest', '--project', $project, '--out', $baseManifestDir,
-                '--functions-dir', $functions, '--translation-output-metadata', $baseMetadata, '--region', 'P'
+                '--functions-dir', $functions, '--translation-output-metadata', $baseMetadata, '--region', $expectedLetter
             ) 'Creating the local base translation manifest' -StepId 'emit-base-manifest'
 
             if (-not [string]::IsNullOrWhiteSpace($TranslationFingerprint)) {
@@ -361,7 +361,7 @@ try {
                 'translate-mod', '--project', $project, '--profile', 'retro-rewind',
                 '--base-manifest', $baseManifest, '--base-translation-output-metadata', $baseMetadata,
                 '--code-pul', $codePul, '--mod-root', $retroRoot, '--mod-name', 'Retro Rewind',
-                '--region', 'P', '--out', $retroOut, '--prefer-cached-inputs', '--emit-cpp',
+                '--region', $expectedLetter, '--out', $retroOut, '--prefer-cached-inputs', '--emit-cpp',
                 '--threads', $translatorThreads
             )
             if ($SkipRetroWfcPayload) {

@@ -185,7 +185,7 @@ translation_provenance=$generated/translation-provenance.json
 toolchain_provenance=$build/toolchain-provenance.json
 retro_root=${retro_rewind_package_dir:-$workspace/PulsarPacks/completed/RetroRewind/RetroRewind6}
 
-dol_hash=$(sha256 "$assets/main.dol")
+dol_hash=$(sha256_of "$assets/main.dol")
 case "$dol_hash" in
     d2beec1b1645fcd134efe9e7e63774b546667764ed8d431029daccd725995694)
         project=$workspace/projects/mkwii-ntsc-u/recomp.yml
@@ -212,7 +212,7 @@ case "$dol_hash" in
         ;;
 esac
 
-rel_hash=$(sha256 "$assets/StaticR.rel")
+rel_hash=$(sha256_of "$assets/StaticR.rel")
 [[ "$rel_hash" == "$expected_rel" ]] || fail "Assets/StaticR.rel sha256 does not match the clean revision for region $expected_letter"
 
 if [[ -f "$assets/DATA/sys/boot.bin" ]]; then
@@ -341,7 +341,7 @@ else
 
     log_step emit-base-manifest "Creating the local base translation manifest"
     translator emit-base-manifest --project "$project" --out "$base_manifest_dir" \
-        --functions-dir "$functions" --translation-output-metadata "$base_metadata" --region P
+        --functions-dir "$functions" --translation-output-metadata "$base_metadata" --region "$expected_letter"
 
     printf '{"SchemaVersion":1,"TranslationFingerprint":"%s"}' "$translation_fingerprint" \
         > "$translation_provenance"
@@ -354,7 +354,7 @@ if (( builds_retro )); then
     translate_mod_args=(translate-mod --project "$project" --profile retro-rewind
         --base-manifest "$base_manifest" --base-translation-output-metadata "$base_metadata"
         --code-pul "$code_pul" --mod-root "$retro_root" --mod-name "Retro Rewind"
-        --region P --out "$retro_out" --prefer-cached-inputs --emit-cpp
+        --region "$expected_letter" --out "$retro_out" --prefer-cached-inputs --emit-cpp
         --threads "$translator_threads")
     if (( skip_retro_wfc_payload )); then
         translate_mod_args+=(--skip-retro-wfc)

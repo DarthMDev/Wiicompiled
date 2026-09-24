@@ -156,9 +156,9 @@ step translate-base 'Translating the user-owned base game'
 rm -rf "$functions" "$metadata" "$manifest_dir"; mkdir -p "$functions" "$manifest_dir"
 translator translate-recursive "$entry_point" --project "$project" --outdir "$functions" --output-metadata "$metadata" --production-source-bundle "$generated/base_translation_sources.bin" --no-function-files --prune-stale --threads "$translator_threads"
 step emit-base-manifest 'Creating the local base translation manifest'
-translator emit-base-manifest --project "$project" --out "$manifest_dir" --functions-dir "$functions" --translation-output-metadata "$metadata" --region P
+translator emit-base-manifest --project "$project" --out "$manifest_dir" --functions-dir "$functions" --translation-output-metadata "$metadata" --region "$expected_letter"
 if (( builds_retro )); then
-    mod_out="$workspace/build/mods/retro_rewind_full_cpp"; args=(translate-mod --project "$project" --profile retro-rewind --base-manifest "$manifest" --base-translation-output-metadata "$metadata" --code-pul "$retro_root/Binaries/Code.pul" --mod-root "$retro_root" --mod-name 'Retro Rewind' --region P --out "$mod_out" --prefer-cached-inputs --emit-cpp --threads "$translator_threads")
+    mod_out="$workspace/build/mods/retro_rewind_full_cpp"; args=(translate-mod --project "$project" --profile retro-rewind --base-manifest "$manifest" --base-translation-output-metadata "$metadata" --code-pul "$retro_root/Binaries/Code.pul" --mod-root "$retro_root" --mod-name 'Retro Rewind' --region "$expected_letter" --out "$mod_out" --prefer-cached-inputs --emit-cpp --threads "$translator_threads")
     if (( skip_retro_wfc )); then args+=(--skip-retro-wfc); else offline_payload="$retro_wfc/binary/payload.RMCPD00.bin"; assert_file "$offline_payload" 'Offline Retro-WFC payload'; args+=(--retro-wfc-payload "$offline_payload"); fi
     step translate-mod 'Translating Retro Rewind'; translator "${args[@]}"
 fi
