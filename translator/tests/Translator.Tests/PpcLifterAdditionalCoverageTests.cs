@@ -21,13 +21,9 @@ public class PpcLifterAdditionalCoverageTests
         var ir = Assert.Single(new PpcLifter().Lift(new[] { branch })).Ir;
 
         Assert.Equal("bltl", branch.Mnemonic);
-        var lr = Assert.IsType<IrAssign>(ir[0]);
-        Assert.Equal("lr", lr.Destination);
-        Assert.Equal(unchecked((int)0x80004398u), lr.Value.Constant);
-
-        var decision = Assert.IsType<IrBranch>(ir[1]);
-        Assert.Equal("blt", decision.Condition);
-        Assert.Equal("0x800043BC", decision.TrueLabel);
+        var decision = Assert.IsType<IrBranch>(Assert.Single(ir));
+        Assert.Equal("raw", decision.Condition);
+        Assert.Equal("link_branch_80004398_800043BC", decision.TrueLabel);
         Assert.Equal("0x80004398", decision.FalseLabel);
     }
 
