@@ -8,8 +8,13 @@
 #define MKW_REGION_GAME_CODE 0x524D4345u  // "RMCE"
 #define MKW_REGION_VI_TV_FORMAT 0u  // VI_NTSC
 #define MKW_REGION_SC_AREA 1u  // SC area USA
+#define MKW_REGION_SC_AREA_NAME "USA"
 #define MKW_REGION_SC_GAME_REGION 1u  // SC game region US
+#define MKW_REGION_SC_GAME_REGION_NAME "US"
 #define MKW_REGION_SC_PRODUCT_CODE "LU"
+#define MKW_REGION_NAND_PRODUCT_CODE "LU"
+#define MKW_REGION_VIDEO_NAME "NTSC"
+#define MKW_REGION_MODEL_NAME "RVL-001(USA)"
 #define MKW_REGION_MEM1_ARENA_LO 0x80394E00u  // initial stack top / arena lo
 
 // PAL identity -> this region. MKW_G_ is the address, MKW_F_ the translated function's

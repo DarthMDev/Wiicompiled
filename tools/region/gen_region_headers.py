@@ -23,8 +23,8 @@ PAL_TEXT = [(0x80004000, 0x80006460), (0x800072C0, 0x80244DE0), (0x805103B4, 0x8
 
 # Console setting values, named rather than spelled as the integers they happen to be. The
 # indices are the RVL SDK's own SCGetProductArea/SCGetProductGameRegion enums.
-SC_AREA = {"JPN": 0, "USA": 1, "EUR": 2, "AUS": 3, "BRA": 4, "TWN": 5, "ROC": 6,
-           "KOR": 7, "HKG": 8, "ASI": 9, "LTN": 10, "SAF": 11, "CHN": 12}
+SC_AREA = {"JPN": 0, "USA": 1, "EUR": 2, "AUS": 3, "BRA": 4, "TWN": 5, "ROC": 5,
+           "KOR": 6, "HKG": 7, "ASI": 8, "LTN": 9, "SAF": 10}
 SC_GAME = {"JP": 0, "US": 1, "EU": 2, "KR": 3}
 VI_TV_FORMAT = {"NTSC": 0, "PAL": 1}
 
@@ -38,11 +38,12 @@ class Region:
     is written against, so its table maps every address to itself.
     """
 
-    def __init__(self, header, game_id, letter, tv, area, game, product_code, arena_lo,
-                 display, project=None):
+    def __init__(self, header, game_id, letter, tv, area, game, product_code, nand_code,
+                 arena_lo, display, project=None):
         self.header, self.game_id, self.letter = header, game_id, letter
         self.tv, self.area, self.game = tv, area, game
-        self.product_code, self.arena_lo = product_code, arena_lo
+        self.product_code, self.nand_code = product_code, nand_code
+        self.arena_lo = arena_lo
         self.display, self.project = display, project
 
     @property
@@ -51,13 +52,13 @@ class Region:
 
 
 REGIONS = [
-    Region("rmcp01", "RMCP01", "P", "PAL", "EUR", "EU", "LEH", 0x80399180,
+    Region("rmcp01", "RMCP01", "P", "PAL", "EUR", "EU", "LEH", "LEH", 0x80399180,
            "Mario Kart Wii PAL (RMCP01)"),
-    Region("rmce01", "RMCE01", "E", "NTSC", "USA", "US", "LU", 0x80394E00,
+    Region("rmce01", "RMCE01", "E", "NTSC", "USA", "US", "LU", "LU", 0x80394E00,
            "Mario Kart Wii NTSC-U (RMCE01)", project="mkwii-ntsc-u"),
-    Region("rmcj01", "RMCJ01", "J", "NTSC", "JPN", "JP", "LJ", 0x80398B00,
+    Region("rmcj01", "RMCJ01", "J", "NTSC", "JPN", "JP", "LJ", "LJH", 0x80398B00,
            "Mario Kart Wii NTSC-J (RMCJ01)", project="mkwii-ntsc-j"),
-    Region("rmck01", "RMCK01", "K", "NTSC", "KOR", "KR", "LKM", 0x803871A0,
+    Region("rmck01", "RMCK01", "K", "NTSC", "KOR", "KR", "LKM", "LKH", 0x803871A0,
            "Mario Kart Wii NTSC-K (RMCK01)", project="mkwii-ntsc-k"),
 ]
 REGIONS_BY_HEADER = {r.header: r for r in REGIONS}
@@ -177,8 +178,13 @@ def write_header(region, mapping, spellings, names, provenance):
         f'#define MKW_REGION_GAME_CODE 0x{region.game_code:08X}u  // "{region.game_id[:4]}"',
         f"#define MKW_REGION_VI_TV_FORMAT {VI_TV_FORMAT[region.tv]}u  // VI_{region.tv}",
         f"#define MKW_REGION_SC_AREA {SC_AREA[region.area]}u  // SC area {region.area}",
+        f'#define MKW_REGION_SC_AREA_NAME "{region.area}"',
         f"#define MKW_REGION_SC_GAME_REGION {SC_GAME[region.game]}u  // SC game region {region.game}",
+        f'#define MKW_REGION_SC_GAME_REGION_NAME "{region.game}"',
         f'#define MKW_REGION_SC_PRODUCT_CODE "{region.product_code}"',
+        f'#define MKW_REGION_NAND_PRODUCT_CODE "{region.nand_code}"',
+        f'#define MKW_REGION_VIDEO_NAME "{region.tv}"',
+        f'#define MKW_REGION_MODEL_NAME "RVL-001({region.area})"',
         f"#define MKW_REGION_MEM1_ARENA_LO 0x{region.arena_lo:08X}u  // initial stack top / arena lo",
         "",
         "// PAL identity -> this region. MKW_G_ is the address, MKW_F_ the translated function's",

@@ -1,4 +1,4 @@
-﻿#include "hle_stubs.h"
+#include "hle_stubs.h"
 #include "isa/big_endian.h"
 #include "hle/dvd_contract.h"
 #include "hle/runtime_parse_helpers.h"
@@ -161,6 +161,20 @@ static const fs::path& GetDvdRoot() {
         }
         if (!IsDvdDataRoot(path)) {
             FailDvdRoot("Configured DVD root is not an extracted DATA directory", path);
+        }
+        std::error_code ec;
+        const auto bootBin = path / "sys" / "boot.bin";
+        if (fs::is_regular_file(bootBin, ec)) {
+            std::ifstream file(bootBin, std::ios::binary);
+            char id[7] = {};
+            if (file.read(id, 6)) {
+                if (std::memcmp(id, "RMC", 3) == 0 && id[3] != MKW_REGION_LETTER) {
+                    FailDvd("dvd_region_mismatch", "DVD region mismatch",
+                            std::string("Configured DVD root has disc ID '") + id +
+                            "', but this build was compiled for region " + MKW_REGION_GAME_ID +
+                            ".\nThe extracted game assets must match the region of the compiled executable.");
+                }
+            }
         }
         g_dvdRoot = path;
     });

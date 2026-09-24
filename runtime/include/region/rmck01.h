@@ -7,9 +7,14 @@
 #define MKW_REGION_LETTER 'K'
 #define MKW_REGION_GAME_CODE 0x524D434Bu  // "RMCK"
 #define MKW_REGION_VI_TV_FORMAT 0u  // VI_NTSC
-#define MKW_REGION_SC_AREA 7u  // SC area KOR
+#define MKW_REGION_SC_AREA 6u  // SC area KOR
+#define MKW_REGION_SC_AREA_NAME "KOR"
 #define MKW_REGION_SC_GAME_REGION 3u  // SC game region KR
+#define MKW_REGION_SC_GAME_REGION_NAME "KR"
 #define MKW_REGION_SC_PRODUCT_CODE "LKM"
+#define MKW_REGION_NAND_PRODUCT_CODE "LKH"
+#define MKW_REGION_VIDEO_NAME "NTSC"
+#define MKW_REGION_MODEL_NAME "RVL-001(KOR)"
 #define MKW_REGION_MEM1_ARENA_LO 0x803871A0u  // initial stack top / arena lo
 
 // PAL identity -> this region. MKW_G_ is the address, MKW_F_ the translated function's

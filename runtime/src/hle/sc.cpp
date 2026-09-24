@@ -17,15 +17,15 @@ namespace {
 uint32_t LookupProductArea(const std::string& area) {
     static const std::pair<const char*, uint32_t> kAreas[] = {
         {"JPN", 0}, {"USA", 1}, {"EUR", 2}, {"AUS", 3}, {"BRA", 4},
-        {"TWN", 5}, {"ROC", 6}, {"KOR", 7}, {"HKG", 8}, {"ASI", 9},
-        {"LTN", 10}, {"SAF", 11}, {"CHN", 12},
+        {"TWN", 5}, {"ROC", 5}, {"KOR", 6}, {"HKG", 7}, {"ASI", 8},
+        {"LTN", 9}, {"SAF", 10},
     };
     for (const auto& [name, index] : kAreas) {
         if (area == name) {
             return index;
         }
     }
-    return MKW_REGION_SC_AREA;
+    return 0xFFFFFFFFu;
 }
 
 // Maps standard Wii setting.txt GAME string to SC game region index (RVL SDK SCGetProductGameRegion).
@@ -38,7 +38,7 @@ uint32_t LookupProductGameRegion(const std::string& gameRegion) {
             return index;
         }
     }
-    return MKW_REGION_SC_GAME_REGION;
+    return 0xFFFFFFFFu;
 }
 
 } // namespace
