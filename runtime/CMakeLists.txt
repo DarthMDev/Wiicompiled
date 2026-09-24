@@ -386,7 +386,7 @@ else()
         target_compile_definitions(mkw_macos_native_compile PRIVATE SDL_MAIN_HANDLED TARGET_PC)
         target_link_libraries(mkw_macos_native_compile PRIVATE
             aurora::gx aurora::pad aurora::si aurora::vi aurora::mtx
-            mkw::pugixml mkw::toml11 mkw::cryptopp)
+            mkw::pugixml mkw::toml11 mkw::cryptopp mkw::mbedtls)
         if(MKW_PLATFORM_MACOS_X86_64)
             target_link_libraries(mkw_macos_native_compile PRIVATE mkw::libco)
             target_compile_options(mkw_macos_native_compile PRIVATE
