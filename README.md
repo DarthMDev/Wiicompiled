@@ -178,6 +178,9 @@ and then throw a C++ compiler at the result. It's a **one-time cost** on your ma
 Clean retail discs for PAL (`RMCP01`), NTSC-U (`RMCE01`), NTSC-J (`RMCJ01`), or NTSC-K (`RMCK01`).
 Modified executables are rejected to prevent subtle, hard-to-debug issues.
 
+> [!NOTE]
+> Prebuilt Windows release packages (`WiiCompiled-Setup.exe`) currently target PAL `RMCP01`. Compiling other regions on Windows is supported from source via `Launcher/LocalBuild.ps1`.
+
 **Can I recompile other GameCube/Wii games with it?**
 The translator itself handles DOLs and RELs generically, see
 `projects/examples/generic-dol.yml`. The catch is that a *playable* port also needs a runtime:
