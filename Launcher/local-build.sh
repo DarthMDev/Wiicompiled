@@ -457,7 +457,9 @@ publish_built_product() {
     local exe=$build/$target
     assert_file "$exe" "Locally compiled game executable"
     cp -f "$exe" "$destination/$target"
-    for name in dsp_coef.bin initial_pipeline_cache.db; do
+    # cacert.pem is the TLS root bundle the mbed TLS path looks up beside the executable
+    # (runtime/src/hle/net/network_ssl.cpp); without it HTTPS fails at runtime.
+    for name in dsp_coef.bin initial_pipeline_cache.db cacert.pem; do
         [[ -f "$build/$name" ]] && cp -f "$build/$name" "$destination/"
     done
     [[ -d "$build/wii_bootstrap" ]] && cp -rf "$build/wii_bootstrap" "$destination/"
