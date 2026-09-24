@@ -190,8 +190,11 @@ jobs:
         shell: bash
         run: |
           pkgutil --check-signature Launcher/dist/WiiCompiled-Setup.pkg
-          ! pkgutil --payload-files Launcher/dist/WiiCompiled-Setup.pkg | \
-            grep -E '/(Assets|generated|PulsarPacks|WiiCompiled.app|RetroRewind.app)(/|$)'
+          if pkgutil --payload-files Launcher/dist/WiiCompiled-Setup.pkg | \
+            grep -E '/(Assets|generated|PulsarPacks|WiiCompiled.app|RetroRewind.app)(/|$)'; then
+            echo "::error::Unexpected excluded paths found in package payload" >&2
+            exit 1
+          fi
           expanded="$RUNNER_TEMP/wiicompiled-setup-expanded"
           pkgutil --expand-full Launcher/dist/WiiCompiled-Setup.pkg "$expanded"
           resources="$expanded/Payload/Applications/WiiCompiled Setup.app/Contents/Resources"

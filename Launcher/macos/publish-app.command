@@ -79,7 +79,7 @@ dependency_path() {
             while IFS= read -r rpath; do
                 case "$rpath" in
                     @loader_path/*) rpath="$(dirname "$current")/${rpath#@loader_path/}" ;;
-                    @executable_path/*) rpath="$macos/${rpath#@executable_path/}" ;;
+                    @executable_path/*) rpath="$build_dir/${rpath#@executable_path/}" ;;
                 esac
                 candidate="$rpath/$name"
                 [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
@@ -95,19 +95,23 @@ dependency_path() {
 
 # Build a closure of non-system dylibs. System libraries remain system
 # references, while every resolved dependency is copied beside the executable.
-queue=("$macos/$product")
-while ((${#queue[@]})); do
-    current=${queue[0]}
-    queue=("${queue[@]:1}")
+queue_bundle=("$macos/$product")
+queue_source=("$build_dir/$product")
+while ((${#queue_bundle[@]})); do
+    current_bundle=${queue_bundle[0]}
+    current_source=${queue_source[0]}
+    queue_bundle=("${queue_bundle[@]:1}")
+    queue_source=("${queue_source[@]:1}")
     while IFS= read -r dependency; do
-        dependency_path=$(dependency_path "$current" "$dependency") || continue
+        dependency_path=$(dependency_path "$current_source" "$dependency") || continue
         name=$(basename "$dependency")
         if [[ ! -f "$frameworks/$name" ]]; then
             ditto "$dependency_path" "$frameworks/$name"
             install_name_tool -id "@rpath/$name" "$frameworks/$name"
-            queue+=("$frameworks/$name")
+            queue_bundle+=("$frameworks/$name")
+            queue_source+=("$dependency_path")
         fi
-    done < <(otool -L "$current" | tail -n +2 | awk '{print $1}')
+    done < <(otool -L "$current_bundle" | tail -n +2 | awk '{print $1}')
 done
 while IFS= read -r binary; do
     while IFS= read -r old; do

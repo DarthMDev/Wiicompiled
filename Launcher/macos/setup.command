@@ -87,6 +87,7 @@ if (( needs_workspace_refresh )); then
         # Refresh only packaged source inputs. Assets and the staged Retro
         # Rewind package belong to the user and stay in place.
         for source in aurora-main projects runtime translator Launcher; do
+            rm -rf "$workspace/$source"
             /usr/bin/ditto "$workspace_source/$source" "$workspace/$source"
         done
         /usr/bin/ditto "$source_bundle_version" "$workspace_bundle_version"
