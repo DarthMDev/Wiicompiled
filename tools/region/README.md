@@ -160,5 +160,4 @@ them with the address each `r13`/`r2` access forms), re-run the porter for J and
 table and is validated against the region's `MAP.txt`.
 
 Region support is also not the same thing as region *content*: `paths.dvd_root` in `Config.toml`
-must point at the extracted disc for the region you are running. A mismatch panics in G3D while
-loading textures, which looks like a code bug and is not one.
+must point at the extracted disc for the region you are running.
