@@ -35,7 +35,7 @@ all use the same upscaling hook; game-specific interpolation remains untested.
 1. Request Dawn's `SharedTextureMemoryIOSurface` and `SharedFenceMTLSharedEvent`
    features when the Metal adapter supports both. Use that Dawn device's native
    `MTLDevice`, not a separately selected default device.
-2. Cache three upscaling slots with IOSurface-backed input and output textures,
+2. Cache MaxInterpolatedFrames + 1 upscaling slots with IOSurface-backed input and output textures,
    a spatial scaler, a private MetalFX output, and shared-event dependencies.
    Check texture formats, dimensions, usages, and device size limits on creation.
 3. Begin Dawn input access, copy the completed game image at its source size,
