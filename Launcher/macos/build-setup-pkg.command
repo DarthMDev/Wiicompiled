@@ -45,6 +45,15 @@ while (($#)); do
     esac
 done
 version=${version#v}
+if [[ -z "$version" || "$version" == "0.1.0" ]]; then
+    local_csproj="$workspace/Launcher/Directory.Build.props"
+    if [[ -f "$local_csproj" ]]; then
+        detected=$(grep -m1 '<Version>' "$local_csproj" | sed -E 's/.*<Version>([^<]+)<\/Version>.*/\1/' || true)
+        if [[ -n "$detected" ]]; then
+            version="$detected"
+        fi
+    fi
+fi
 [[ "$version" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || fail '--version must contain one to three period-separated integers'
 IFS=. read -r version_major version_minor version_patch <<< "$version"
 short_version="$version_major.${version_minor:-0}.${version_patch:-0}"

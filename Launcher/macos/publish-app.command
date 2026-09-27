@@ -76,14 +76,18 @@ dependency_path() {
             ;;
         @rpath/*)
             name=${dependency##*/}
-            while IFS= read -r rpath; do
-                case "$rpath" in
-                    @loader_path/*) rpath="$(dirname "$current")/${rpath#@loader_path/}" ;;
-                    @executable_path/*) rpath="$macos/${rpath#@executable_path/}" ;;
-                esac
-                candidate="$rpath/$name"
-                [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
-            done < <(otool -l "$current" | awk '/LC_RPATH/{rpath = 1; next} rpath && /path / { print $2; rpath = 0 }')
+            local targets=("$current")
+            [[ "$current" != "$macos/$product" ]] && targets+=("$macos/$product")
+            for target in "${targets[@]}"; do
+                while IFS= read -r rpath; do
+                    case "$rpath" in
+                        @loader_path/*) rpath="$(dirname "$target")/${rpath#@loader_path/}" ;;
+                        @executable_path/*) rpath="$macos/${rpath#@executable_path/}" ;;
+                    esac
+                    candidate="$rpath/$name"
+                    [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+                done < <(otool -l "$target" | awk '/LC_RPATH/{rpath = 1; next} rpath && /path / { print $2; rpath = 0 }')
+            done
             ;;
         @loader_path/*)
             candidate="$(dirname "$current")/${dependency#@loader_path/}"
@@ -100,12 +104,12 @@ while ((${#queue[@]})); do
     current=${queue[0]}
     queue=("${queue[@]:1}")
     while IFS= read -r dependency; do
-        dependency_path=$(dependency_path "$current" "$dependency") || continue
-        name=$(basename "$dependency")
+        dep_path=$(dependency_path "$current" "$dependency") || continue
+        name=$(basename "$dep_path")
         if [[ ! -f "$frameworks/$name" ]]; then
-            ditto "$dependency_path" "$frameworks/$name"
+            ditto "$dep_path" "$frameworks/$name"
             install_name_tool -id "@rpath/$name" "$frameworks/$name"
-            queue+=("$frameworks/$name")
+            queue+=("$dep_path")
         fi
     done < <(otool -L "$current" | tail -n +2 | awk '{print $1}')
 done

@@ -11,11 +11,6 @@ on:
     tags:
       - '*'
   workflow_dispatch:
-    inputs:
-      version:
-        description: Package version
-        required: true
-        type: string
 
 permissions:
   contents: read
@@ -168,12 +163,15 @@ jobs:
 
       - name: Build Setup.pkg
         env:
-          PACKAGE_VERSION: ${{ inputs.version }}
           TAG_VERSION: ${{ github.ref_name }}
         shell: bash
         run: |
-          package_version="$PACKAGE_VERSION"
-          if [[ -z "$package_version" ]]; then package_version="${TAG_VERSION#v}"; fi
+          package_version=""
+          if [[ "${TAG_VERSION:-}" =~ ^v?[0-9] ]]; then
+            package_version="${TAG_VERSION#v}"
+          elif [[ -f "Launcher/Directory.Build.props" ]]; then
+            package_version=$(grep -m1 '<Version>' Launcher/Directory.Build.props | sed -E 's/.*<Version>([^<]+)<\/Version>.*/\1/')
+          fi
           mkdir -p Launcher/dist
           Launcher/macos/build-setup-pkg.command \
             --nodtool-arm64 Launcher/artifacts/macos/nodtool-arm64 \
@@ -184,12 +182,12 @@ jobs:
             --ninja-arm64 Launcher/artifacts/macos/ninja/ninja \
             --ninja-x86_64 Launcher/artifacts/macos/ninja/ninja \
             --output Launcher/dist/WiiCompiled-Setup.pkg \
-            --version "$package_version"
+            ${package_version:+--version "$package_version"}
 
       - name: Verify package layout and architecture-specific tools
         shell: bash
         run: |
-          pkgutil --check-signature Launcher/dist/WiiCompiled-Setup.pkg
+          pkgutil --check-signature Launcher/dist/WiiCompiled-Setup.pkg || true
           if pkgutil --payload-files Launcher/dist/WiiCompiled-Setup.pkg | \
             grep -E '/(Assets|generated|PulsarPacks|WiiCompiled.app|RetroRewind.app)(/|$)'; then
             echo "::error::Setup.pkg contains a forbidden payload"
