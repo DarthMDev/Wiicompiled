@@ -58,7 +58,7 @@ require_arch() {
 require_arch "$nodtool_arm64" arm64 '--nodtool-arm64'; require_arch "$nodtool_x86_64" x86_64 '--nodtool-x86_64'
 require_arch "$translator_arm64" arm64 '--translator-arm64'; require_arch "$translator_x86_64" x86_64 '--translator-x86_64'
 require_arch "$ninja_arm64" arm64 '--ninja-arm64'; require_arch "$ninja_x86_64" x86_64 '--ninja-x86_64'
-lipo "$cmake_root/bin/cmake" -verify_arch arm64 x86_64 >/dev/null 2>&1 || fail '--cmake-root/bin/cmake must be universal2'
+lipo "$cmake_root/bin/cmake" -verify_arch arm64 >/dev/null 2>&1 && lipo "$cmake_root/bin/cmake" -verify_arch x86_64 >/dev/null 2>&1 || fail '--cmake-root/bin/cmake must be universal2'
 
 # Slice checks above prevent accidental cross-architecture packaging. Exercise
 # each supplied executable as well: an incorrectly bundled runtime can have a
@@ -144,7 +144,12 @@ mkdir -p "$resources/workspace/Launcher/macos"
 copy_clean "$workspace/Launcher/local-build-macos.command" "$resources/workspace/Launcher/local-build-macos.command"
 copy_clean "$workspace/Launcher/macos/extract-disc.command" "$resources/workspace/Launcher/macos/extract-disc.command"
 copy_clean "$workspace/Launcher/macos/publish-app.command" "$resources/workspace/Launcher/macos/publish-app.command"
+[[ -f "$workspace/Launcher/macos/macos-x86_64-toolchain.cmake" ]] && copy_clean "$workspace/Launcher/macos/macos-x86_64-toolchain.cmake" "$resources/workspace/Launcher/macos/macos-x86_64-toolchain.cmake"
+[[ -d "$workspace/Launcher/WiiCompiled.Setup.Common" ]] && copy_clean "$workspace/Launcher/WiiCompiled.Setup.Common" "$resources/workspace/Launcher/WiiCompiled.Setup.Common"
+[[ -f "$workspace/Launcher/Directory.Build.props" ]] && copy_clean "$workspace/Launcher/Directory.Build.props" "$resources/workspace/Launcher/Directory.Build.props"
 chmod +x "$resources/workspace/Launcher/local-build-macos.command" "$resources/workspace/Launcher/macos/"*.command
+find "$resources/workspace" -type d \( -name "bin" -o -name "obj" -o -name ".local" \) -prune -exec rm -rf {} +
+find "$resources/workspace" -name ".DS_Store" -delete
 # setup.command uses this marker to refresh source inputs in an existing user
 # workspace without replacing extracted game assets or Retro Rewind files.
 printf '%s\n' "$version" > "$resources/workspace/.bundle-version"
