@@ -21,7 +21,7 @@ static int32_t NewWiiSocket(uint32_t af, uint32_t type, uint32_t protocol) {
     return wiiFd;
 }
 
-static int32_t DeleteWiiSocket(uint32_t fd) {
+int32_t DeleteWiiSocket(uint32_t fd) {
     WiiSocket* s = GetWiiSocket(fd);
     if (!s) {
         return -SO_EBADF;
