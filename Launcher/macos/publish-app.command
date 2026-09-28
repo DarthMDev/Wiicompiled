@@ -35,7 +35,7 @@ done
 for tool in codesign ditto install_name_tool lipo otool; do command -v "$tool" >/dev/null || fail "required macOS tool is unavailable: $tool"; done
 [[ -x "$build_dir/$product" ]] || fail "missing compiled product: $build_dir/$product"
 lipo "$build_dir/$product" -verify_arch "$architecture" || fail "compiled product is not $architecture: $build_dir/$product"
-for asset in dsp_coef.bin initial_pipeline_cache.db wii_bootstrap; do [[ -e "$build_dir/$asset" ]] || fail "missing runtime asset: $build_dir/$asset"; done
+for asset in dsp_coef.bin initial_pipeline_cache.db cacert.pem wii_bootstrap; do [[ -e "$build_dir/$asset" ]] || fail "missing runtime asset: $build_dir/$asset"; done
 
 app="$output_dir/$product.app"
 macos="$app/Contents/MacOS"
@@ -60,7 +60,7 @@ cat > "$app/Contents/Info.plist" <<EOF
 </dict></plist>
 EOF
 ditto "$build_dir/$product" "$macos/$product"
-for asset in dsp_coef.bin initial_pipeline_cache.db wii_bootstrap; do
+for asset in dsp_coef.bin initial_pipeline_cache.db cacert.pem wii_bootstrap; do
     ditto "$build_dir/$asset" "$resources/$asset"
     ln -s "../Resources/$asset" "$macos/$asset"
 done
