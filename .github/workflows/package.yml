@@ -133,20 +133,9 @@ jobs:
       - name: Publish self-contained Translator tools
         shell: bash
         run: |
-          printf '%s  %s\n' "$nodtool_arm64_sha256" Launcher/artifacts/macos/nodtool-arm64 | shasum -a 256 -c -
-          printf '%s  %s\n' "$nodtool_x86_64_sha256" Launcher/artifacts/macos/nodtool-x86_64 | shasum -a 256 -c -
-          chmod +x Launcher/artifacts/macos/nodtool-arm64 Launcher/artifacts/macos/nodtool-x86_64
-
-        shell: bash
-        run: |
           dotnet publish translator/src/Translator.Cli/Translator.Cli.csproj \
             -c Release -r osx-arm64 --self-contained true \
             -p:PublishSingleFile=true \
-          dotnet publish translator/src/Translator.Cli/Translator.Cli.csproj \
-            -c Release -r osx-arm64 --self-contained true \
-            -p:PublishSingleFile=true \
-            -o Launcher/artifacts/macos/translator-arm64
-
             -o Launcher/artifacts/macos/translator-arm64
           dotnet publish translator/src/Translator.Cli/Translator.Cli.csproj \
             -c Release -r osx-x64 --self-contained true \
@@ -198,10 +187,6 @@ jobs:
         shell: bash
         run: |
           pkgutil --check-signature Launcher/dist/WiiCompiled-Setup.pkg
-
-        shell: bash
-        run: |
-          pkgutil --check-signature Launcher/dist/WiiCompiled-Setup.pkg
           ! pkgutil --payload-files Launcher/dist/WiiCompiled-Setup.pkg | \
             grep -E '/(Assets|generated|PulsarPacks|WiiCompiled.app|RetroRewind.app)(/|$)'
           expanded="$RUNNER_TEMP/wiicompiled-setup-expanded"
@@ -212,7 +197,8 @@ jobs:
               lipo "$resources/tools/$arch/$tool" -verify_arch "$arch"
             done
           done
-          lipo "$resources/tools/cmake/bin/cmake" -verify_arch arm64 x86_64
+          lipo "$resources/tools/cmake/bin/cmake" -verify_arch arm64
+          lipo "$resources/tools/cmake/bin/cmake" -verify_arch x86_64
           bash "$resources/setup.command" --help
           /usr/bin/arch -x86_64 /bin/bash "$resources/setup.command" --help
 
