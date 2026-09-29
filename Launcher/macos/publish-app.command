@@ -71,27 +71,43 @@ done
 dependency_path() {
     local current=$1 dependency=$2 name rpath candidate
     case "$dependency" in
-        /opt/homebrew/*|/usr/local/*)
-            [[ -f "$dependency" ]] && { printf '%s\n' "$dependency"; return 0; }
+        /System/Library/*|/usr/lib/*)
+            return 1
             ;;
-        @rpath/*)
-            name=${dependency##*/}
-            local targets=("$current")
-            [[ "$current" != "$macos/$product" ]] && targets+=("$macos/$product")
-            for target in "${targets[@]}"; do
-                while IFS= read -r rpath; do
-                    case "$rpath" in
-                        @loader_path/*) rpath="$(dirname "$target")/${rpath#@loader_path/}" ;;
-                        @executable_path/*) rpath="$macos/${rpath#@executable_path/}" ;;
-                    esac
-                    candidate="$rpath/$name"
-                    [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
-                done < <(otool -l "$target" | awk '/LC_RPATH/{rpath = 1; next} rpath && /path / { print $2; rpath = 0 }')
-            done
+        /*)
+            [[ -f "$dependency" ]] && { printf '%s\n' "$dependency"; return 0; }
             ;;
         @loader_path/*)
             candidate="$(dirname "$current")/${dependency#@loader_path/}"
             [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+            ;;
+        @executable_path/*)
+            candidate="$build_dir/${dependency#@executable_path/}"
+            [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+            ;;
+        @rpath/*|*.dylib)
+            name=${dependency##*/}
+            local targets=("$current")
+            [[ "$current" != "$build_dir/$product" ]] && targets+=("$build_dir/$product")
+            for target in "${targets[@]}"; do
+                while IFS= read -r rpath; do
+                    case "$rpath" in
+                        @loader_path/*) rpath="$(dirname "$target")/${rpath#@loader_path/}" ;;
+                        @loader_path) rpath="$(dirname "$target")" ;;
+                        @executable_path/*) rpath="$build_dir/${rpath#@executable_path/}" ;;
+                        @executable_path) rpath="$build_dir" ;;
+                    esac
+                    candidate="$rpath/$name"
+                    [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
+                done < <(otool -l "$target" | awk '
+/LC_RPATH/ { rpath = 1; next }
+rpath && /^[[:space:]]*path / {
+    sub(/^[[:space:]]*path[[:space:]]+/, "");
+    sub(/[[:space:]]+\(offset[[:space:]]+[0-9]+\)$/, "");
+    print;
+    rpath = 0;
+}')
+            done
             ;;
     esac
     return 1
@@ -99,19 +115,25 @@ dependency_path() {
 
 # Build a closure of non-system dylibs. System libraries remain system
 # references, while every resolved dependency is copied beside the executable.
-queue=("$macos/$product")
+queue=("$build_dir/$product")
 while ((${#queue[@]})); do
     current=${queue[0]}
     queue=("${queue[@]:1}")
+    self_id=$(otool -D "$current" 2>/dev/null | tail -n +2 | sed -nE 's/^[[:space:]]*(.*)[[:space:]]*$/\1/p' || true)
     while IFS= read -r dependency; do
-        dep_path=$(dependency_path "$current" "$dependency") || continue
+        [[ -z "$dependency" ]] && continue
+        [[ -n "$self_id" && "$dependency" == "$self_id" ]] && continue
+        case "$dependency" in
+            /System/Library/*|/usr/lib/*) continue ;;
+        esac
+        dep_path=$(dependency_path "$current" "$dependency") || fail "unresolved non-system dependency: '$dependency' needed by '$current'"
         name=$(basename "$dep_path")
         if [[ ! -f "$frameworks/$name" ]]; then
             ditto "$dep_path" "$frameworks/$name"
             install_name_tool -id "@rpath/$name" "$frameworks/$name"
             queue+=("$dep_path")
         fi
-    done < <(otool -L "$current" | tail -n +2 | awk '{print $1}')
+    done < <(otool -L "$current" | tail -n +2 | sed -nE 's/^[[:space:]]*(.*)[[:space:]]+\(compatibility version .*/\1/p')
 done
 while IFS= read -r binary; do
     while IFS= read -r old; do
@@ -122,7 +144,7 @@ while IFS= read -r binary; do
         else
             install_name_tool -change "$old" "@loader_path/$name" "$binary"
         fi
-    done < <(otool -L "$binary" | tail -n +2 | awk '{print $1}')
+    done < <(otool -L "$binary" | tail -n +2 | sed -nE 's/^[[:space:]]*(.*)[[:space:]]+\(compatibility version .*/\1/p')
 done < <(find "$frameworks" -type f -print; printf '%s\n' "$macos/$product")
 
 find "$frameworks" -type f -exec codesign --force --sign - {} +
