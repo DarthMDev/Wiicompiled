@@ -69,7 +69,7 @@ done
 # both traditional Homebrew dylibs and the vendored dylibs CMake emits under
 # the local build directory for a cross-architecture build.
 dependency_path() {
-    local current=$1 dependency=$2 name rpath candidate
+    local current=$1 dependency=$2 rpath candidate
     case "$dependency" in
         /System/Library/*|/usr/lib/*)
             return 1
@@ -86,7 +86,12 @@ dependency_path() {
             [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
             ;;
         @rpath/*|*.dylib)
-            name=${dependency##*/}
+            local subpath
+            if [[ "$dependency" == @rpath/* ]]; then
+                subpath="${dependency#@rpath/}"
+            else
+                subpath="$dependency"
+            fi
             local targets=("$current")
             [[ "$current" != "$build_dir/$product" ]] && targets+=("$build_dir/$product")
             for target in "${targets[@]}"; do
@@ -97,7 +102,7 @@ dependency_path() {
                         @executable_path/*) rpath="$build_dir/${rpath#@executable_path/}" ;;
                         @executable_path) rpath="$build_dir" ;;
                     esac
-                    candidate="$rpath/$name"
+                    candidate="$rpath/$subpath"
                     [[ -f "$candidate" ]] && { printf '%s\n' "$candidate"; return 0; }
                 done < <(otool -l "$target" | awk '
 /LC_RPATH/ { rpath = 1; next }
