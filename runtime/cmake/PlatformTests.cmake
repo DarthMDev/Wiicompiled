@@ -89,8 +89,8 @@ endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     # Probe at the base ISA, including OS support for AVX register state. Cross
-    # builds retain both compile targets without trying to execute target code.
-    if(NOT CMAKE_CROSSCOMPILING)
+    # builds execute target code only through a configured emulator.
+    if(NOT CMAKE_CROSSCOMPILING OR CMAKE_CROSSCOMPILING_EMULATOR)
         include(CheckCXXSourceRuns)
         include(CMakePushCheckState)
         cmake_push_check_state(RESET)
@@ -130,7 +130,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
         target_compile_features(mkw_ppc_pair_fma_${profile}_tests PRIVATE cxx_std_17)
         target_compile_options(mkw_ppc_pair_fma_${profile}_tests PRIVATE
             -march=x86-64-${profile} -fno-fast-math -ffp-contract=off)
-        if(profile STREQUAL "v2" OR (NOT CMAKE_CROSSCOMPILING AND MKW_HOST_SUPPORTS_X86_V3))
+        if((NOT CMAKE_CROSSCOMPILING OR CMAKE_CROSSCOMPILING_EMULATOR) AND
+           (profile STREQUAL "v2" OR MKW_HOST_SUPPORTS_X86_V3))
             add_test(NAME mkw_ppc_pair_fma_${profile}_tests COMMAND mkw_ppc_pair_fma_${profile}_tests)
         endif()
     endforeach()
