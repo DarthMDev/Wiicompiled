@@ -21,12 +21,18 @@
 // Any PAL address the region header does not define fails to compile ("use of undeclared
 // identifier 'MKW_G_xxxxxxxx'"): a region table is complete or the build does not exist.
 
+// Standalone host tests and the native compile audit have no translated game.
+// They select a fixture explicitly; product builds still require the translator's
+// configuration so a missing file cannot silently bind an NTSC build to PAL.
+#if defined(MKW_STANDALONE_GUEST_REGION_HEADER)
+#include MKW_STANDALONE_GUEST_REGION_HEADER
+#else
 #include "generated/RuntimeConfig.h"
-
 #if defined(MKW_GUEST_REGION_HEADER)
 #include MKW_GUEST_REGION_HEADER
 #else
 #include "region/rmcp01.h"
+#endif
 #endif
 
 // A guest address, and the C symbol of its translated function, from a PAL identity. The region
