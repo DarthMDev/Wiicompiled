@@ -21,17 +21,9 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
             "WiiCompiled supports one macOS architecture per build directory; "
             "configure separate arm64 and x86_64 build directories")
     endif()
-    string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" MKW_OSX_PROCESSOR)
-    string(TOLOWER "${CMAKE_OSX_ARCHITECTURES}" MKW_OSX_ARCHITECTURE)
-    if(MKW_OSX_PROCESSOR STREQUAL "amd64")
-        set(MKW_OSX_PROCESSOR x86_64)
-    endif()
-    if(NOT MKW_OSX_PROCESSOR STREQUAL MKW_OSX_ARCHITECTURE)
-        message(FATAL_ERROR
-            "CMAKE_OSX_ARCHITECTURES must match CMAKE_SYSTEM_PROCESSOR so dependencies "
-            "and context backends use the target architecture. For Intel builds on Apple "
-            "Silicon, configure a fresh directory with Launcher/macos/macos-x86_64-toolchain.cmake.")
-    endif()
+    list(GET CMAKE_OSX_ARCHITECTURES 0 _mkw_osx_arch)
+    set(CMAKE_SYSTEM_PROCESSOR "${_mkw_osx_arch}" CACHE STRING "Target processor architecture" FORCE)
+    set(CMAKE_SYSTEM_PROCESSOR "${_mkw_osx_arch}")
 endif()
 
 if(WIN32 AND MINGW AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
@@ -55,6 +47,7 @@ if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
 endif()
 
 option(MKW_BUILD_PRODUCTS "Build translated WiiCompiled product targets" ON)
+option(MKW_BUILD_PSQ_TESTS "Build focused PSQ ISA tests" OFF)
 set(MKW_X86_CPU_PROFILE "v3" CACHE STRING
     "Minimum x86-64 CPU profile for translated products (v2 or v3)")
 set_property(CACHE MKW_X86_CPU_PROFILE PROPERTY STRINGS v2 v3)
@@ -198,6 +191,18 @@ set(MKW_AURORA_DIR "${CMAKE_CURRENT_LIST_DIR}/../aurora-main")
 # The translator's explicit float casts are PPC single-precision rounding points.
 # Fast-math may erase them and change guest-visible integer conversions.
 set(MKW_TRANSLATED_PPC_FP_OPTIONS -fno-fast-math -ffp-contract=off)
+
+set(MKW_PPC_SEMANTIC_RUNTIME_SOURCES
+    "${CMAKE_CURRENT_LIST_DIR}/src/ppc_helpers.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/fpu_helpers.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp")
+set_source_files_properties(${MKW_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
+    SKIP_UNITY_BUILD_INCLUSION ON
+    SKIP_PRECOMPILE_HEADERS ON
+    COMPILE_OPTIONS "${MKW_TRANSLATED_PPC_FP_OPTIONS}")
+# Match the optimization policy of the translated callers as well as their FP policy.
+set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp" APPEND PROPERTY
+    COMPILE_OPTIONS -O2 -fno-slp-vectorize)
 
 # ----------------------------------------------------------------------
 # Third-party: aurora-main (provides SDL3 + GPU backends)

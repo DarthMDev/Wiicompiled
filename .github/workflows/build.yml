@@ -78,6 +78,10 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Test macOS app dependency packaging
+        shell: bash
+        run: bash Launcher/macos/test-publish-app.command
+
       - name: Configure native runtime
         shell: bash
         run: |
@@ -92,6 +96,7 @@ jobs:
         run: |
           cmake --build build-macos --target \
             mkw_platform_paths_tests \
+            mkw_runtime_config_tests \
             mkw_nand_save_tests \
             mkw_nand_settings_tests \
             mkw_sc_serial_tests \
@@ -99,7 +104,8 @@ jobs:
             mkw_macos_native_compile \
             mkw_macos_context_abi_tests \
             mkw_macos_host_context_tests \
-            mkw_macos_guest_flat_memory_tests
+            mkw_macos_guest_flat_memory_tests \
+            mkw_macos_external_audio_tests
 
       - name: Test execution substrate
         shell: bash

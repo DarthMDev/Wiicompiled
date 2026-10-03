@@ -52,12 +52,16 @@ Play at several times the console's resolution.
 **Music ducking.** 
 Start playing something else, Spotify, a YouTube video, and
 the game automatically mutes its own music until the other audio stops. Optional, if you'd
-rather it didn't. All audio that shows in your display media controls on your windows pc fall under this.
+rather it didn't. Windows uses system media controls and Linux uses MPRIS players.
+On macOS 14.2 or later, this detects other apps with active audio output and excludes
+the game's own audio. Apps that keep an output stream running silently can keep
+game music muted even when nothing is audible.
 
 **An in-game settings bar.** 
 Press **F10** while the game window has focus:
 - Internal resolution
 - FPS counter
+- MetalFX spatial upscaling on supported macOS GPUs
 - Controller assignment for all four ports
 - Full per-controller button mapping, including the bumpers
 - Dolphin-syntax input expressions and GCPadNew.ini import
@@ -120,10 +124,10 @@ launching. The backend itself is deliberately command-line only, Wheel Wizard is
 
 ### macOS
 
-Download `WiiCompiled-Setup.pkg` from this repository's Releases page and open it. The package includes
-native tools for Apple Silicon and Intel x86_64-v3 Macs, selecting the matching set automatically. It
-installs **WiiCompiled Setup** in Applications; open that app, choose your clean PAL `RMCP01` disc image,
-and select either the base game or Retro Rewind. For Retro Rewind, choose the `RetroRewind6` folder
+Download `WiiCompiled-Setup.pkg` from this repository's Releases page and open it. The universal
+package selects the appropriate bundled tools for the host architecture, supporting both Apple Silicon (`arm64`)
+and Intel (`x86_64`) Macs. It installs **WiiCompiled Setup** in Applications; open that app, choose
+your clean PAL `RMCP01` disc image, and select either the base game or Retro Rewind. For Retro Rewind, choose the `RetroRewind6` folder
 or its parent folder.
 
 Setup verifies and extracts the image locally, then translates and compiles the native app on your

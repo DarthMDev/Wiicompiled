@@ -3,10 +3,39 @@ get_filename_component(MKW_TEST_RUNTIME_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOL
 # Keep these independent from Aurora's BUILD_TESTING option: they validate the
 # project's host-platform contracts, not Aurora's third-party test suite.
 enable_testing()
+if(MKW_BUILD_PSQ_TESTS)
+    add_executable(mkw_psq_helpers_tests
+        "${MKW_TEST_RUNTIME_DIR}/tests/psq_helpers_tests.cpp"
+        "${MKW_TEST_RUNTIME_DIR}/src/ppc_quantized.cpp")
+    target_include_directories(mkw_psq_helpers_tests PRIVATE
+        "${MKW_TEST_RUNTIME_DIR}/tests/psq_memory"
+        "${MKW_TEST_RUNTIME_DIR}/include/isa"
+        "${MKW_TEST_RUNTIME_DIR}/include")
+    target_compile_features(mkw_psq_helpers_tests PRIVATE cxx_std_17)
+    target_compile_options(mkw_psq_helpers_tests PRIVATE
+        -O2 -fno-fast-math -ffp-contract=off -fno-slp-vectorize)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+        target_compile_options(mkw_psq_helpers_tests PRIVATE
+            -march=x86-64-${MKW_X86_CPU_PROFILE})
+    endif()
+    set_target_properties(mkw_psq_helpers_tests PROPERTIES UNITY_BUILD OFF)
+    add_test(NAME mkw_psq_helpers_tests COMMAND mkw_psq_helpers_tests)
+    add_test(NAME mkw_psq_reserved_tests COMMAND "${CMAKE_COMMAND}"
+        "-DPSQ_TEST_EXECUTABLE=$<TARGET_FILE:mkw_psq_helpers_tests>"
+        -P "${MKW_TEST_RUNTIME_DIR}/tests/psq_reserved_tests.cmake")
+endif()
+
 add_executable(mkw_platform_paths_tests "${MKW_TEST_RUNTIME_DIR}/tests/platform_paths_tests.cpp")
 target_link_libraries(mkw_platform_paths_tests PRIVATE mkw_platform)
 target_compile_features(mkw_platform_paths_tests PRIVATE cxx_std_17)
 add_test(NAME mkw_platform_paths_tests COMMAND mkw_platform_paths_tests)
+
+add_executable(mkw_runtime_config_tests "${MKW_TEST_RUNTIME_DIR}/tests/runtime_config_tests.cpp")
+target_include_directories(mkw_runtime_config_tests PRIVATE
+    "${MKW_TEST_RUNTIME_DIR}/include"
+    "${MKW_TEST_RUNTIME_DIR}/third_party/toml11")
+target_compile_features(mkw_runtime_config_tests PRIVATE cxx_std_20)
+add_test(NAME mkw_runtime_config_tests COMMAND mkw_runtime_config_tests)
 
 add_executable(mkw_nand_save_tests "${MKW_TEST_RUNTIME_DIR}/tests/nand_save_tests.cpp")
 target_include_directories(mkw_nand_save_tests PRIVATE "${MKW_TEST_RUNTIME_DIR}/include")
@@ -115,4 +144,11 @@ if(MKW_PLATFORM_MACOS)
     target_include_directories(mkw_macos_guest_flat_memory_tests PRIVATE "${MKW_TEST_RUNTIME_DIR}/include")
     target_compile_features(mkw_macos_guest_flat_memory_tests PRIVATE cxx_std_17)
     add_test(NAME mkw_macos_guest_flat_memory_tests COMMAND mkw_macos_guest_flat_memory_tests)
+
+    add_executable(mkw_macos_external_audio_tests
+        "${MKW_TEST_RUNTIME_DIR}/tests/macos_external_audio_tests.cpp"
+        "${MKW_TEST_RUNTIME_DIR}/src/external_audio_macos.cpp")
+    target_include_directories(mkw_macos_external_audio_tests PRIVATE "${MKW_TEST_RUNTIME_DIR}/include")
+    target_compile_features(mkw_macos_external_audio_tests PRIVATE cxx_std_17)
+    add_test(NAME mkw_macos_external_audio_tests COMMAND mkw_macos_external_audio_tests)
 endif()
