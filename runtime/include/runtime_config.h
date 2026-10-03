@@ -33,6 +33,7 @@
 
 struct RuntimeUserConfig {
     std::optional<bool> widescreen;
+    std::optional<bool> forceAspect169;
     std::optional<int32_t> windowPosX;
     std::optional<int32_t> windowPosY;
     std::optional<uint32_t> windowWidth;
@@ -41,6 +42,7 @@ struct RuntimeUserConfig {
     std::optional<std::string> graphicsApi;
     std::optional<std::string> displayMode;
     std::optional<uint32_t> frameInterpolationFps;
+    std::optional<bool> metalFxSpatialUpscaling;
     std::optional<bool> skipUnreadyPipelines;
     std::optional<bool> disableCopyFilter;
     std::optional<bool> textureReplacements;
@@ -298,6 +300,7 @@ inline void EnsureConfigFile() {
               "# Set paths.dvd_root to an extracted Mario Kart Wii DATA directory.\n\n"
               "[video]\n"
               "widescreen = true\n"
+              "force_16_9 = false\n"
               "resolution_multiplier = 1.0\n"
               "frame_interpolation_fps = 0\n"
               "display_mode = \"windowed\"\n"
@@ -426,6 +429,7 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
     }
 
     config.widescreen = FindConfigValue<bool>(document, "video", "widescreen");
+    config.forceAspect169 = FindConfigValue<bool>(document, "video", "force_16_9");
     config.windowPosX = FindConfigInt(document, "video", "window_x");
     config.windowPosY = FindConfigInt(document, "video", "window_y");
     if (auto value = FindConfigUint(document, "video", "window_width"); value && *value != 0) {
@@ -456,6 +460,8 @@ inline RuntimeUserConfig ParseConfigDocument(const toml::value& document) {
             config.frameInterpolationFps = migrated;
         }
     }
+    config.metalFxSpatialUpscaling =
+        FindConfigValue<bool>(document, "video", "metalfx_spatial_upscaling");
     config.skipUnreadyPipelines = FindConfigValue<bool>(document, "video", "skip_unready_pipelines");
     config.disableCopyFilter = FindConfigValue<bool>(document, "video", "disable_copy_filter");
     config.showFps = FindConfigValue<bool>(document, "video", "show_fps");
@@ -657,6 +663,11 @@ inline bool SetFrameInterpolationFps(uint32_t value) {
     return WriteSetting("video", "frame_interpolation_fps", std::to_string(value));
 }
 
+inline bool SetMetalFxSpatialUpscaling(bool value) {
+    Mutable().metalFxSpatialUpscaling = value;
+    return WriteSetting("video", "metalfx_spatial_upscaling", value ? "true" : "false");
+}
+
 inline bool SetDisplayMode(std::string value) {
     if (!IsSupportedDisplayMode(value)) {
         return false;
@@ -782,6 +793,15 @@ inline bool WidescreenEnabled(bool fallback = false) {
     return Get().widescreen.value_or(fallback);
 }
 
+inline bool ForceAspect169Enabled(bool fallback = false) {
+    return Get().forceAspect169.value_or(fallback);
+}
+
+inline bool SetForceAspect169(bool value) {
+    Mutable().forceAspect169 = value;
+    return WriteSetting("video", "force_16_9", value ? "true" : "false");
+}
+
 inline bool WindowPosition(int32_t& x, int32_t& y) {
     if (!Get().windowPosX || !Get().windowPosY) {
         return false;
@@ -801,6 +821,10 @@ inline uint32_t WindowHeight(uint32_t fallback) {
 
 inline float ResolutionMultiplier(float fallback = 1.0f) {
     return std::max(0.0f, Get().resolutionMultiplier.value_or(fallback));
+}
+
+inline bool MetalFxSpatialUpscaling(bool fallback = false) {
+    return Get().metalFxSpatialUpscaling.value_or(fallback);
 }
 
 inline float AudioVolume(float fallback = 1.0f) {
