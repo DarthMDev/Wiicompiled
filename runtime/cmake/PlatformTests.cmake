@@ -88,6 +88,37 @@ if(MKW_PLATFORM_WINDOWS)
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
+    # Probe at the base ISA, including OS support for AVX register state. Cross
+    # builds retain both compile targets without trying to execute target code.
+    if(NOT CMAKE_CROSSCOMPILING)
+        include(CheckCXXSourceRuns)
+        include(CMakePushCheckState)
+        cmake_push_check_state(RESET)
+        set(CMAKE_REQUIRED_FLAGS "-march=x86-64")
+        check_cxx_source_runs([=[
+            #include <cpuid.h>
+            int main() {
+                unsigned a, b, c, d;
+                if (__get_cpuid_max(0, nullptr) < 7 ||
+                    __get_cpuid_max(0x80000000u, nullptr) < 0x80000001u)
+                    return 1;
+                __cpuid_count(1, 0, a, b, c, d);
+                // v2 plus FMA, MOVBE, XSAVE, OSXSAVE, AVX and F16C.
+                const unsigned leaf1 = (1u << 0) | (1u << 9) | (1u << 12) |
+                    (1u << 13) | (1u << 19) | (1u << 20) | (1u << 22) |
+                    (1u << 23) | (1u << 26) | (1u << 27) | (1u << 28) | (1u << 29);
+                if ((c & leaf1) != leaf1) return 1;
+                __cpuid_count(7, 0, a, b, c, d);
+                const unsigned leaf7 = (1u << 3) | (1u << 5) | (1u << 8);
+                if ((b & leaf7) != leaf7) return 1;
+                __cpuid_count(0x80000001u, 0, a, b, c, d);
+                if ((c & 0x21u) != 0x21u) return 1; // LAHF-SAHF and LZCNT.
+                __asm__ __volatile__("xgetbv" : "=a"(a), "=d"(d) : "c"(0));
+                return (a & 0x6u) == 0x6u ? 0 : 1;
+            }
+        ]=] MKW_HOST_SUPPORTS_X86_V3)
+        cmake_pop_check_state()
+    endif()
     # Compile the same oracle cases for both paths. The v2 binary proves the
     # scalar fallback stays free of FMA; the v3 binary checks the existing
     # vector intrinsic path against the same strict result.
@@ -99,7 +130,9 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
         target_compile_features(mkw_ppc_pair_fma_${profile}_tests PRIVATE cxx_std_17)
         target_compile_options(mkw_ppc_pair_fma_${profile}_tests PRIVATE
             -march=x86-64-${profile} -fno-fast-math -ffp-contract=off)
-        add_test(NAME mkw_ppc_pair_fma_${profile}_tests COMMAND mkw_ppc_pair_fma_${profile}_tests)
+        if(profile STREQUAL "v2" OR (NOT CMAKE_CROSSCOMPILING AND MKW_HOST_SUPPORTS_X86_V3))
+            add_test(NAME mkw_ppc_pair_fma_${profile}_tests COMMAND mkw_ppc_pair_fma_${profile}_tests)
+        endif()
     endforeach()
 
     add_library(mkw_cpu_baseline_v2_compile OBJECT
