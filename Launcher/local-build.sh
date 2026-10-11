@@ -212,6 +212,10 @@ case "$dol_hash" in
         ;;
 esac
 
+if (( builds_retro )) && [[ "$expected_letter" == K ]]; then
+    fail 'Retro Rewind is not supported for NTSC-K; use --profile base for the Korean game'
+fi
+
 rel_hash=$(sha256_of "$assets/StaticR.rel")
 [[ "$rel_hash" == "$expected_rel" ]] || fail "Assets/StaticR.rel sha256 does not match the clean revision for region $expected_letter"
 
@@ -383,7 +387,7 @@ if (( builds_retro )); then
     if (( skip_retro_wfc_payload )); then
         translate_mod_args+=(--skip-retro-wfc)
     else
-        offline_payload=$retro_wfc_offline_dir/binary/payload.RMCPD00.bin
+        offline_payload=$retro_wfc_offline_dir/binary/payload.RMC${expected_letter}D00.bin
         assert_file "$offline_payload" "Offline Retro-WFC shared payload"
         translate_mod_args+=(--retro-wfc-payload "$offline_payload")
     fi

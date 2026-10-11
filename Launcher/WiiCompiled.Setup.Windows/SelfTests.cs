@@ -649,8 +649,9 @@ internal static class SelfTests
             Directory.CreateDirectory(Path.GetDirectoryName(payloadPath)!);
             using var signingRsa = RSA.Create(2048);
             var signingKey = signingRsa.ExportParameters(includePrivateParameters: false);
-            var bytes = new byte[0x140];
+            var bytes = new byte[0x150];
             "WWFC/Payload"u8.CopyTo(bytes);
+            "RMCPD00"u8.CopyTo(bytes.AsSpan(0x138));
             BinaryPrimitives.WriteUInt32BigEndian(bytes.AsSpan(0x0C), (uint)bytes.Length);
             bytes[^1] = 0x5A;
             signingRsa.SignData(bytes.AsSpan(0x110), HashAlgorithmName.SHA256,

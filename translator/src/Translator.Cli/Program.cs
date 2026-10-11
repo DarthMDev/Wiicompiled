@@ -372,7 +372,8 @@ int RunValidateRetroWfcPayload(string[] argsTail)
 
     try
     {
-        WiiCompiled.Setup.Common.RetroWfcPayload.ValidateStagedRetroWfcPayloadDirectory(directory);
+        WiiCompiled.Setup.Common.RetroWfcPayload.ValidateStagedRetroWfcPayloadDirectory(directory,
+            gameId: OptionValue(argsTail, "--game-id") ?? "RMCP01");
         Console.WriteLine("[translator] Retro WFC payload signature validated.");
         return 0;
     }
@@ -1724,6 +1725,13 @@ int RunTranslateModCore(string[] argsTail, string? outputDirectoryOverride)
 
     var pul = KamekPulFile.Load(codePul);
     var selected = pul.SelectRegion(region);
+    if (string.Equals(profile?.Name, "retro-rewind", StringComparison.OrdinalIgnoreCase))
+    {
+        var corrected = RetroRewindRegionPatches.CorrectUsVoiceHook(selected, project?.Identity.GameId, image.Value);
+        if (!ReferenceEquals(corrected, selected))
+            Console.WriteLine("[translator] Corrected Retro Rewind US voice vtable hook: 0x808DBCD8 -> 0x808D7580.");
+        selected = corrected;
+    }
     if (requestedRetroWfc && profile?.RetroWfcLegacyBootstrapHook is { } legacyBootstrapHook)
     {
         selected = RetroWfcBootstrapSuppressor.Suppress(selected, legacyBootstrapHook);
@@ -3626,7 +3634,8 @@ static (string? Positional, CommandOption[] Options)? CommandSpec(string command
     }),
     "validate-retro-wfc-payload" => (null, new CommandOption[]
     {
-        new("--directory", "directory", Required: true)
+        new("--directory", "directory", Required: true),
+        new("--game-id", "RMCP01")
     }),
     "emit-base-manifest" => (null, new CommandOption[]
     {

@@ -50,3 +50,26 @@ output:
   runtime_config: RuntimeConfig.h
   data_initializer: data_sections_init.cpp
   base_manifest: ../build/base/mkwii_base_manifest.json
+
+# Code.pul carries a separate chunk for this region. The regional link base determines
+# the branch bytes checked at startup; execution is remapped to module_guest_base.
+profiles:
+  retro-rewind:
+    enabled: true
+    requires_game_id: RMCJ01
+    requires_dol_sha256: 1b9621ef7c5d97dada103e50e5389730e67f3c2545dda592edd4b5843655af91
+    code_pul: PulsarPacks/completed/RetroRewind/RetroRewind6/Binaries/Code.pul
+    mod_root: PulsarPacks/completed/RetroRewind/RetroRewind6
+    region: J
+    module_guest_base: 0x81800000
+    module_link_base: 0x80398C60
+    output: build/mods/retro_rewind_full_cpp
+    enable_retro_wfc: true
+    retro_wfc_payload: https://rwfc.net/api/wfc/payload?g=RMCJD00
+    retro_wfc_legacy_bootstrap_hook: 0x800ED608
+    riivolution:
+      xml: xml/RetroRewind6.xml
+      options:
+        - section: Retro Rewind
+          option: Pack
+          choice: 1

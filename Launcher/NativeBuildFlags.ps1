@@ -91,7 +91,7 @@ function Get-MkwBuildSafePath([string]$Path, [string]$Kind, [string]$MarkerFile)
         'letters, digits and spaces, or make a safe junction location available.')
 }
 
-function Get-MkwProjectPins([string]$ProjectFile) {
+function Get-MkwProjectPins([string]$ProjectFile, [switch]$BaseOnly) {
     <#
     The Mario Kart Wii facts pinned by projects/mkwii/recomp.yml (game identity, clean input
     digests, translation entry point, Retro-WFC endpoint), read from one place instead of being
@@ -122,7 +122,10 @@ function Get-MkwProjectPins([string]$ProjectFile) {
             $pins.RetroWfcPayloadUri = $Matches[1]
         }
     }
+    # Base translation has no dependency on a mod profile or its download endpoint.
+    # Installer/release callers still require the endpoint by default.
     foreach ($name in @($pins.Keys)) {
+        if ($BaseOnly -and $name -eq 'RetroWfcPayloadUri') { continue }
         if ([string]::IsNullOrWhiteSpace($pins[$name])) {
             throw "$ProjectFile does not pin $name; the project file is not the shape this build expects."
         }

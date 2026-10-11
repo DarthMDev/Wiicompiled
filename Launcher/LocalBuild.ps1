@@ -194,6 +194,10 @@ if (Test-Path -LiteralPath $mainDol) {
     }
 }
 
+if ($buildsRetro -and $expectedLetter -eq 'K') {
+    throw 'Retro Rewind is not supported for NTSC-K; use -Profile base for the Korean game.'
+}
+
 if (Test-Path -LiteralPath $staticRel) {
     $relSha = Get-MkwFileSha256 $staticRel
     if ($relSha -cne $expectedRelSha) {
@@ -230,7 +234,7 @@ foreach ($required in @(
 # Everything Mario-Kart-specific this script needs is read from the project file rather than
 # restated here: the translation entry point below, and (through the retro-rewind profile the
 # translator loads itself) the module guest/link bases the mod translation uses.
-$pins = Get-MkwProjectPins $project
+$pins = Get-MkwProjectPins $project -BaseOnly:(-not $buildsRetro)
 
 # Three independent knobs: $translatorThreads (the translator's own worker threads; peak memory is
 # one heap that barely moves with thread count, so clamping it only slows translation), $translatedJobs
@@ -376,7 +380,7 @@ try {
                 $translateModArguments += '--skip-retro-wfc'
             } elseif (-not [string]::IsNullOrWhiteSpace($RetroWfcOfflineDirectory)) {
                 $offlineRoot = [IO.Path]::GetFullPath($RetroWfcOfflineDirectory)
-                $offlinePayload = Join-Path $offlineRoot 'binary\payload.RMCPD00.bin'
+                $offlinePayload = Join-Path $offlineRoot "binary\payload.RMC${expectedLetter}D00.bin"
                 Assert-File $offlinePayload 'Offline Retro-WFC shared payload'
                 $translateModArguments += @('--retro-wfc-payload', $offlinePayload)
             } else {
@@ -486,8 +490,8 @@ try {
                 RelSha256 = $relSha
                 CodePulSha256 = if ($isRetro) { Get-MkwFileSha256 (Join-Path $retroRoot 'Binaries\Code.pul') } else { $null }
                 RetroWfcPayloadMode = if (-not $isRetro) { $null } elseif ($SkipRetroWfcPayload) { 'skipped' } else { $RetroWfcPayloadOrigin }
-                RetroWfcPayloadSha256 = if ($isRetro -and -not $SkipRetroWfcPayload) { Get-MkwFileSha256 (Join-Path $RetroWfcOfflineDirectory 'binary\payload.RMCPD00.bin') } else { $null }
-                RetroWfcPayloadLength = if ($isRetro -and -not $SkipRetroWfcPayload) { (Get-Item -LiteralPath (Join-Path $RetroWfcOfflineDirectory 'binary\payload.RMCPD00.bin')).Length } else { $null }
+                RetroWfcPayloadSha256 = if ($isRetro -and -not $SkipRetroWfcPayload) { Get-MkwFileSha256 (Join-Path $RetroWfcOfflineDirectory "binary\payload.RMC${expectedLetter}D00.bin") } else { $null }
+                RetroWfcPayloadLength = if ($isRetro -and -not $SkipRetroWfcPayload) { (Get-Item -LiteralPath (Join-Path $RetroWfcOfflineDirectory "binary\payload.RMC${expectedLetter}D00.bin")).Length } else { $null }
                 Compiler = "llvm-mingw clang-22 sha256:$compilerSha"
             }
             $provenance | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $Destination 'local-build.json') -Encoding UTF8

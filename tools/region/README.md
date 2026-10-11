@@ -93,6 +93,10 @@ instruction-exact. So data addresses live in per-region tables:
   by `tools/region/port_data_addresses.py`, which re-derives every address from that region's own
   shipped executable. Do not edit them by hand.
 
+The porter uses NTSC-U as its reference by default, or PAL with `--reference-region P`. Both
+the reference and target `main.dol` / `StaticR.rel` hashes must match the project's pins. PAL
+inputs are also required for the `FIELD` and `RECORD` proofs.
+
 ### Verdicts
 
 The porter labels every row with how it was established, strongest first. It never guesses: a row
@@ -101,27 +105,40 @@ it cannot establish is written out as `UNRESOLVED`, which then fails header gene
 | Verdict | Meaning |
 |---|---|
 | `PROVEN` | The instruction at the ported reference site forms exactly this address, **and** the independent chunk-table port agrees. Two derivations, one answer. |
-| `CALIBRATED` | The reference site reproduces the hand-verified NTSC-U address, so its decode is trusted here even where the chunk table has no mapping. |
+| `CALIBRATED` | The reference site reproduces the known reference-disc address and uniquely matches the target code, even where the data chunk table has no mapping. |
 | `MATCHED` | The reference site's instruction window, with region-varying fields masked out, occurs exactly once in this region's code; the displacement was read from it. Resolves globals inside functions whose length changed. |
-| `ANCHORED` | A fixed offset from a resolved neighbour, where the same offset holds in the verified NTSC-U table. |
+| `FIELD` | The base and field instructions uniquely match PAL. The base register is preserved, and the target's own field offset gives the address. |
+| `RECORD` | The table base and indexing stride are verified, and both records match the PAL bytes. |
 | `SECTION` | A section boundary, taken from the region's own section table. |
-| `SECTION-RELATIVE` | Same offset within the same named section. Bounds-checked; weaker, and labelled as such. |
 | `CHUNK-ONLY` | Chunk-table port with no reference site confirming it. Weakest. |
 
-Current spread for RMCK01: 83 `PROVEN`, 10 `CALIBRATED`, 9 `ANCHORED`, 4 `SECTION`,
-6 `SECTION-RELATIVE`, 17 `CHUNK-ONLY`, 0 unresolved; RMCJ01: 90 / 3 / 9 / 4 / 6 / 17 / 0.
+Current totals:
+
+| Region | PROVEN | CALIBRATED | MATCHED | FIELD | RECORD | SECTION | CHUNK-ONLY | UNRESOLVED |
+|---|---|---|---|---|---|---|---|---|
+| NTSC-J | 91 | 7 | 0 | 10 | 1 | 4 | 16 | 0 |
+| NTSC-K | 84 | 14 | 0 | 10 | 1 | 4 | 16 | 0 |
+
+The 15 rows per region previously labelled `SECTION-RELATIVE` or `ANCHORED` are now checked
+against the target binaries. Neither verdict is emitted anymore. Missing evidence produces
+`UNRESOLVED` and a nonzero exit status; `CHUNK-ONLY` rows are not counted as confirmed.
 
 ### Masked instruction matching
 
 The compiled instruction stream for the same SDK source is identical between regions apart from
-the fields that legitimately move: SDA displacements, branch targets, and `lis` high halves. Mask
+the fields that legitimately move: SDA displacements, branch targets, and absolute address halves. Mask
 exactly those and a window around a reference site becomes a signature. If it occurs **exactly
 once** in the target region's code, that occurrence is the same instruction, and the displacement
 read from it is that region's address. Zero matches or several are reported, not guessed at.
 
-Only sites that reproduce the known NTSC-U address are used as signatures. An uncalibrated site
+Only sites that reproduce the known reference-region address are used as signatures. An uncalibrated site
 forms some *other* object - several GX globals are reached through a pointer cell, so the site
 loads the cell rather than the object - and matching one resolves the wrong address confidently.
+
+REL `ADDR16_LO/HI/HA` relocations are applied before decoding addresses: the raw file has zero
+immediates where the loader writes them. Those fields are masked in signatures; field offsets
+and branch link/absolute flags are kept. `FIELD` checks also track copies and writes to the base
+register, and `RECORD` checks the indexing instruction and table bytes.
 
 ## Things this has already caught
 
@@ -129,6 +146,10 @@ Besides the Korea bugs above, naming the EGG fog constants by identity found a l
 bug: those three `.sdata2` floats sit 8 bytes further from `r2` in NTSC-U than in PAL/NTSC-J/NTSC-K,
 so the hardcoded PAL offset read `176.0 / 176.0 / 1.0` where every region should read
 `0.0 / 0.99 / 0.5`.
+
+Checking the data tables against clean NTSC-J and NTSC-K binaries also corrected four EGG
+vertex-array addresses in each region, plus the GameScreen vtable and movie audio-mode table
+in NTSC-K. The instruction evidence for each address is recorded in `data_addresses.txt`.
 
 ## Regenerating
 
@@ -142,9 +163,9 @@ python3 tools/region/port_map.py --region E --disc-root /path/to/discs   # RMCE0
 python3 tools/region/port_map.py --region J --disc-root /path/to/discs
 python3 tools/region/port_map.py --region K --disc-root /path/to/discs
 
-# Re-derive the NTSC-J and NTSC-K data tables from the NTSC-U evidence table.
-python3 tools/region/port_data_addresses.py --region J --disc-root /path/to/discs
-python3 tools/region/port_data_addresses.py --region K --disc-root /path/to/discs
+# Re-derive the committed data tables using clean PAL as the reference.
+python3 tools/region/port_data_addresses.py --region J --reference-region P --disc-root /path/to/discs
+python3 tools/region/port_data_addresses.py --region K --reference-region P --disc-root /path/to/discs
 
 # Resolve every identity the runtime names and write the four region headers.
 python3 tools/region/gen_region_headers.py
@@ -152,6 +173,12 @@ python3 tools/region/gen_region_headers.py
 
 All three are deterministic: running them again over the same inputs reproduces the committed
 files byte for byte.
+
+The data porter tests need no disc files:
+
+```sh
+python3 -m unittest discover -s tools/region
+```
 
 To name a new global in the runtime: write it as `MKW_GADDR(<PAL address>)`, add one row to the
 NTSC-U table with the NTSC-U address and the instruction(s) that reference it (`disasm.py` prints
@@ -161,3 +188,9 @@ table and is validated against the region's `MAP.txt`.
 
 Region support is also not the same thing as region *content*: `paths.dvd_root` in `Config.toml`
 must point at the extracted disc for the region you are running.
+
+Retro Rewind has profiles for PAL, NTSC-U and NTSC-J, matching the three chunks in `Code.pul`.
+Each profile uses its region's Retro-WFC payload and bootstrap hook. The supplied NTSC-U chunk
+keeps the PAL address for the Rosalina voice vtable hook; the translator corrects that one pointer
+after checking the clean US vtable. NTSC-K needs an upstream-compatible pack chunk before a
+Retro Rewind profile can be added.

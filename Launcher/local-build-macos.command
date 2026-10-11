@@ -20,7 +20,7 @@ Usage: local-build-macos.command --output-dir DIR [options]
   --base-output-dir DIR           Base .app directory (required with --profile both)
   --game IMAGE --nodtool PATH     Extract and verify a clean Mario Kart Wii disc image first
   --retro-rewind-package-dir DIR  RetroRewind6 directory (required for Retro Rewind)
-  --retro-wfc-offline-dir DIR     Directory containing binary/payload.RMCPD00.bin
+  --retro-wfc-offline-dir DIR     Directory containing binary/payload.RMC?D00.bin for the disc region
   --skip-retro-wfc-payload        Build Retro Rewind without the shared Retro-WFC payload
   --force-clean-build             Delete local generated and current-architecture native build caches
   --parallel N                    Pin translation and build parallelism
@@ -107,6 +107,10 @@ case "$dol_hash" in
         ;;
 esac
 
+if (( builds_retro )) && [[ "$expected_letter" == K ]]; then
+    fail 'Retro Rewind is not supported for NTSC-K; use --profile base for the Korean game'
+fi
+
 rel_hash=$(sha256 "$assets/StaticR.rel")
 [[ "$rel_hash" == "$expected_rel" ]] || fail "Assets/StaticR.rel sha256 does not match the clean revision for region $expected_letter"
 
@@ -162,7 +166,7 @@ step emit-base-manifest 'Creating the local base translation manifest'
 translator emit-base-manifest --project "$project" --out "$manifest_dir" --functions-dir "$functions" --translation-output-metadata "$metadata" --region "$expected_letter"
 if (( builds_retro )); then
     mod_out="$workspace/build/mods/retro_rewind_full_cpp"; args=(translate-mod --project "$project" --profile retro-rewind --base-manifest "$manifest" --base-translation-output-metadata "$metadata" --code-pul "$retro_root/Binaries/Code.pul" --mod-root "$retro_root" --mod-name 'Retro Rewind' --region "$expected_letter" --out "$mod_out" --prefer-cached-inputs --emit-cpp --threads "$translator_threads")
-    if (( skip_retro_wfc )); then args+=(--skip-retro-wfc); else offline_payload="$retro_wfc/binary/payload.RMCPD00.bin"; assert_file "$offline_payload" 'Offline Retro-WFC payload'; args+=(--retro-wfc-payload "$offline_payload"); fi
+    if (( skip_retro_wfc )); then args+=(--skip-retro-wfc); else offline_payload="$retro_wfc/binary/payload.RMC${expected_letter}D00.bin"; assert_file "$offline_payload" 'Offline Retro-WFC payload'; args+=(--retro-wfc-payload "$offline_payload"); fi
     step translate-mod 'Translating Retro Rewind'; translator "${args[@]}"
 fi
 step generate-data-init 'Generating local game data initialization'; translator generate-data-init --project "$project"
