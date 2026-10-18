@@ -5,6 +5,7 @@
 
 #include <dolphin/pad.h>
 #include <SDL3/SDL_gamepad.h>
+#include <SDL3/SDL_hidapi.h>
 #include <SDL3/SDL_hints.h>
 #include <SDL3/SDL_log.h>
 #include <SDL3/SDL_sensor.h>
@@ -12,10 +13,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <string>
 #include <unordered_set>
 
@@ -92,11 +95,17 @@ uint64_t g_lostAtMs = 0;
 // remote gets a fresh id and is enabled again.
 std::array<SDL_JoystickID, PAD_MAX_CONTROLLERS> g_sensorsEnabledFor{};
 
-// Zero-point correction subtracted from the remote's accelerometer, in g and in
-// SDL's sensor frame; loaded from Config.toml on first use, replaced by a
-// calibration run. The Nunchuk accelerometer is left uncorrected.
-std::array<float, 3> g_accelOffset{};
-bool g_accelOffsetLoaded = false;
+// Zero-point correction subtracted from a remote's accelerometer, in g and in
+// SDL's sensor frame, with the config key it is stored under. Resolved once per
+// gamepad instance (a re-created joystick of the same remote resolves to the same
+// key) and replaced by a calibration run. The Nunchuk accelerometer is left
+// uncorrected.
+struct RemoteCalibration {
+    SDL_JoystickID instance = 0;
+    std::string key;
+    std::array<float, 3> offset{};
+};
+std::array<RemoteCalibration, PAD_MAX_CONTROLLERS> g_remoteCalibration{};
 
 // Frames sampled by a calibration run (about 1.5 s at 60 Hz) and how far a
 // sample may stray from the first one before the run is declared "moved".
@@ -110,12 +119,15 @@ constexpr double kCalibrationMinTiltCosine = 0.9396926;
 struct AccelCalibration {
     bool active = false;
     uint32_t chan = 0;
+    SDL_JoystickID instance = 0;
     int count = 0;
     double sum[3] = {};
     float first[3] = {};
 };
 AccelCalibration g_calibration;
 char g_calibrationMessage[160] = {};
+uint32_t g_calibrationMessageChan = 0;
+SDL_JoystickID g_calibrationMessageRemote = 0;
 
 // Last accepted KPAD acc per port, for the remote and for the Nunchuk. Reused on
 // frames that bring no sample or a glitched one, so the game never sees a jump.
@@ -155,14 +167,73 @@ void EnsureSensors(SDL_Gamepad* gamepad, uint32_t port) {
     }
 }
 
-// Loads the stored zero-point correction once.
-const std::array<float, 3>& AccelOffset() {
-    if (!g_accelOffsetLoaded) {
-        const std::array<double, 3> stored = RuntimeConfigFile::WiiAccelOffset();
-        for (size_t i = 0; i < 3; ++i) g_accelOffset[i] = static_cast<float>(stored[i]);
-        g_accelOffsetLoaded = true;
+// USB interface number of the HID device at `path`, or -1 when it is not a USB
+// interface or cannot be found. A DolphinBar shows each remote slot as one.
+int UsbInterfaceForPath(const char* path, Uint16 vendor, Uint16 product) {
+    if (path == nullptr) {
+        return -1;
     }
-    return g_accelOffset;
+    int interfaceNumber = -1;
+    SDL_hid_device_info* list = SDL_hid_enumerate(vendor, product);
+    for (const SDL_hid_device_info* info = list; info != nullptr; info = info->next) {
+        if (info->path != nullptr && std::strcmp(info->path, path) == 0) {
+            interfaceNumber = info->interface_number;
+            break;
+        }
+    }
+    SDL_hid_free_enumeration(list);
+    return interfaceNumber;
+}
+
+// Config key identifying the physical remote behind a gamepad: its HID serial
+// (the Bluetooth address when paired directly), else its USB interface number
+// (a DolphinBar has no serial and one interface per remote slot) and the game
+// port, else the game port. Only characters valid in a bare TOML key.
+std::string RemoteKey(SDL_Gamepad* gamepad, uint32_t port) {
+    std::string serial;
+    if (const char* raw = SDL_GetGamepadSerial(gamepad)) {
+        for (const char* c = raw; *c != '\0'; ++c) {
+            if (std::isalnum(static_cast<unsigned char>(*c))) {
+                serial += static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
+            }
+        }
+    }
+    if (serial.find_first_not_of('0') != std::string::npos) {
+        return "serial_" + serial;
+    }
+    const Uint16 vendor = SDL_GetGamepadVendor(gamepad);
+    const Uint16 product = SDL_GetGamepadProduct(gamepad);
+    const int interfaceNumber = UsbInterfaceForPath(SDL_GetGamepadPath(gamepad), vendor, product);
+    char key[48];
+    if (interfaceNumber >= 0) {
+        std::snprintf(key, sizeof(key), "usb_%04x_%04x_if%d_port%u", vendor, product, interfaceNumber,
+                      port + 1);
+    } else {
+        std::snprintf(key, sizeof(key), "port_%u", port + 1);
+    }
+    return key;
+}
+
+// Calibration of the remote currently on `port`, resolved on first use per gamepad
+// instance. A remote without a stored entry has a zero offset.
+RemoteCalibration& CalibrationFor(SDL_Gamepad* gamepad, uint32_t port) {
+    RemoteCalibration& calibration = g_remoteCalibration[port];
+    const SDL_JoystickID id = SDL_GetGamepadID(gamepad);
+    if (calibration.instance != id) {
+        static bool s_legacyReported = false;
+        if (!s_legacyReported && RuntimeConfigFile::Get().hasLegacyWiiAccelOffset) {
+            s_legacyReported = true;
+            RT_LOG(RT_TAG_CONFIG) << "Old shared Wii Remote calibration ignored; recalibrate each remote in F10"
+                                  << std::endl;
+        }
+        calibration.instance = id;
+        calibration.key = RemoteKey(gamepad, port);
+        const std::optional<std::array<double, 3>> stored = RuntimeConfigFile::WiiAccelOffsetFor(calibration.key);
+        for (size_t i = 0; i < 3; ++i) calibration.offset[i] = stored ? static_cast<float>((*stored)[i]) : 0.0f;
+        RT_LOG(RT_TAG_CONFIG) << "Wii Remote on port " << (port + 1) << ": calibration key " << calibration.key
+                              << (stored ? "" : " (no stored offset)") << std::endl;
+    }
+    return calibration;
 }
 
 // Raw SDL sample in m/s^2, rejecting anything SDL has not delivered yet.
@@ -200,9 +271,10 @@ bool IsGlitchedSample(SDL_SensorType sensor, const float* g) {
 // +x left, +y towards the user, +z out of the button face (wiibrew, Dolphin);
 // SDL_hidapi_wii.c posts (-wiiX, wiiZ, wiiY): x right across the face, y out of
 // the face (+1 at rest, buttons up), z towards the user, i.e. away from the tip.
-// The remote's sample gets the zero-point correction; the Nunchuk's does not.
-// False when there is no sample yet or the sample is a glitch (see above).
-bool ReadAccelG(SDL_Gamepad* gamepad, SDL_SensorType sensor, float* g) {
+// The remote's sample gets the zero-point correction of the remote on `port`; the
+// Nunchuk's does not. False when there is no sample yet or the sample is a glitch
+// (see above).
+bool ReadAccelG(SDL_Gamepad* gamepad, uint32_t port, SDL_SensorType sensor, float* g) {
     float sdl[3] = {};
     if (!ReadSdlAccel(gamepad, sensor, sdl)) {
         return false;
@@ -212,7 +284,7 @@ bool ReadAccelG(SDL_Gamepad* gamepad, SDL_SensorType sensor, float* g) {
         return false;
     }
     if (sensor == SDL_SENSOR_ACCEL) {
-        const std::array<float, 3>& offset = AccelOffset();
+        const std::array<float, 3>& offset = CalibrationFor(gamepad, port).offset;
         for (int i = 0; i < 3; ++i) g[i] -= offset[i];
     }
     return true;
@@ -231,9 +303,9 @@ void AccelGToKpad(const float* g, float* kpad) {
 }
 
 // Sensor -> KPAD acc for ReadKpadSample.
-bool ReadAccelAsKpad(SDL_Gamepad* gamepad, SDL_SensorType sensor, float* kpad) {
+bool ReadAccelAsKpad(SDL_Gamepad* gamepad, uint32_t port, SDL_SensorType sensor, float* kpad) {
     float g[3] = {};
-    if (!ReadAccelG(gamepad, sensor, g)) {
+    if (!ReadAccelG(gamepad, port, sensor, g)) {
         return false;
     }
     AccelGToKpad(g, kpad);
@@ -275,10 +347,25 @@ void TraceSample(uint32_t chan, const KpadSample& sample, const float* rawG, boo
     trace.flush();
 }
 
-// Ends a calibration run with a message for the overlay.
-void FinishAccelCalibration(const char* message) {
-    g_calibration.active = false;
+// Gamepad of the Wii Remote on `chan`, or nullptr.
+SDL_Gamepad* RemoteGamepad(uint32_t chan) {
+    if (chan >= PAD_MAX_CONTROLLERS || !IsRemoteChannel(chan)) {
+        return nullptr;
+    }
+    return SDL_GetGamepadFromPlayerIndex(static_cast<int>(chan));
+}
+
+void SetCalibrationMessage(uint32_t chan, const char* message) {
+    SDL_Gamepad* gamepad = RemoteGamepad(chan);
+    g_calibrationMessageChan = chan;
+    g_calibrationMessageRemote = gamepad != nullptr ? SDL_GetGamepadID(gamepad) : 0;
     std::snprintf(g_calibrationMessage, sizeof(g_calibrationMessage), "%s", message);
+}
+
+// Ends a calibration run with a message for the overlay.
+void FinishAccelCalibration(uint32_t chan, const char* message) {
+    g_calibration.active = false;
+    SetCalibrationMessage(chan, message);
     RT_LOG(RT_TAG_CONFIG) << "Wii Remote accelerometer calibration: " << message << std::endl;
 }
 
@@ -288,9 +375,10 @@ void StepAccelCalibration() {
     if (!g_calibration.active) {
         return;
     }
-    SDL_Gamepad* gamepad = SDL_GetGamepadFromPlayerIndex(static_cast<int>(g_calibration.chan));
-    if (gamepad == nullptr || !IsRemoteChannel(g_calibration.chan)) {
-        FinishAccelCalibration("Cancelled: the Wii Remote went away.");
+    SDL_Gamepad* gamepad = RemoteGamepad(g_calibration.chan);
+    if (gamepad == nullptr ||
+        SDL_GetGamepadID(gamepad) != g_calibration.instance) {
+        FinishAccelCalibration(g_calibration.chan, "Cancelled: the Wii Remote went away.");
         return;
     }
     EnsureSensors(gamepad, g_calibration.chan);
@@ -308,7 +396,7 @@ void StepAccelCalibration() {
     } else {
         for (int i = 0; i < 3; ++i) {
             if (std::fabs(g[i] - g_calibration.first[i]) > kCalibrationMaxDeviationG) {
-                FinishAccelCalibration("Failed: the remote moved. Put it down, buttons up, and try again.");
+                FinishAccelCalibration(g_calibration.chan, "Failed: the remote moved. Put it down, buttons up, and try again.");
                 return;
             }
         }
@@ -322,18 +410,18 @@ void StepAccelCalibration() {
     const double length = std::sqrt(mean[0] * mean[0] + mean[1] * mean[1] + mean[2] * mean[2]);
     if (length < kCalibrationMinGravityG || length > kCalibrationMaxGravityG ||
         mean[1] / length < kCalibrationMinTiltCosine) {
-        FinishAccelCalibration("Failed: the remote was not resting flat with the buttons up.");
+        FinishAccelCalibration(g_calibration.chan, "Failed: the remote was not resting flat with the buttons up.");
         return;
     }
     const std::array<double, 3> offset = {mean[0], mean[1] - 1.0, mean[2]};
-    for (int i = 0; i < 3; ++i) g_accelOffset[i] = static_cast<float>(offset[i]);
-    g_accelOffsetLoaded = true;
-    const bool saved = RuntimeConfigFile::SetWiiAccelOffset(offset);
+    RemoteCalibration& calibration = CalibrationFor(gamepad, g_calibration.chan);
+    for (int i = 0; i < 3; ++i) calibration.offset[i] = static_cast<float>(offset[i]);
+    const bool saved = RuntimeConfigFile::SetWiiAccelOffsetFor(calibration.key, offset);
     char message[160];
     std::snprintf(message, sizeof(message), "%s offset x %+.3f  y %+.3f  z %+.3f g",
                   saved ? "Calibrated:" : "Calibrated (could not write Config.toml):", offset[0], offset[1],
                   offset[2]);
-    FinishAccelCalibration(message);
+    FinishAccelCalibration(g_calibration.chan, message);
 }
 
 // True when any controller aurora knows about is a Wii device.
@@ -655,7 +743,7 @@ bool ReadKpadSample(uint32_t chan, KpadSample& sample) {
     const bool haveRaw = ReadSdlAccel(gamepad, SDL_SENSOR_ACCEL, rawG);
     for (float& v : rawG) v /= kStandardGravity;
     LastAcc& last = g_lastAcc[chan];
-    const bool accepted = ReadAccelAsKpad(gamepad, SDL_SENSOR_ACCEL, sample.acc);
+    const bool accepted = ReadAccelAsKpad(gamepad, chan, SDL_SENSOR_ACCEL, sample.acc);
     if (accepted) {
         last.valid = true;
         for (int i = 0; i < 3; ++i) last.acc[i] = sample.acc[i];
@@ -719,7 +807,7 @@ bool ReadKpadSample(uint32_t chan, KpadSample& sample) {
         sample.stick[1] = -static_cast<float>(SDL_GetGamepadAxis(gamepad, SDL_GAMEPAD_AXIS_LEFTY)) / 32767.0f;
         for (float& v : sample.stick) v = std::clamp(v, -1.0f, 1.0f);
         LastAcc& lastNunchuk = g_lastNunchukAcc[chan];
-        if (ReadAccelAsKpad(gamepad, SDL_SENSOR_ACCEL_L, sample.nunchukAcc)) {
+        if (ReadAccelAsKpad(gamepad, chan, SDL_SENSOR_ACCEL_L, sample.nunchukAcc)) {
             lastNunchuk.valid = true;
             for (int i = 0; i < 3; ++i) lastNunchuk.acc[i] = sample.nunchukAcc[i];
         } else {
@@ -739,7 +827,7 @@ bool ReadAccelDebug(uint32_t chan, float sdlG[3], float kpadAcc[3]) {
         return false;
     }
     EnsureSensors(gamepad, chan);
-    if (!ReadAccelG(gamepad, SDL_SENSOR_ACCEL, sdlG)) {
+    if (!ReadAccelG(gamepad, chan, SDL_SENSOR_ACCEL, sdlG)) {
         return false;
     }
     AccelGToKpad(sdlG, kpadAcc);
@@ -748,28 +836,47 @@ bool ReadAccelDebug(uint32_t chan, float sdlG[3], float kpadAcc[3]) {
 
 // Begins collecting rest samples from the remote on `chan`.
 void StartAccelCalibration(uint32_t chan) {
-    if (!IsRemoteChannel(chan)) {
-        FinishAccelCalibration("No Wii Remote on this port.");
+    SDL_Gamepad* gamepad = RemoteGamepad(chan);
+    if (gamepad == nullptr) {
+        FinishAccelCalibration(chan, "No Wii Remote on this port.");
         return;
     }
     g_calibration = {};
     g_calibration.active = true;
     g_calibration.chan = chan;
+    g_calibration.instance = SDL_GetGamepadID(gamepad);
     g_calibrationMessage[0] = '\0';
 }
 
-// Drops the stored correction and goes back to SDL's raw reading.
-void ClearAccelCalibration() {
-    g_calibration.active = false;
-    g_accelOffset = {};
-    g_accelOffsetLoaded = true;
-    RuntimeConfigFile::SetWiiAccelOffset({0.0, 0.0, 0.0});
-    std::snprintf(g_calibrationMessage, sizeof(g_calibrationMessage), "Calibration cleared.");
+// Zeroes the stored correction of the remote on `chan`.
+void ClearAccelCalibration(uint32_t chan) {
+    if (g_calibration.chan == chan) {
+        g_calibration.active = false;
+    }
+    SDL_Gamepad* gamepad = RemoteGamepad(chan);
+    if (gamepad == nullptr) {
+        SetCalibrationMessage(chan, "No Wii Remote on this port.");
+        return;
+    }
+    RemoteCalibration& calibration = CalibrationFor(gamepad, chan);
+    calibration.offset = {};
+    RuntimeConfigFile::SetWiiAccelOffsetFor(calibration.key, {0.0, 0.0, 0.0});
+    SetCalibrationMessage(chan, "Calibration cleared.");
 }
 
-// True while a calibration run is collecting samples.
-bool IsAccelCalibrating() {
-    return g_calibration.active;
+// Correction in effect for the remote on `chan`, for the overlay.
+std::optional<std::array<double, 3>> ReadAccelOffset(uint32_t chan) {
+    SDL_Gamepad* gamepad = RemoteGamepad(chan);
+    if (gamepad == nullptr) {
+        return std::nullopt;
+    }
+    const RemoteCalibration& calibration = CalibrationFor(gamepad, chan);
+    return std::array<double, 3>{calibration.offset[0], calibration.offset[1], calibration.offset[2]};
+}
+
+// True while a calibration run is collecting samples from `chan`.
+bool IsAccelCalibrating(uint32_t chan) {
+    return g_calibration.active && g_calibration.chan == chan;
 }
 
 // Share of the calibration samples collected so far, 0..1; 0 when idle.
@@ -777,9 +884,14 @@ float AccelCalibrationProgress() {
     return g_calibration.active ? static_cast<float>(g_calibration.count) / kCalibrationSamples : 0.0f;
 }
 
-// Outcome of the last calibration run for the overlay, or nullptr before any.
-const char* AccelCalibrationMessage() {
-    return g_calibrationMessage[0] != '\0' ? g_calibrationMessage : nullptr;
+// Outcome of the last calibration run on `chan` for the overlay, or nullptr.
+const char* AccelCalibrationMessage(uint32_t chan) {
+    if (g_calibrationMessage[0] == '\0' || g_calibrationMessageChan != chan) {
+        return nullptr;
+    }
+    SDL_Gamepad* gamepad = RemoteGamepad(chan);
+    const SDL_JoystickID remote = gamepad != nullptr ? SDL_GetGamepadID(gamepad) : 0;
+    return remote == g_calibrationMessageRemote ? g_calibrationMessage : nullptr;
 }
 
 } // namespace WiiRemoteInput
