@@ -30,10 +30,11 @@ void Expect(bool available, bool playing, const char* message) {
 
 // Fake only the Core Audio boundary so the production enumeration and process
 // filtering run unchanged, without depending on other apps on the test machine.
+// Use the public selector ABI values so these mocks also build with older SDKs.
 extern "C" Boolean AudioObjectHasProperty(AudioObjectID object,
                                          const AudioObjectPropertyAddress* address) {
     Require(object == kAudioObjectSystemObject &&
-            address->mSelector == kAudioHardwarePropertyProcessObjectList,
+            address->mSelector == 'prs#',
             "Must query the system process list");
     return supported;
 }
@@ -62,11 +63,11 @@ extern "C" OSStatus AudioObjectGetPropertyData(
     }
     const auto& process = processes.at(object - 100);
     if (process.disappeared) return kAudioHardwareBadObjectError;
-    if (address->mSelector == kAudioProcessPropertyPID) {
+    if (address->mSelector == 'ppid') {
         std::memcpy(data, &process.pid, sizeof(process.pid));
         *size = sizeof(process.pid);
     } else {
-        Require(address->mSelector == kAudioProcessPropertyIsRunningOutput,
+        Require(address->mSelector == 'piro',
                 "Input-only activity must not count as playback");
         Require(process.pid != getpid(), "Must exclude the game's own output");
         std::memcpy(data, &process.output, sizeof(process.output));

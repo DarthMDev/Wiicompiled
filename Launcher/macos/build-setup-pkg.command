@@ -20,13 +20,14 @@ resulting pkg is unsigned unless
 Developer ID Installer certificate.
 
   --workspace DIR             Repository root (default: script's grandparent)
-  --version VERSION           Bundle/package version (default: 0.1.0)
+  --version VERSION           Bundle/package version (default: project version, or 0.1.0)
   --installer-identity NAME   Developer ID Installer identity for productbuild
 EOF
 }
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 workspace=$(cd "$script_dir/../.." && pwd); nodtool_arm64=""; nodtool_x86_64=""; translator_arm64=""; translator_x86_64=""; cmake_root=""; ninja_arm64=""; ninja_x86_64=""; output=""; version=0.1.0; identity=""
+version_supplied=false
 while (($#)); do
     case "$1" in
         --workspace) workspace=${2:-}; shift 2 ;;
@@ -38,13 +39,22 @@ while (($#)); do
         --ninja-arm64) ninja_arm64=${2:-}; shift 2 ;;
         --ninja-x86_64) ninja_x86_64=${2:-}; shift 2 ;;
         --output) output=${2:-}; shift 2 ;;
-        --version) version=${2:-}; shift 2 ;;
+        --version) version=${2:-}; version_supplied=true; shift 2 ;;
         --installer-identity) identity=${2:-}; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown option: $1" ;;
     esac
 done
 version=${version#v}
+if [[ "$version_supplied" == false ]]; then
+    local_csproj="$workspace/Launcher/Directory.Build.props"
+    if [[ -f "$local_csproj" ]]; then
+        detected=$(grep -m1 '<Version>' "$local_csproj" | sed -E 's/.*<Version>([^<]+)<\/Version>.*/\1/' || true)
+        if [[ -n "$detected" ]]; then
+            version="$detected"
+        fi
+    fi
+fi
 [[ "$version" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || fail '--version must contain one to three period-separated integers'
 IFS=. read -r version_major version_minor version_patch <<< "$version"
 short_version="$version_major.${version_minor:-0}.${version_patch:-0}"
@@ -58,7 +68,7 @@ require_arch() {
 require_arch "$nodtool_arm64" arm64 '--nodtool-arm64'; require_arch "$nodtool_x86_64" x86_64 '--nodtool-x86_64'
 require_arch "$translator_arm64" arm64 '--translator-arm64'; require_arch "$translator_x86_64" x86_64 '--translator-x86_64'
 require_arch "$ninja_arm64" arm64 '--ninja-arm64'; require_arch "$ninja_x86_64" x86_64 '--ninja-x86_64'
-lipo "$cmake_root/bin/cmake" -verify_arch arm64 >/dev/null 2>&1 && lipo "$cmake_root/bin/cmake" -verify_arch x86_64 >/dev/null 2>&1 || fail '--cmake-root/bin/cmake must be universal2'
+lipo "$cmake_root/bin/cmake" -verify_arch arm64 x86_64 >/dev/null 2>&1 || fail '--cmake-root/bin/cmake must be universal2'
 
 # Slice checks above prevent accidental cross-architecture packaging. Exercise
 # each supplied executable as well: an incorrectly bundled runtime can have a
@@ -140,8 +150,16 @@ for source in aurora-main projects runtime translator; do
     [[ -d "$workspace/$source" ]] || fail "required workspace directory is missing: $source"
     copy_clean "$workspace/$source" "$resources/workspace/$source"
 done
+# The translation identity (build-cache.sh) covers the runtime's native registrations through this
+# index, so it is extracted from exactly the packaged runtime sources.
+if [[ "$host_arch" == arm64 ]]; then host_translator=$translator_arm64; else host_translator=$translator_x86_64; fi
+"$host_translator" emit-native-index --native-source-dir "$resources/workspace/runtime/src" \
+    --out "$resources/workspace/runtime/native-index.json" || fail 'the runtime native index could not be extracted'
+[[ -f "$resources/workspace/runtime/native-index.json" ]] || fail 'the runtime native index was not written'
 mkdir -p "$resources/workspace/Launcher/macos"
+copy_clean "$workspace/Launcher/Directory.Build.props" "$resources/workspace/Launcher/Directory.Build.props"
 copy_clean "$workspace/Launcher/local-build-macos.command" "$resources/workspace/Launcher/local-build-macos.command"
+copy_clean "$workspace/Launcher/build-cache.sh" "$resources/workspace/Launcher/build-cache.sh"
 copy_clean "$workspace/Launcher/macos/extract-disc.command" "$resources/workspace/Launcher/macos/extract-disc.command"
 copy_clean "$workspace/Launcher/macos/publish-app.command" "$resources/workspace/Launcher/macos/publish-app.command"
 [[ -f "$workspace/Launcher/macos/macos-x86_64-toolchain.cmake" ]] && copy_clean "$workspace/Launcher/macos/macos-x86_64-toolchain.cmake" "$resources/workspace/Launcher/macos/macos-x86_64-toolchain.cmake"
@@ -150,7 +168,7 @@ copy_clean "$workspace/Launcher/macos/publish-app.command" "$resources/workspace
 chmod +x "$resources/workspace/Launcher/local-build-macos.command" "$resources/workspace/Launcher/macos/"*.command
 find "$resources/workspace" -type d \( -name "bin" -o -name "obj" -o -name ".local" \) -prune -exec rm -rf {} +
 find "$resources/workspace" -name ".DS_Store" -delete
-# setup.command uses this marker to refresh source inputs in an existing user
+# setup.command uses this marker to update source inputs in an existing user
 # workspace without replacing extracted game assets or Retro Rewind files.
 printf '%s\n' "$version" > "$resources/workspace/.bundle-version"
 mkdir -p "$resources/tools/cmake" "$resources/tools/arm64" "$resources/tools/x86_64"

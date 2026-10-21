@@ -9,8 +9,8 @@
 </p>
 <p align="center">
   <a href="#building-from-source"><img alt="PowerPC static recompilation" src="https://img.shields.io/badge/PowerPC-static%20recompilation-FF9F0A"></a>
-  <a href="#retro-rewind"><img alt="Retro Rewind supported" src="https://img.shields.io/badge/Retro%20Rewind-supported-FF375F"></a>
   <a href="https://github.com/TeamWheelWizard/WheelWizard/releases"><img alt="Install with Wheel Wizard" src="https://img.shields.io/badge/install%20with-Wheel%20Wizard-8B5CF6"></a>
+  <a href="#retro-rewind"><img alt="Retro Rewind supported" src="https://img.shields.io/badge/Retro%20Rewind-supported-FF375F"></a>
   <a href="LICENSE"><img alt="License: GPLv3" src="https://img.shields.io/badge/license-GPLv3-2EA44F?logo=gnu&amp;logoColor=white"></a>
 </p>
 
@@ -61,6 +61,7 @@ game music muted even when nothing is audible.
 Press **F10** while the game window has focus:
 - Internal resolution
 - FPS counter
+- MetalFX spatial upscaling on supported macOS GPUs
 - Controller assignment for all four ports
 - Full per-controller button mapping, including the bumpers
 - Dolphin-syntax input expressions and GCPadNew.ini import
@@ -84,13 +85,10 @@ Pair a Wii Remote with Windows (Settings > Bluetooth > Add device, press 1+2 or 
 PIN empty)
 
 Known limitations of the Wii Remote path:
-- No IR pointer yet: menus are navigated with the D-pad and A (the game treats the remote as
   pointing away from the screen).
 - Battery level is not reported to the game and the remote's speaker is not implemented.
-- Only the Wii Remote's own accelerometer is calibrated; the Nunchuk's uses SDL's fixed zero point.
 - The Classic Controller's L/R triggers reach the game as digital (full pull on click): SDL does not
   expose their analog travel.
-- Turn the Wii Remote support off in that menu if you use a Mayflash DolphinBar, which already
   presents the remote as a regular gamepad.
 
 ## Requirements
@@ -123,10 +121,10 @@ launching. The backend itself is deliberately command-line only, Wheel Wizard is
 
 ### macOS
 
-Download `WiiCompiled-Setup.pkg` from this repository's Releases page and open it. It requires an
-Apple Silicon Mac because its bundled nodtool and Translator.Cli executables are arm64. It installs
-**WiiCompiled Setup** in Applications; open that app, choose your clean PAL `RMCP01` disc image,
-and select either the base game or Retro Rewind. For Retro Rewind, choose the `RetroRewind6` folder
+Download `WiiCompiled-Setup.pkg` from this repository's Releases page and open it. The universal
+package selects the appropriate bundled tools for the host architecture, supporting both Apple Silicon (`arm64`)
+and Intel (`x86_64`) Macs. It installs **WiiCompiled Setup** in Applications; open that app, choose
+your clean PAL `RMCP01` disc image, and select either the base game or Retro Rewind. For Retro Rewind, choose the `RetroRewind6` folder
 or its parent folder.
 
 Setup verifies and extracts the image locally, then translates and compiles the native app on your
@@ -221,7 +219,6 @@ dvd_root = "DATA"
 ```
 
 Touch controls appear when no gamepad is attached; tap the FPS readout for settings.
-
 
 > [!CAUTION]
 > Only take builds from this repository's

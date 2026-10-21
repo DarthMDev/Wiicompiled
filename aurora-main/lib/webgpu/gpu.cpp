@@ -642,6 +642,14 @@ bool initialize(AuroraBackend auroraBackend) {
         requiredLimits.maxDynamicStorageBuffersPerPipelineLayout, requiredLimits.maxStorageBuffersPerShaderStage,
         requiredLimits.minUniformBufferOffsetAlignment, requiredLimits.minStorageBufferOffsetAlignment);
     std::vector<wgpu::FeatureName> requiredFeatures;
+    // Optional native sharing for MetalFX. Devices without either feature keep
+    // the normal renderer; the upscaler checks the enabled pair at runtime.
+    if (backend == wgpu::BackendType::Metal &&
+        g_adapter.HasFeature(wgpu::FeatureName::SharedTextureMemoryIOSurface) &&
+        g_adapter.HasFeature(wgpu::FeatureName::SharedFenceMTLSharedEvent)) {
+      requiredFeatures.push_back(wgpu::FeatureName::SharedTextureMemoryIOSurface);
+      requiredFeatures.push_back(wgpu::FeatureName::SharedFenceMTLSharedEvent);
+    }
     bool implicitDeviceSynchronizationSupported = false;
     wgpu::SupportedFeatures supportedFeatures;
     g_adapter.GetFeatures(&supportedFeatures);
@@ -885,9 +893,14 @@ void release_surface() noexcept {
   }
   g_surface = {};
   if (hadSurface && g_instance && g_device && g_queue) {
+    // Retired swapchain is freed after a later submission completes and the device ticks.
+    submit_staging_commands(g_device.CreateCommandEncoder().Finish());
     const auto future = g_queue.OnSubmittedWorkDone(
         wgpu::CallbackMode::WaitAnyOnly, [](wgpu::QueueWorkDoneStatus, wgpu::StringView) {});
-    g_instance.WaitAny(future, 1000000000);
+    if (const auto status = g_instance.WaitAny(future, 1000000000); status != wgpu::WaitStatus::Success) {
+      Log.warn("Timed out waiting for queue idle on surface release: {}", magic_enum::enum_name(status));
+    }
+    g_device.Tick();
   }
 }
 

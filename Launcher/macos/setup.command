@@ -11,7 +11,13 @@ workspace="$support_root/BuildWorkspace"
 products="$support_root/Products"
 
 fail() { printf 'WiiCompiled Setup: %s\n' "$*" >&2; exit 1; }
-notice() { /usr/bin/osascript -e "display dialog \"${1//\"/\\\"}\" buttons {\"OK\"} default button \"OK\" with icon caution" >/dev/null; }
+notice() {
+    /usr/bin/osascript - "$1" >/dev/null <<'APPLESCRIPT'
+on run argv
+    display dialog (item 1 of argv) buttons {"OK"} default button "OK" with icon caution
+end run
+APPLESCRIPT
+}
 usage() {
     cat <<'EOF'
 Usage: setup.command --game IMAGE [--retro-dir DIR] [--install-location {user|applications}]
@@ -85,14 +91,12 @@ if (( needs_workspace_refresh )); then
         /usr/bin/ditto "$workspace_source" "$workspace"
     else
         # Refresh only packaged source inputs. Assets and the staged Retro
-        # Rewind package belong to the user and stay in place.
-        for source in aurora-main projects runtime translator Launcher; do
-            /usr/bin/ditto "$workspace_source/$source" "$workspace/$source"
-        done
+    # Rewind package belong to the user and stay in place; unchanged files
+    # keep their timestamps so the incremental native build survives.
+    # shellcheck source=../build-cache.sh
+    source "$workspace_source/Launcher/build-cache.sh"
+    mkw_sync_tree "$workspace_source" "$workspace" aurora-main projects runtime translator Launcher
         /usr/bin/ditto "$source_bundle_version" "$workspace_bundle_version"
-        # A dependency provider can be cached in this directory, so make the
-        # refreshed sources configure from a clean native build tree.
-        rm -rf "$workspace/native-build-macos-arm64" "$workspace/native-build-macos-x86_64"
     fi
 fi
 
@@ -105,33 +109,47 @@ if [[ -n "$retro_dir" ]]; then
     # verify its pinned signature before publishing it into the local cache.
     retro_wfc_dir="$support_root/RetroWfcPayload"
     retro_wfc_payload="$retro_wfc_dir/binary/payload.RMCPD00.bin"
-    if [[ -f "$retro_wfc_payload" ]] && ! "$translator" validate-retro-wfc-payload --directory "$retro_wfc_dir"; then
-        printf 'Discarding an invalid cached Retro-WFC payload...\n' >&2
-        rm -f "$retro_wfc_payload"
+    cached_payload_valid=0
+    if [[ -f "$retro_wfc_payload" ]]; then
+        if "$translator" validate-retro-wfc-payload --directory "$retro_wfc_dir"; then
+            cached_payload_valid=1
+        else
+            printf 'Discarding an invalid cached Retro-WFC payload...\n' >&2
+            rm -f "$retro_wfc_payload"
+        fi
     fi
-    if [[ ! -f "$retro_wfc_payload" ]]; then
-        printf 'Downloading the Retro-WFC payload needed for online play...\n'
-        mkdir -p "$retro_wfc_dir"
-        payload_stage=$(mktemp -d "$retro_wfc_dir/.payload-download.XXXXXX")
-        temporary_payload="$payload_stage/binary/payload.RMCPD00.bin"
-        mkdir -p "$(dirname "$temporary_payload")"
-        trap 'rm -rf "$payload_stage"' EXIT
-        /usr/bin/curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
-            --retry 1 --output "$temporary_payload" \
-            'https://rwfc.net/api/wfc/payload?g=RMCPD00' || fail 'could not download the Retro-WFC payload needed for online play'
+
+    # A signed cache may still be an older vulnerable revision, so always attempt to replace it
+    # with the current signed snapshot. A transport failure may fall back to the verified cache;
+    # a downloaded snapshot with an invalid signature remains a hard failure.
+    printf 'Downloading the current Retro-WFC payload needed for online play...\n'
+    mkdir -p "$retro_wfc_dir"
+    payload_stage=$(mktemp -d "$retro_wfc_dir/.payload-download.XXXXXX")
+    temporary_payload="$payload_stage/binary/payload.RMCPD00.bin"
+    mkdir -p "$(dirname "$temporary_payload")"
+    trap 'rm -rf "$payload_stage"' EXIT
+    if /usr/bin/curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
+        --retry 1 --output "$temporary_payload" \
+        'https://rwfc.net/api/wfc/payload?g=RMCPD00'; then
         "$translator" validate-retro-wfc-payload --directory "$payload_stage" || \
             fail 'downloaded Retro-WFC payload failed signature validation'
         mkdir -p "$retro_wfc_dir/binary"
         mv "$temporary_payload" "$retro_wfc_payload"
         rmdir "$payload_stage/binary" "$payload_stage"
         trap - EXIT
+    elif (( cached_payload_valid )); then
+        printf 'Could not download the current Retro-WFC payload; using the previously verified cached payload.\n' >&2
+        rm -rf "$payload_stage"
+        trap - EXIT
+    else
+        fail 'could not download the current Retro-WFC payload and no valid cached payload is available'
     fi
     build_args+=(--profile both --base-output-dir "$products" --retro-rewind-package-dir "$retro_dir" --retro-wfc-offline-dir "$retro_wfc_dir")
 fi
 "$workspace/Launcher/local-build-macos.command" "${build_args[@]}" --profile "$profile" --cmake "$cmake_bin" --ninja "$ninja_bin" --translator-bin "$translator"
 
 config="$support_root/Config.toml"
-toml_string() { printf '%s' "$1" | sed -e 's/\\\\/\\\\\\\\/g' -e 's/"/\\\\"/g'; }
+toml_string() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 set_path() {
     local key=$1 value=$2 encoded line temporary
     encoded=$(toml_string "$value"); line="$key = \"$encoded\""; temporary="$config.tmp"
@@ -157,8 +175,13 @@ install_app() {
     local app=$1
     [[ -d "$products/$app" ]] || return 0
     if [[ "$destination" == /Applications ]]; then
-        command="mkdir -p /Applications && rm -rf '/Applications/$app' && ditto '$products/$app' '/Applications/$app'"
-        /usr/bin/osascript -e "do shell script \"$command\" with administrator privileges"
+        /usr/bin/osascript - "$products/$app" "/Applications/$app" <<'APPLESCRIPT'
+on run argv
+    set sourcePath to quoted form of (item 1 of argv)
+    set installedPath to quoted form of (item 2 of argv)
+    do shell script "mkdir -p /Applications && rm -rf " & installedPath & " && /usr/bin/ditto " & sourcePath & " " & installedPath with administrator privileges
+end run
+APPLESCRIPT
     else
         mkdir -p "$destination"; rm -rf "$destination/$app"; /usr/bin/ditto "$products/$app" "$destination/$app"
     fi

@@ -1447,8 +1447,8 @@ static void render_impl(std::vector<RenderPass>& renderPasses, wgpu::CommandEnco
 
 #if defined(AURORA_GFX_DEBUG_GROUPS)
   if (finalize && !debugFrame.groups.empty()) {
-    for (auto& it : std::ranges::reverse_view(debugFrame.groups)) {
-      Log.warn("Debug group was not popped at end of frame: {}", it);
+    for (auto it = debugFrame.groups.rbegin(); it != debugFrame.groups.rend(); ++it) {
+      Log.warn("Debug group was not popped at end of frame: {}", *it);
     }
     debugFrame.groups.clear();
   }

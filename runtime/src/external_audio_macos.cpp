@@ -9,6 +9,18 @@
 namespace MusicAttenuation {
 namespace {
 
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140200
+constexpr auto kProcessObjectList = kAudioHardwarePropertyProcessObjectList;
+constexpr auto kProcessPid = kAudioProcessPropertyPID;
+constexpr auto kProcessRunningOutput = kAudioProcessPropertyIsRunningOutput;
+#else
+// Public Core Audio selector ABI values, for SDKs predating process objects.
+// The runtime HasProperty check still determines whether the OS supports them.
+constexpr AudioObjectPropertySelector kProcessObjectList = 'prs#';
+constexpr AudioObjectPropertySelector kProcessPid = 'ppid';
+constexpr AudioObjectPropertySelector kProcessRunningOutput = 'piro';
+#endif
+
 template <typename T>
 bool ReadAudioProcessProperty(AudioObjectID object, AudioObjectPropertySelector selector,
                               T& value) noexcept {
@@ -23,7 +35,7 @@ bool ReadAudioProcessProperty(AudioObjectID object, AudioObjectPropertySelector 
 
 MacOSAudioStatus QueryMacOSExternalAudio() noexcept {
     const AudioObjectPropertyAddress address{
-        kAudioHardwarePropertyProcessObjectList,
+        kProcessObjectList,
         kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain};
     // Probe the property instead of raising the game's minimum macOS version.
     if (!AudioObjectHasProperty(kAudioObjectSystemObject, &address)) {
@@ -58,9 +70,9 @@ MacOSAudioStatus QueryMacOSExternalAudio() noexcept {
             UInt32 runningOutput = 0;
             // An exiting process may disappear mid-query. Never count an
             // unknown PID or our own SDL output as external playback.
-            if (ReadAudioProcessProperty(processes[index], kAudioProcessPropertyPID, pid) &&
+            if (ReadAudioProcessProperty(processes[index], kProcessPid, pid) &&
                 pid > 0 && pid != ownPid &&
-                ReadAudioProcessProperty(processes[index], kAudioProcessPropertyIsRunningOutput,
+                ReadAudioProcessProperty(processes[index], kProcessRunningOutput,
                                          runningOutput) && runningOutput != 0) {
                 return {true, true};
             }
