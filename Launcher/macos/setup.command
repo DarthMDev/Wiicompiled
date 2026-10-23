@@ -41,6 +41,28 @@ done
 
 host_arch=$(uname -m)
 case "$host_arch" in arm64|x86_64) ;; *) fail "unsupported macOS architecture: $host_arch" ;; esac
+# Same x86-64-v2 check as runtime/src/host_cpu_baseline.cpp, before anything is built;
+# local-build-macos.command builds for v2 when the CPU lacks v3.
+if [[ "$host_arch" == x86_64 ]]; then
+    cpu_features=$(/usr/sbin/sysctl -n machdep.cpu.features machdep.cpu.extfeatures 2>/dev/null | tr '\n' ' ' || true)
+    if [[ -n "${cpu_features// /}" ]]; then
+        missing_features=""
+        for feature in SSE3=SSE3 SSSE3=SSSE3 CX16=CMPXCHG16B SSE4.1=SSE4.1 SSE4.2=SSE4.2 POPCNT=POPCNT \
+                LAHF=LAHF-SAHF; do
+            [[ " $cpu_features " == *" ${feature%%=*} "* ]] || missing_features+="${missing_features:+, }${feature#*=}"
+        done
+        if [[ -n "$missing_features" ]]; then
+            message="This build needs a processor that supports the x86-64-v2 instruction set.
+
+Missing on this machine: $missing_features
+
+x86-64-v2 covers Intel Core processors from Nehalem (2008) onward and AMD processors from Jaguar (2013) onward."
+            printf 'WiiCompiled Setup: %s\n' "$message" >&2
+            notice "$message"
+            exit 1
+        fi
+    fi
+fi
 host_tools="$resources/tools/$host_arch"
 nodtool="$host_tools/nodtool"
 translator="$host_tools/Translator.Cli"
@@ -48,7 +70,7 @@ ninja_bin="$host_tools/ninja"
 
 if [[ -z "$game" ]]; then
     game=$(/usr/bin/osascript <<'APPLESCRIPT'
-set selectedFile to choose file with prompt "Choose your clean Mario Kart Wii PAL (RMCP01) disc image"
+set selectedFile to choose file with prompt "Choose your clean Mario Kart Wii disc image"
 POSIX path of selectedFile
 APPLESCRIPT
 ) || exit 0
@@ -100,18 +122,28 @@ if (( needs_workspace_refresh )); then
     fi
 fi
 
+# The extracted disc decides the release, and with it the region's Retro-WFC payload.
+# shellcheck source=../build-cache.sh
+source "$workspace/Launcher/build-cache.sh"
+"$workspace/Launcher/macos/extract-disc.command" --workspace "$workspace" --game "$game" \
+    --assets-dir "$workspace/Assets" --nodtool "$nodtool"
+project=$(mkw_resolve_project "$workspace" "$workspace/Assets") || fail 'the extracted game cannot be built'
+
 profile=base
-build_args=(--workspace "$workspace" --game "$game" --nodtool "$nodtool" --output-dir "$products")
+build_args=(--workspace "$workspace" --output-dir "$products")
 if [[ -n "$retro_dir" ]]; then
     profile=both
     # Online play needs the shared Retro-WFC payload. Keep it in the per-user
     # support directory rather than the packaged app or build workspace, then
     # verify its pinned signature before publishing it into the local cache.
+    game_id=$(mkw_project_pin "$project" game_id)
+    payload_uri=$(mkw_project_pin "$project" retro_wfc_payload)
+    payload_file=$(mkw_retro_wfc_payload_file "$project") || fail "$project pins no Retro-WFC payload"
     retro_wfc_dir="$support_root/RetroWfcPayload"
-    retro_wfc_payload="$retro_wfc_dir/binary/payload.RMCPD00.bin"
+    retro_wfc_payload="$retro_wfc_dir/$payload_file"
     cached_payload_valid=0
     if [[ -f "$retro_wfc_payload" ]]; then
-        if "$translator" validate-retro-wfc-payload --directory "$retro_wfc_dir"; then
+        if "$translator" validate-retro-wfc-payload --directory "$retro_wfc_dir" --game-id "$game_id"; then
             cached_payload_valid=1
         else
             printf 'Discarding an invalid cached Retro-WFC payload...\n' >&2
@@ -125,15 +157,14 @@ if [[ -n "$retro_dir" ]]; then
     printf 'Downloading the current Retro-WFC payload needed for online play...\n'
     mkdir -p "$retro_wfc_dir"
     payload_stage=$(mktemp -d "$retro_wfc_dir/.payload-download.XXXXXX")
-    temporary_payload="$payload_stage/binary/payload.RMCPD00.bin"
+    temporary_payload="$payload_stage/$payload_file"
     mkdir -p "$(dirname "$temporary_payload")"
     trap 'rm -rf "$payload_stage"' EXIT
     if /usr/bin/curl --fail --silent --show-error --connect-timeout 10 --max-time 30 \
-        --retry 1 --output "$temporary_payload" \
-        'https://rwfc.net/api/wfc/payload?g=RMCPD00'; then
-        "$translator" validate-retro-wfc-payload --directory "$payload_stage" || \
+        --retry 1 --output "$temporary_payload" "$payload_uri"; then
+        "$translator" validate-retro-wfc-payload --directory "$payload_stage" --game-id "$game_id" || \
             fail 'downloaded Retro-WFC payload failed signature validation'
-        mkdir -p "$retro_wfc_dir/binary"
+        mkdir -p "$(dirname "$retro_wfc_payload")"
         mv "$temporary_payload" "$retro_wfc_payload"
         rmdir "$payload_stage/binary" "$payload_stage"
         trap - EXIT
