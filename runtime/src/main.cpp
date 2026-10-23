@@ -63,9 +63,10 @@
 #include "system_bridge.h"
 #include "ppc_runtime.h"
 #include "aurora_events.h"
-#include "wii_remote_input.h"
+#include "wiimote_host.h"
 #include "discord_presence.h"
 #include "fiber_manager.h"
+#include "gx_worker.h"
 #include "hle_stubs.h"
 #include "runtime_config.h"
 #include "runtime_log.h"
@@ -88,6 +89,9 @@ namespace {
 std::string FormatHostStackTrace(unsigned framesToSkip = 0);
 
 void ServiceGuestTimingDuringAuroraFrameWait() {
+    if (GxWorker::OnWorker()) {
+        return;
+    }
     // Aurora can block inside FIFO drains before control returns to GX HLE, for as long as a
     // whole display period. Keep VI retraces, alarms and audio moving at wall-clock cadence here
     // while still suppressing guest rescheduling and recursive Aurora work.
@@ -761,6 +765,8 @@ extern "C" void DumpHostStackTraceForRuntimeHelper() {
 
 void MarkFatalErrorReported() {
     g_fatalErrorReported.store(true, std::memory_order_release);
+    // Every caller exits next; keep the worker out of static teardown.
+    GxWorker::Abandon();
 }
 
 void ShowRuntimeFatalPopup(std::string_view category, std::string_view details) noexcept {
@@ -1384,7 +1390,7 @@ int RuntimeMain(int argc, char** argv) {
         auroraConfig.allowTextureReplacements = RuntimeConfigFile::TextureReplacements(false);
         auroraConfig.allowTextureDumps = auroraConfig.allowTextureReplacements &&
                                          RuntimeConfigFile::TextureDumps(false);
-        // No vsync knob: aurora always configures a non-blocking present mode.
+        auroraConfig.vsync = RuntimeConfigFile::Vsync();
         auroraConfig.desiredBackend = BACKEND_AUTO;
         const float resolutionMultiplier = RuntimeConfigFile::ResolutionMultiplier(1.0f);
         ConfigureMkwDynamicAspect(configWidescreen, forceAspect169,
@@ -1430,10 +1436,9 @@ int RuntimeMain(int argc, char** argv) {
         }
         const AuroraBackend requestedBackend = auroraConfig.desiredBackend;
 
-        // SDL only reads its Wii driver hint when the joystick subsystem starts, which
-        // aurora_initialize does; a Bluetooth Wii Remote paired before launch must be
-        // visible on that first scan.
-        WiiRemoteInput::ConfigureSdlHints(RuntimeConfigFile::WiiRemotesEnabled(true));
+        // SDL reads its device hints when the joystick subsystem starts, which
+        // aurora_initialize does.
+        Wiimote::ConfigureSdlHints(RuntimeConfigFile::WiiRemotesEnabled());
 
         const AuroraInfo auroraInfo = aurora_initialize(0, nullptr, &auroraConfig);
         if (auroraInfo.initializationStatus != AURORA_INITIALIZATION_SUCCESS) {
@@ -1450,6 +1455,7 @@ int RuntimeMain(int argc, char** argv) {
                       << std::endl;
         }
         aurora_set_frame_worker_wait_callback(ServiceGuestTimingDuringAuroraFrameWait);
+        Wiimote::Initialize();
         GxGuestWrite::InstallAuroraHooks();
         UpdateMkwDynamicAspectSurface(auroraInfo.windowSize.native_fb_width,
                                       auroraInfo.windowSize.native_fb_height);
@@ -1466,6 +1472,8 @@ int RuntimeMain(int argc, char** argv) {
                   << (forceAspect169 ? "16:9" : (configWidescreen ? "surface (dynamic EGG canvas)" : "4:3"))
                   << std::endl;
         g_auroraInitialized.store(true, std::memory_order_release);
+        GxWorker::SetWaitCallback(ServiceGuestTimingDuringAuroraFrameWait);
+        GxWorker::Start();
 
         auto entry = ResolveEntry();
         InitializePersistentCpuContext();
@@ -1493,6 +1501,8 @@ int RuntimeMain(int argc, char** argv) {
         // Shutdown fiber system
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
+        Wiimote::Shutdown();
+        GxWorker::Stop();
         aurora_shutdown();
         DiscordPresence::Shutdown();
         SetRuntimeExitCodeImpl(0);
@@ -1511,6 +1521,8 @@ int RuntimeMain(int argc, char** argv) {
         SetRuntimeExitCodeImpl(1);
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
+        Wiimote::Shutdown();
+        GxWorker::Stop();
         aurora_shutdown();
         DiscordPresence::Shutdown();
         ShutdownProcessTranscript();
@@ -1523,6 +1535,8 @@ int RuntimeMain(int argc, char** argv) {
         SetRuntimeExitCodeImpl(1);
         Fiber::GuestFiberManager::Shutdown();
         WindowPlacementPersistence::Flush(true);
+        Wiimote::Shutdown();
+        GxWorker::Stop();
         aurora_shutdown();
         DiscordPresence::Shutdown();
         ShutdownProcessTranscript();

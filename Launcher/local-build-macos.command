@@ -19,9 +19,9 @@ Usage: local-build-macos.command --output-dir DIR [options]
   --profile {base|retro-rewind|both}  Product to build (default: base)
   --output-dir DIR                Output .app directory (required; Retro Rewind for both)
   --base-output-dir DIR           Base .app directory (required with --profile both)
-  --game IMAGE --nodtool PATH     Extract and verify a clean PAL RMCP01 disc image first
+  --game IMAGE --nodtool PATH     Extract and verify a clean supported disc image first
   --retro-rewind-package-dir DIR  RetroRewind6 directory (required for Retro Rewind)
-  --retro-wfc-offline-dir DIR     Directory containing binary/payload.RMCPD00.bin
+  --retro-wfc-offline-dir DIR     Directory containing the release's binary/payload.<game>.bin
   --skip-retro-wfc-payload        Build Retro Rewind without the shared Retro-WFC payload
   --force-clean-build             Delete local generated and current-architecture native build caches
   --parallel N                    Pin translation and build parallelism
@@ -82,13 +82,26 @@ if (( builds_retro )); then
 fi
 for tool in "$cmake_bin" "$ninja_bin" clang clang++ shasum; do command -v "$tool" >/dev/null || fail "required tool not found: $tool"; done
 
-project="$workspace/projects/mkwii/recomp.yml"; assets="$workspace/Assets"; generated="$workspace/generated"
+assets="$workspace/Assets"; generated="$workspace/generated"
 functions="$generated/functions"; metadata="$generated/base_translation_output.json"; manifest_dir="$workspace/build/base"
 manifest="$manifest_dir/mkwii_base_manifest.json"; shards="$generated/build_shards"
 native_build="$workspace/native-build-macos-$macos_arch"
-assert_file "$project" 'translation project'
-if [[ -n "$game" ]]; then "$script_dir/macos/extract-disc.command" --game "$game" --assets-dir "$assets" --nodtool "$nodtool"; fi
+x86_cpu_profile=v3
+if [[ "$macos_arch" == x86_64 ]]; then
+    native_macros=$(clang -march=native -dM -E -x c /dev/null 2>/dev/null || true)
+    for macro in __AVX__ __AVX2__ __BMI__ __BMI2__ __F16C__ __FMA__ __LZCNT__ __MOVBE__; do
+        if ! grep -q "^#define $macro " <<<"$native_macros"; then
+            x86_cpu_profile=v2
+            printf 'MKWCBUILD: This CPU does not support x86-64-v3; building for x86-64-v2\n'
+            break
+        fi
+    done
+fi
+if [[ -n "$game" ]]; then "$script_dir/macos/extract-disc.command" --workspace "$workspace" --game "$game" --assets-dir "$assets" --nodtool "$nodtool"; fi
 assert_file "$assets/main.dol" 'extracted main.dol'; assert_file "$assets/StaticR.rel" 'extracted StaticR.rel'
+# The translation project is the one pinned to the extracted main.dol, which decides the region.
+project=$(mkw_resolve_project "$workspace" "$assets") || fail 'the extracted game cannot be translated'
+region=$(mkw_project_pin "$project" region); [[ -n "$region" ]] || fail "could not find the region of $project"
 
 if (( force_clean )); then
     step force-clean 'Discarding translation and native build caches'
@@ -148,12 +161,12 @@ else
     step translate-base 'Translating the user-owned base game'
     translator translate-recursive "$entry_point" --project "$project" --outdir "$functions" --output-metadata "$metadata" --production-source-bundle "$generated/base_translation_sources.bin" --no-function-files --prune-stale --threads "$translator_threads"
     step emit-base-manifest 'Creating the local base translation manifest'
-    translator emit-base-manifest --project "$project" --out "$manifest_dir" --functions-dir "$functions" --translation-output-metadata "$metadata" --region P
+    translator emit-base-manifest --project "$project" --out "$manifest_dir" --functions-dir "$functions" --translation-output-metadata "$metadata" --region "$region"
     mkw_write_identity "$translation_provenance" TranslationFingerprint "$translation_fingerprint"
 fi
 if (( builds_retro )); then
-    mod_out="$workspace/build/mods/retro_rewind_full_cpp"; args=(translate-mod --project "$project" --profile retro-rewind --base-manifest "$manifest" --base-translation-output-metadata "$metadata" --code-pul "$retro_root/Binaries/Code.pul" --mod-root "$retro_root" --mod-name 'Retro Rewind' --region P --out "$mod_out" --prefer-cached-inputs --emit-cpp --threads "$translator_threads")
-    if (( skip_retro_wfc )); then args+=(--skip-retro-wfc); else offline_payload="$retro_wfc/binary/payload.RMCPD00.bin"; assert_file "$offline_payload" 'Offline Retro-WFC payload'; args+=(--retro-wfc-payload "$offline_payload"); fi
+    mod_out="$workspace/build/mods/retro_rewind_full_cpp"; args=(translate-mod --project "$project" --profile retro-rewind --base-manifest "$manifest" --base-translation-output-metadata "$metadata" --code-pul "$retro_root/Binaries/Code.pul" --mod-root "$retro_root" --mod-name 'Retro Rewind' --region "$region" --out "$mod_out" --prefer-cached-inputs --emit-cpp --threads "$translator_threads")
+    if (( skip_retro_wfc )); then args+=(--skip-retro-wfc); else payload_file=$(mkw_retro_wfc_payload_file "$project") || fail "$project pins no Retro-WFC payload"; offline_payload="$retro_wfc/$payload_file"; assert_file "$offline_payload" 'Offline Retro-WFC payload'; args+=(--retro-wfc-payload "$offline_payload"); fi
     step translate-mod 'Translating Retro Rewind'; translator "${args[@]}"
 fi
 step generate-data-init 'Generating local game data initialization'; translator generate-data-init --project "$project"
@@ -170,7 +183,7 @@ fi
 step configure-native 'Configuring the native toolchain'
 # Use Aurora's pinned SDL3 source on macOS.  A system SDL3 can be older than
 # Aurora's required API even when find_package() succeeds.
-"$cmake_bin" -S "$workspace/runtime" -B "$native_build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_MAKE_PROGRAM="$ninja_bin" -DCMAKE_OSX_ARCHITECTURES="$macos_arch" -DCMAKE_OSX_DEPLOYMENT_TARGET="$macos_deployment_target" -DMKW_TRANSLATED_COMPILE_JOBS="$translated_jobs" -DAURORA_SDL3_PROVIDER=vendor -DMKW_SETUP_VERSION="$setup_version"
+"$cmake_bin" -S "$workspace/runtime" -B "$native_build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_MAKE_PROGRAM="$ninja_bin" -DCMAKE_OSX_ARCHITECTURES="$macos_arch" -DCMAKE_OSX_DEPLOYMENT_TARGET="$macos_deployment_target" -DMKW_TRANSLATED_COMPILE_JOBS="$translated_jobs" -DMKW_X86_CPU_PROFILE="$x86_cpu_profile" -DAURORA_SDL3_PROVIDER=vendor -DMKW_SETUP_VERSION="$setup_version"
 mkw_write_identity "$toolchain_provenance" ToolchainFingerprint "$toolchain_fingerprint"
 targets=(); [[ "$profile" != retro-rewind ]] && targets+=(WiiCompiled); [[ "$profile" != base ]] && targets+=(RetroRewind)
 step compile "Compiling ${targets[*]} locally"; "$cmake_bin" --build "$native_build" --target "${targets[@]}" --parallel "$global_jobs"
