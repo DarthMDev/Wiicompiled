@@ -75,6 +75,7 @@ const char* GraphicsApiDisplayName() {
 
 bool g_topBarVisible = false;
 bool g_exitPromptOpen = false;
+bool g_restartPromptOpen = false;
 bool g_rumbleEnabled = RuntimeConfigFile::RumbleEnabled(true);
 int g_controllerPort = 0;
 float g_resolutionScale = RuntimeConfigFile::ResolutionMultiplier(1.0f);
@@ -299,6 +300,8 @@ void ApplyConfiguredMappings() {
 }
 
 bool g_wiiRemotesEnabled = RuntimeConfigFile::WiiRemotesEnabled();
+const bool g_wiiRemotesAtLaunch = g_wiiRemotesEnabled;
+bool g_wiiRemotesSaveFailed = false;
 bool g_wiiAutoPair = RuntimeConfigFile::WiiAutoPairEnabled(true);
 bool g_wiiSensorBarAbove = RuntimeConfigFile::WiiSensorBarAbove(false);
 int g_wiiIrSensitivity = RuntimeConfigFile::WiiIrSensitivity(3);
@@ -379,10 +382,18 @@ void DrawWiiRemoteSetup() {
         ImGui::SetTooltip("The sensor bar sensitivity from the Wii settings.\nTakes effect the next time the game starts.");
     }
     if (ImGui::Checkbox("Use Wii Remotes", &g_wiiRemotesEnabled)) {
-        RuntimeConfigFile::SetWiiRemotesEnabled(g_wiiRemotesEnabled);
+        g_wiiRemotesSaveFailed = !RuntimeConfigFile::SetWiiRemotesEnabled(g_wiiRemotesEnabled);
+        if (g_wiiRemotesSaveFailed) g_wiiRemotesEnabled = !g_wiiRemotesEnabled;
+        g_restartPromptOpen = g_wiiRemotesEnabled != g_wiiRemotesAtLaunch && !g_wiiRemotesSaveFailed;
     }
     if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Takes effect on the next launch. Turn this off to use a Wii U Pro Controller as a gamepad.");
+        ImGui::SetTooltip("Takes effect after restarting the game. Turn this off to use a Wii U Pro Controller as a gamepad.");
+    }
+    if (g_wiiRemotesSaveFailed) {
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Could not save this setting to Config.toml.");
+    }
+    if (g_wiiRemotesEnabled != g_wiiRemotesAtLaunch) {
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "Restart the game to apply this change.");
     }
     ImGui::Unindent();
 }
@@ -1357,6 +1368,19 @@ void DrawExitPrompt() {
     ImGui::EndPopup();
 }
 
+void DrawRestartPrompt() {
+    constexpr const char* kTitle = "Restart required";
+    if (g_restartPromptOpen && !ImGui::IsPopupOpen(kTitle)) ImGui::OpenPopup(kTitle);
+    if (!ImGui::BeginPopupModal(kTitle, &g_restartPromptOpen, ImGuiWindowFlags_AlwaysAutoResize)) return;
+    ImGui::TextUnformatted(g_wiiRemotesEnabled ? "Wii Remotes will be used after you restart the game."
+                                               : "Wii Remotes will stop being used after you restart the game.");
+    if (ImGui::Button("Exit now", ImVec2(140.0f, 0.0f))) ExitForAuroraWindowClose();
+    ImGui::SameLine();
+    if (ImGui::Button("Restart later", ImVec2(140.0f, 0.0f))) g_restartPromptOpen = false;
+    if (!g_restartPromptOpen) ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+}
+
 void DrawTopBar() {
     if (!g_topBarVisible) {
         return;
@@ -1495,7 +1519,7 @@ void PersistDisplayModeIfChanged() {
 
 void ApplyInputBlockState() {
     const bool blocked = controller_mapping_wizard::IsActive() || g_rebind.active ||
-                         g_exitPromptOpen || g_topBarVisible || StartupScreenVisible();
+                         g_exitPromptOpen || g_restartPromptOpen || g_topBarVisible || StartupScreenVisible();
     PADBlockInput(blocked);
     InputBindings::SetInputBlocked(blocked);
 }
@@ -1561,7 +1585,9 @@ void HandleEvents(const AuroraEvent* events) noexcept {
             RuntimeConfigFile::SetAudioMuted(g_audioMuted);
         }
         if (!g_rebind.active && IsToggleKey(ev->sdl, SDL_SCANCODE_ESCAPE)) {
-            if (g_exitPromptOpen) {
+            if (g_restartPromptOpen) {
+                g_restartPromptOpen = false;
+            } else if (g_exitPromptOpen) {
                 g_exitPromptOpen = false;
             } else if (g_topBarVisible) {
                 SetTopBarVisible(false);
@@ -1610,6 +1636,7 @@ void Draw() noexcept {
     DrawFpsOverlay();
     DrawTopBar();
     DrawExitPrompt();
+    DrawRestartPrompt();
     controller_mapping_wizard::Draw();
     ApplyInputBlockState();
     DrawStartupScreen();
