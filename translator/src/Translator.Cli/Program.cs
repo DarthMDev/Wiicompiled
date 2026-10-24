@@ -1780,6 +1780,8 @@ int RunTranslateModCore(string[] argsTail, string? outputDirectoryOverride)
 
     var pul = KamekPulFile.Load(codePul);
     var selected = pul.SelectRegion(region);
+    // The server validates the hash of the unmodified chunk.
+    var sourceKamekCodeSha1 = SHA1.HashData(selected.CodeBlob);
     if (string.Equals(profile?.Name, "retro-rewind", StringComparison.OrdinalIgnoreCase))
     {
         var corrected = pul.IsCombined && !string.Equals(region, "P", StringComparison.OrdinalIgnoreCase)
@@ -1988,7 +1990,7 @@ int RunTranslateModCore(string[] argsTail, string? outputDirectoryOverride)
         baseManifest,
         dvdOverlayRoots,
         relocatedModuleImage,
-        SHA1.HashData(selected.CodeBlob),
+        sourceKamekCodeSha1,
         retroWfcLoweringPlan?.StaticPointers,
         selected.CodeSize,
         selected.BssSize,
