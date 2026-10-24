@@ -57,6 +57,8 @@
 #endif
 
 #include "abi_bridge.h"
+#include "boot_race.h"
+#include "guest_abi/guest_region.h"
 #include "guest_flat_memory.h"
 #include "gx_guest_write.h"
 #include "memory.h"
@@ -696,6 +698,7 @@ void WriteFatalLogImpl(std::string_view reason, std::string_view extraDetails = 
     out << "[runtime] fatal log" << std::endl;
     out << "[runtime] reason: " << reason << std::endl;
     out << "[runtime] timestamp(seconds): " << nowSecs << std::endl;
+    out << "[runtime] game: " << GuestRegion::CurrentFacts().gameId << std::endl;
     out << "[runtime] entry: " << (g_lastEntryLabel.empty() ? "<unknown>" : g_lastEntryLabel) << std::endl;
     if (!extraDetails.empty()) {
         out << "[runtime] details: " << extraDetails << std::endl;
@@ -1343,8 +1346,11 @@ int RuntimeMain(int argc, char** argv) {
     std::string currentEntryLabel;
 
     try {
-        if (argc != 1) {
-            throw std::invalid_argument("The game runtime does not accept command-line options; use Config.toml through the installed host.");
+        for (int i = 1; i < argc; ++i) {
+            if (!BootRace::ParseArgument(argv[i])) {
+                throw std::invalid_argument(std::string("Unknown command-line option '") + argv[i] +
+                                            "'; the game runtime only accepts --race[=<course id>] and --race-cpu, use Config.toml through the installed host.");
+            }
         }
         RuntimeConfigFile::LogLoadedConfig();
         if (RuntimeConfigFile::DiscordPresenceEnabled()) {

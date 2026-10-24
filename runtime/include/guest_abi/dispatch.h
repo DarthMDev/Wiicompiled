@@ -291,6 +291,11 @@ struct KnownTypedNativeCpuCall {
     static constexpr bool kAvailable = false;
 };
 
+template <typename T, typename = void>
+struct IsPureTypedNativeCpuCall : std::false_type {};
+template <typename T>
+struct IsPureTypedNativeCpuCall<T, std::void_t<decltype(T::kPure)>> : std::bool_constant<T::kPure> {};
+
 #include "guest_abi/native_cpu_calls.inc"
 
 // Direct-mapped thread-local memo in front of the sorted registry lookup every bctrl performs;
@@ -554,7 +559,10 @@ inline void InvokeDirectCpu(CpuContext* ctx) {
         return;
     }
 
-    if constexpr (KnownTypedNativeCpuCall<Target>::kAvailable) {
+    if constexpr (IsPureTypedNativeCpuCall<KnownTypedNativeCpuCall<Target>>::value) {
+        KnownTypedNativeCpuCall<Target>::Invoke(cpu);
+        return;
+    } else if constexpr (KnownTypedNativeCpuCall<Target>::kAvailable) {
         PpcNonvolatileGprGuard gprGuard(cpu);
         if (TryGetCpuContext() != cpu) {
             CpuContextScope scope(cpu);
@@ -581,12 +589,20 @@ inline void InvokeDirectCpu(CpuContext* ctx) {
 // Cold tail of InvokeIndirectJump: a bctr target that is not a registered function.
 [[noreturn]] MKW_PPC_NO_INLINE MKW_PPC_COLD void ReportMissingIndirectJumpTarget(uint32_t target, CpuContext* cpu);
 
-// Indirect jump (bctr without link) - used for switch tables.
-inline void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
-    // Use the caller's context, not the persistent global context!
-    // This is essential for tail calls via bctr where the 'this' pointer (r3)
-    // must be passed correctly to the target function.
-    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+// The common indirect case: an unguarded record called from its own CpuContext, so the full
+// TryDispatchRawCpuTarget would only set the execution address and call.
+MKW_PPC_FORCE_INLINE bool TryDispatchUnguardedRawCpuTarget(uint32_t target, CpuContext* cpu) {
+    const RawDispatchRecord* record = TranslatedFunctionRegistry::FindRawByAddressPtr(target);
+    if (record == nullptr || record->entry == nullptr || record->preserveNonvolatileGprs ||
+        record->nonvolatileFprWriteMask != 0 || TryGetCpuContext() != cpu) {
+        return false;
+    }
+    RecompMod::ScopedTranslatedExecutionAddress translatedExecution(record->address);
+    record->entry(cpu);
+    return true;
+}
+
+MKW_PPC_NO_INLINE inline void InvokeIndirectJumpSlow(uint32_t target, CpuContext* cpu) {
     if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {
         return;
     }
@@ -601,12 +617,22 @@ inline void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
     ReportMissingIndirectJumpTarget(target, cpu);
 }
 
-inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
+// Indirect jump (bctr without link) - used for switch tables.
+inline void InvokeIndirectJump(uint32_t target, CpuContext* ctx) {
+    // Use the caller's context, not the persistent global context!
+    // This is essential for tail calls via bctr where the 'this' pointer (r3)
+    // must be passed correctly to the target function.
     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+    if (TryDispatchUnguardedRawCpuTarget(target, cpu)) {
+        return;
+    }
+    InvokeIndirectJumpSlow(target, cpu);
+}
+
+MKW_PPC_NO_INLINE inline void InvokeIndirectCpuSlow(uint32_t target, CpuContext* cpu) {
     if (target == 0) {
         ReportMissingCpuTarget(target, cpu);
     }
-    ApplyRuntimeCallOptions(target, cpu);
     if (TryDispatchRawCpuTarget(TranslatedFunctionRegistry::FindRawByAddressPtr(target), cpu)) {
         return;
     }
@@ -614,4 +640,13 @@ inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
         return;
     }
     ReportMissingCpuTarget(target, cpu);
+}
+
+inline void InvokeIndirectCpu(uint32_t target, CpuContext* ctx) {
+    CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();
+    ApplyRuntimeCallOptions(target, cpu);
+    if (TryDispatchUnguardedRawCpuTarget(target, cpu)) {
+        return;
+    }
+    InvokeIndirectCpuSlow(target, cpu);
 }
