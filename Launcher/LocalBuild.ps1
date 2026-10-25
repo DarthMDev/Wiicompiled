@@ -34,65 +34,6 @@ Set-StrictMode -Version 3.0
 # See NativeBuildFlags.ps1; Build-Installer.ps1 stages it beside this script.
 . (Join-Path $PSScriptRoot 'NativeBuildFlags.ps1')
 
-function Resolve-NativePrebuiltDirectory([string]$DependenciesDirectory, [string]$ToolchainBin, [string]$AuroraDirectory, [string]$ThirdPartyDirectory) {
-    <#
-    The shipped precompiled aurora/third-party package, verified against its recorded provenance
-    (exact compiler, exact flags) before use. Anything unexpected falls back to building from source.
-    #>
-    $package = Join-Path $DependenciesDirectory 'native_prebuilt'
-    $provenancePath = Join-Path $package 'provenance.json'
-    if (-not (Test-Path -LiteralPath $provenancePath -PathType Leaf)) {
-        Write-Host 'MKWCBUILD: No precompiled aurora package was shipped; building it from source'
-        return ''
-    }
-    try {
-        $provenance = Get-Content -LiteralPath $provenancePath -Raw | ConvertFrom-Json
-        $compiler = Join-Path $ToolchainBin 'clang-22.exe'
-        $compilerHash = Get-MkwFileSha256 $compiler
-        if ($provenance.CompilerSha256 -ne $compilerHash) {
-            Write-Host 'MKWCBUILD: The precompiled aurora package was built by a different compiler; building it from source'
-            return ''
-        }
-        if ($provenance.FlagFingerprint -ne (Get-MkwNativeFlagFingerprint)) {
-            Write-Host 'MKWCBUILD: The precompiled aurora package was built with different flags; building it from source'
-            return ''
-        }
-        # The archives embed Dawn's headers and link its import library, so a
-        # dawn_prebuilt tree that is not the one they were harvested against is
-        # an ABI mismatch that only shows up as a crash inside the GPU backend.
-        $recordedDawn = $provenance.PSObject.Properties['DawnRuntimeSha256']
-        if ($null -eq $recordedDawn -or
-            $recordedDawn.Value -ne (Get-MkwDawnRuntimeSha256 $DependenciesDirectory)) {
-            Write-Host 'MKWCBUILD: The precompiled aurora package was built against a different Dawn; building it from source'
-            return ''
-        }
-        # The archives are aurora; the runtime compiled here calls its headers.
-        # If this workspace's aurora sources are not the ones that were harvested
-        # (a newer toolkit, or a locally modified tree), linking the package would
-        # mix two versions of aurora, so build it from source instead.
-        $recordedAurora = $provenance.PSObject.Properties['AuroraSourceFingerprint']
-        if ($null -eq $recordedAurora -or
-            $recordedAurora.Value -ne (Get-MkwAuroraSourceFingerprint $AuroraDirectory)) {
-            Write-Host 'MKWCBUILD: The precompiled aurora package was built from different aurora sources; building it from source'
-            return ''
-        }
-        # Same reasoning for the vendored Crypto++ the package also carries:
-        # first-party TUs compile against this workspace's third_party headers,
-        # so a package harvested from an older tree must not be linked here.
-        $recordedThirdParty = $provenance.PSObject.Properties['ThirdPartySourceFingerprint']
-        if ($null -eq $recordedThirdParty -or
-            $recordedThirdParty.Value -ne (Get-MkwThirdPartySourceFingerprint $ThirdPartyDirectory)) {
-            Write-Host 'MKWCBUILD: The precompiled aurora package was built from different vendored third-party sources; building it from source'
-            return ''
-        }
-    } catch {
-        Write-Host "MKWCBUILD: The precompiled aurora package could not be validated ($($_.Exception.Message)); building it from source"
-        return ''
-    }
-    Write-Host 'MKWCBUILD: Using the precompiled aurora and third-party libraries'
-    return $package
-}
-
 function Write-MkwBuildStep([string]$StepId, [string]$Message) {
     <#
     Announces a build step. The identifier is the contract (BuildStepIds in
@@ -160,6 +101,8 @@ if (-not [string]::IsNullOrWhiteSpace($RetroRewindPackageDirectory) -and
     $RetroRewindPackageDirectory = $Workspace + $RetroRewindPackageDirectory.Substring($realWorkspace.Length)
 }
 $translator = Join-Path $Toolkit 'Translator\Translator.Cli.exe'
+# A translator step takes 3-19 s on 16 threads; past this it has hung, and failing lets the clean retry run.
+$translatorTimeoutSeconds = 1800
 $toolchain = Get-MkwBuildSafePath $Toolkit 'toolchain' 'CMake\bin\cmake.exe'
 $cmake = Join-Path $toolchain 'CMake\bin\cmake.exe'
 $ninja = Join-Path $toolchain 'Ninja\ninja.exe'
@@ -208,8 +151,9 @@ if ($Parallel -gt 0) {
     $globalJobs = $Parallel
 } else {
     $translatorThreads = [math]::Max(1, [math]::Min([Environment]::ProcessorCount, 16))
+    # A translated TU peaks around 0.26 GB in clang; 0.5 GiB each after a 2 GiB reserve.
     $translatedJobs = [math]::Max(1, [math]::Min([Environment]::ProcessorCount,
-        [math]::Floor($memoryGiB / 2)))
+        [math]::Floor(($memoryGiB - 2) / 0.5)))
     $globalJobs = [math]::Max($translatedJobs, [Environment]::ProcessorCount)
 }
 
@@ -286,11 +230,18 @@ try {
                 # same translated functions produces the same base tree. Only the translator can
                 # decide that - it takes parsing the Kamek patch set against the recorded translated
                 # function ranges - and it fails closed, so anything but exit 0 retranslates.
-                & $translator @(
-                    'check-base-mod-awareness', '--project', $project, '--profile', 'retro-rewind',
-                    '--translation-output-metadata', $baseMetadata, '--code-pul', $retroCodePul
-                ) | Write-Host
-                if ($LASTEXITCODE -ne 0) {
+                $modAware = $true
+                try {
+                    Invoke-Checked $translator @(
+                        'check-base-mod-awareness', '--project', $project, '--profile', 'retro-rewind',
+                        '--translation-output-metadata', $baseMetadata, '--code-pul', $retroCodePul
+                    ) 'Checking whether the base translation covers the new Code.pul' `
+                        -TimeoutSeconds $translatorTimeoutSeconds
+                } catch {
+                    Write-Host "MKWCBUILD: $($_.Exception.Message)"
+                    $modAware = $false
+                }
+                if (-not $modAware) {
                     Write-MkwBuildStep 'retranslate-base' 'The base translation is stale; retranslating the base game for the new Code.pul'
                     $reuseBase = $false
                 }
@@ -313,12 +264,14 @@ try {
                 '--outdir', $functions, '--output-metadata', $baseMetadata,
                 '--production-source-bundle', (Join-Path $generated 'base_translation_sources.bin'),
                 '--no-function-files', '--prune-stale', '--threads', $translatorThreads
-            ) 'Translating the user-owned base game' -StepId 'translate-base'
+            ) 'Translating the user-owned base game' -StepId 'translate-base' `
+                -TimeoutSeconds $translatorTimeoutSeconds
 
             Invoke-Checked $translator @(
                 'emit-base-manifest', '--project', $project, '--out', $baseManifestDir,
                 '--functions-dir', $functions, '--translation-output-metadata', $baseMetadata, '--region', $pins.Region
-            ) 'Creating the local base translation manifest' -StepId 'emit-base-manifest'
+            ) 'Creating the local base translation manifest' -StepId 'emit-base-manifest' `
+                -TimeoutSeconds $translatorTimeoutSeconds
 
             if (-not [string]::IsNullOrWhiteSpace($TranslationFingerprint)) {
                 [ordered]@{ SchemaVersion = 1; TranslationFingerprint = $TranslationFingerprint; DolSha256 = $pins.DolSha256 } |
@@ -348,11 +301,12 @@ try {
                 throw 'Retro Rewind requires either -RetroWfcOfflineDirectory or -SkipRetroWfcPayload.'
             }
             Invoke-Checked $translator $translateModArguments 'Translating the selected Retro Rewind Code.pul' `
-                -StepId 'translate-mod'
+                -StepId 'translate-mod' -TimeoutSeconds $translatorTimeoutSeconds
         }
 
         Invoke-Checked $translator @('generate-data-init', '--project', $project) `
-            'Generating local game data initialization' -StepId 'generate-data-init'
+            'Generating local game data initialization' -StepId 'generate-data-init' `
+            -TimeoutSeconds $translatorTimeoutSeconds
 
         $shardArgs = @(
             'emit-build-shards', '--project', $project, '--base-metadata', $baseMetadata,
@@ -364,7 +318,8 @@ try {
             $shardArgs += @('--resolved-profile', (Join-Path $retroOut 'resolved_dispatch_profile.json'),
                 '--retro-cpp-dir', (Join-Path $retroOut 'cpp'))
         }
-        Invoke-Checked $translator $shardArgs 'Preparing local native build shards' -StepId 'emit-build-shards'
+        Invoke-Checked $translator $shardArgs 'Preparing local native build shards' -StepId 'emit-build-shards' `
+            -TimeoutSeconds $translatorTimeoutSeconds
 
         # The build directory is kept whenever the exact toolchain that filled it is the one
         # installed now and its CMake cache still belongs to this workspace path. Object files are
@@ -396,7 +351,7 @@ try {
             }
         }
         $dependencies = Join-Path $Workspace 'Dependencies'
-        $nativePrebuilt = Resolve-NativePrebuiltDirectory $dependencies $toolchainBin `
+        $nativePrebuilt = Resolve-MkwNativePrebuiltDirectory $dependencies $toolchainBin `
             (Join-Path $Workspace 'aurora-main') (Join-Path $Workspace 'runtime\third_party')
         if ($X86CpuProfile -eq 'v2') {
             Write-Host 'MKWCBUILD: This CPU does not support x86-64-v3; building for x86-64-v2'
