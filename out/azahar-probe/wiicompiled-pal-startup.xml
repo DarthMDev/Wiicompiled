@@ -1,0 +1,5 @@
+<targets>
+    <target>
+        <app title="WiiCompiled PAL" memory="7x-app" />
+    </target>
+</targets>

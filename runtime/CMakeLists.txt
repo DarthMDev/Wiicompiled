@@ -10,6 +10,16 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
 endif()
 project(mkw_recompiled)
 
+# CMake 4.x leaves CMAKE_OSX_SYSROOT empty by default on macOS while storing the
+# resolved SDK path in _CMAKE_OSX_SYSROOT_PATH. Third-party scripts such as
+# libpng's genout.cmake substitute @CMAKE_OSX_SYSROOT@ directly when invoking
+# the preprocessor, which fails with raw Xcode toolchain clang unless
+# CMAKE_OSX_SYSROOT is populated.
+if(APPLE AND NOT CMAKE_OSX_SYSROOT AND _CMAKE_OSX_SYSROOT_PATH AND IS_DIRECTORY "${_CMAKE_OSX_SYSROOT_PATH}")
+    set(CMAKE_OSX_SYSROOT "${_CMAKE_OSX_SYSROOT_PATH}" CACHE PATH
+        "The product will be built against the headers and libraries located inside the indicated SDK." FORCE)
+endif()
+
 if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "WiiCompiled requires a 64-bit Clang toolchain")
 endif()
