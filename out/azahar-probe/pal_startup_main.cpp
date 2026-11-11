@@ -29,6 +29,7 @@ extern "C" void func_805A8FBC(CpuContext*);
 extern "C" void func_805A900C(CpuContext*);
 extern "C" void func_8052A954(CpuContext*);
 extern "C" void func_80540038(CpuContext*);
+extern "C" void func_80577064(CpuContext*);
 extern "C" void func_80124894(CpuContext*);
 extern "C" void func_8020FA80(CpuContext*);
 extern "C" void func_8004C240(CpuContext*);
@@ -2527,6 +2528,9 @@ struct CourseModelTrace {
     std::set<uint32_t> objects;
 };
 static uint32_t g_tracedCourseU8 = 0;
+// Every decompressed SZS image we have produced. Used as a last-resort lookup source for resource
+// requests the guest's ArchiveMgr cannot satisfy yet (see [Model Rescue]).
+static std::vector<uint32_t> g_decompressedArcs;
 static CourseModelTrace g_courseModelTrace[] = {
     {"course_model.brres"}, {"vrcorn_model.brres"}, {"map_model.brres"},
 };
@@ -2557,6 +2561,25 @@ static const CourseModelTrace* FindTracedModelFilename(uint32_t address) {
 
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
+    // First-appearance filter for the archive-load window. The ArchiveMgr entries flip 0 -> 4
+    // between frames ~84 and ~100, but no call that receives an archive pointer happens after
+    // frame 84 and no task job runs in that window. So build a baseline of everything called at
+    // frames 86-89 and then report only targets that are NEW at frames 90-100: that leaves the
+    // code that starts running only once the load completes.
+    if (gx_bridge::g_gxFrame >= 86 && gx_bridge::g_gxFrame <= 100) {
+        static std::set<uint32_t> s_baseline;
+        static std::set<uint64_t> s_reportedNew;
+        if (gx_bridge::g_gxFrame <= 89) {
+            s_baseline.insert(target);
+        } else if (s_baseline.find(target) == s_baseline.end()) {
+            const uint64_t k = (static_cast<uint64_t>(gx_bridge::g_gxFrame) << 32) | target;
+            if (s_reportedNew.size() < 200 && s_reportedNew.insert(k).second) {
+                AppLog("[ArcNew] frame=%u target=%08X lr=%08X r3=%08X r4=%08X\n",
+                    gx_bridge::g_gxFrame, target, cpu ? cpu->lr : 0,
+                    cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0);
+            }
+        }
+    }
     // Non-intercepting trace: which guest functions are handed an ArchiveMgr object or entry
     // pointer while the archive groups are still loading? The one that advances entry state
     // 0/1 -> 4 is the per-frame pump we need to drive synchronously.
@@ -3263,9 +3286,35 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 func_8004C350(cpu);
             }
             const uint32_t mdl = cpu->gpr[3];
+            // RESCUE: section 32 creates the karts at frame 84, but the ArchiveMgr groups only
+            // become usable at ~frame 100, so the guest's own lookup fails and is never retried.
+            // We already hold every decompressed archive image, so resolve the model directly from
+            // those instead of returning NULL. Same mechanism that already makes the course models
+            // load (see FindU8Resource / the [Race Model] recovery path).
+            uint32_t rescued = 0;
+            if (mdl == 0 && !nm.empty() && target == 0x8004C240u) {
+                uint32_t foundSize = 0;
+                for (uint32_t arcData : g_decompressedArcs) {
+                    if (!arcData || !Memory::Contains(arcData, 4)) continue;
+                    const uint32_t found = FindU8Resource(arcData, nm.c_str(), &foundSize);
+                    if (found && Memory::Contains(found, 8) && ReadTraceWord(found) == 0x62726573u) {
+                        rescued = found;
+                        cpu->gpr[3] = found;
+                        static std::set<std::string> s_seenRescue;
+                        std::string rk = nm + "|" + std::to_string(arcData);
+                        if (s_seenRescue.size() < 96 && s_seenRescue.insert(rk).second) {
+                            AppLog("[Model Rescue] '%s' from arc=%08X -> mdl=%08X size=%u frame=%u\n",
+                                nm.c_str(), arcData, found, foundSize, gx_bridge::g_gxFrame);
+                        }
+                        break;
+                    }
+                }
+            }
             static std::set<std::string> s_seenOk, s_seenFail;
             std::string key = nm + "|res=" + std::to_string(channel);
-            if (mdl != 0) {
+            if (rescued != 0) {
+                // already logged above
+            } else if (mdl != 0) {
                 if (s_seenOk.size() < 64 && s_seenOk.insert(key).second) {
                     AppLog("[Model Ok] '%s' resFile=%08X -> mdl=%08X magic=%08X frame=%u\n",
                         nm.c_str(), channel, mdl, ReadTraceWord(mdl), gx_bridge::g_gxFrame);
@@ -4590,6 +4639,11 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             mask >>= 1;
         }
         AppLog("[Decomp] Decoded %u bytes SZS from 0x%08X to 0x%08X\n", expandSize, src, dst);
+        if (g_decompressedArcs.size() < 64) {
+            bool dup = false;
+            for (uint32_t a : g_decompressedArcs) if (a == dst) { dup = true; break; }
+            if (!dup) g_decompressedArcs.push_back(dst);
+        }
         std::fflush(stdout);
         cpu->gpr[3] = expandSize;
         return true;
@@ -4692,6 +4746,33 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x801630D0u: // DVD::CancelAll
         cpu->gpr[3] = 1;
         return true;
+    case 0x80577064u: { // kart/driver model loader: func_80577064(info, holder->124, holder+552)
+        // info+0 must be an nw4r ResFile over a .brres, because the loader calls
+        // ResFile::GetResMdl(info, "model_lod"). Section 32 runs at frame 84 with info+0 = NULL
+        // (the ArchiveMgr groups only become usable at ~frame 100), so every lookup fails.
+        // Supply the kart .brres straight out of the archives we have already decompressed.
+        const uint32_t info = cpu ? cpu->gpr[3] : 0;
+        if (info && Memory::Contains(info, 24) && Memory::Read32(info) == 0) {
+            static bool s_loggedRescue = false;
+            for (uint32_t arcData : g_decompressedArcs) {
+                if (!arcData || !Memory::Contains(arcData, 4)) continue;
+                uint32_t size = 0;
+                const uint32_t brres = FindU8Resource(arcData, "kart_model.brres", &size);
+                if (brres && Memory::Contains(brres, 4) && ReadTraceWord(brres) == 0x62726573u) {
+                    Memory::Write32(info, brres);   // ResFile handle = .brres image
+                    Memory::Write8(info + 17, 1);   // loader gate: "resource available"
+                    if (!s_loggedRescue) {
+                        s_loggedRescue = true;
+                        AppLog("[Kart Rescue] info=%08X <- kart_model.brres %08X (arc=%08X size=%u) frame=%u\n",
+                            info, brres, arcData, size, gx_bridge::g_gxFrame);
+                    }
+                    break;
+                }
+            }
+        }
+        func_80577064(cpu);
+        return true;
+    }
     case 0x80540038u: { // archive load job; arg indexes entries at *(0x809BD748) + arg*84
         const uint32_t argIn = cpu ? cpu->gpr[3] : 0;
         const uint32_t baseIn = Memory::Read32(0x809BD748u);
