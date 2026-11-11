@@ -677,6 +677,7 @@ struct GxState {
     uint32_t xfMtxWrites = 0;      // completed 12-float XF position-matrix writes
     uint32_t mtxNonIdentity = 0;   // loads whose row0/row1 were not the sanitized identity
     uint32_t camUpdateCalls = 0;   // RaceCameraMgr::Update calls this frame
+    uint32_t drawCallsSkipped = 0; // draws dropped by the raster frame-skip
 
     float vpLeft = 0.0f, vpTop = 0.0f, vpWidth = 608.0f, vpHeight = 456.0f;
     float vpNear = 0.0f, vpFar = 1.0f;
@@ -875,7 +876,17 @@ static void LogDrawSamples(uint32_t order, FrameSamples before) {
         after.center, after.topLeft, after.topRight, after.bottomLeft, after.bottomRight);
 }
 
+
+// Rasterise only every kRasterStride-th frame. The guest keeps running at full speed, so the race
+// simulation advances ~4x faster while the display shows the most recent fully-rendered frame.
+// Skipped frames must NOT clear the framebuffer, otherwise the screen strobes black.
+static constexpr uint32_t kRasterStride = 4;
+static bool RasterThisFrame() {
+    return g_gxFrame < 40u || (g_gxFrame % kRasterStride) == 0u;
+}
+
 static void ClearFramebuffer() {
+    if (!RasterThisFrame()) return;
     const uint32_t r = g_gx.clearColor[0];
     const uint32_t g = g_gx.clearColor[1];
     const uint32_t b = g_gx.clearColor[2];
@@ -1216,7 +1227,7 @@ static inline bool BlendPixel(int x, int y, float z, uint8_t sr, uint8_t sg, uin
 
 static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVertex& v2, uint32_t pnMtxIdx) {
     EnsureInitialized();
-    const bool tracePerspective = (g_gxFrame == kGxTraceFrame || g_gxFrame % 20 == 0) && g_gx.projType == 0;
+    const bool tracePerspective = (g_gxFrame == kGxTraceFrame) && g_gx.projType == 0;
     const float* rawMv = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
     float mv[12];
     std::memcpy(mv, rawMv, sizeof(mv));
@@ -1806,6 +1817,7 @@ static void HandleLoadIndx(uint8_t cmd, const uint8_t* d) {
 }
 
 static void ExecutePrimitive(uint8_t primCmd, uint16_t vtxCount, const uint8_t*& p) {
+    if (!RasterThisFrame()) { ++g_gx.drawCallsSkipped; return; }
     uint32_t vatIdx = primCmd & 7u;
     uint8_t primType = primCmd & 0xF8u;
     if (vtxCount == 0) return;
@@ -2189,7 +2201,7 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
             AppLog("[ArcState] frame=%u%s\n", frameNumber, arcOut.c_str());
         }
     }
-    if (frameNumber == kGxTraceFrame || (frameNumber % 20 == 0 && (g_perspectiveTrace.rasterized > 0 || g_perspectiveTrace.area > 0 || g_perspectiveTrace.nonFinite > 0))) {
+    if (frameNumber == kGxTraceFrame) {
         AppLog("[GX Perspective Frame %u] nonFinite=%u nearPlane=%u area=%u offscreen=%u rasterized=%u wrotePixels=%u\n",
             frameNumber, g_perspectiveTrace.nonFinite, g_perspectiveTrace.nearPlane,
             g_perspectiveTrace.area, g_perspectiveTrace.offscreen, g_perspectiveTrace.rasterized,
@@ -2205,6 +2217,7 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
     g_gx.xfMtxWrites = 0;
     g_gx.mtxNonIdentity = 0;
     g_gx.camUpdateCalls = 0;
+    g_gx.drawCallsSkipped = 0;
     g_fifoStream.clear();
     ClearFramebuffer();
 }
