@@ -809,6 +809,12 @@ static constexpr uint32_t kGxTraceFrame = 120;
 static uint32_t g_gxFrame = 1;
 // ArchiveMgr instance captured on the first GetFile call; used by the per-frame [ArcState] dump.
 static uint32_t g_tracedArchiveMgr = 0;
+// Watch window for the ArchiveMgr entry table (set by the [ArcState] dump) so the HLE trace can
+// report every function that is handed an archive entry pointer during the load window.
+static uint32_t g_watchArcEntries = 0;
+static uint32_t g_watchArcCount = 0;
+static uint32_t g_watchArcs[8] = {0,0,0,0,0,0,0,0};
+static uint32_t g_watchArcN = 0;
 // True when every registered ArchiveMgr group has a loaded entry (state 4 or 5), i.e. every
 // archive is usable. func_805411FC refuses entries in any other state.
 static bool ArchivesReady() {
@@ -2168,6 +2174,8 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
                     if (!arc || !Memory::Contains(arc, 12)) break;
                     const uint32_t count = Memory::Read16(arc + 8);
                     const uint32_t entries = Memory::Read32(arc + 4);
+                    if (ty == 0 && entries) { g_watchArcEntries = entries; g_watchArcCount = count; }
+                    if (ty < 8) { g_watchArcs[ty] = arc; if (g_watchArcN < ty + 1) g_watchArcN = ty + 1; }
                     arcOut += " t" + std::to_string(ty) + "=[";
                     for (uint32_t e = 0; e < count && e < 6; ++e) {
                         if (!entries || !Memory::Contains(entries + e * 36u, 36)) break;
@@ -2549,6 +2557,37 @@ static const CourseModelTrace* FindTracedModelFilename(uint32_t address) {
 
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
+    // Non-intercepting trace: which guest functions are handed an ArchiveMgr object or entry
+    // pointer while the archive groups are still loading? The one that advances entry state
+    // 0/1 -> 4 is the per-frame pump we need to drive synchronously.
+    if (gx_bridge::g_watchArcEntries && gx_bridge::g_watchArcCount &&
+        gx_bridge::g_gxFrame >= 80 && gx_bridge::g_gxFrame <= 130) {
+        const uint32_t lo = gx_bridge::g_watchArcEntries;
+        const uint32_t hi = lo + gx_bridge::g_watchArcCount * 36u;
+        auto watched = [&](uint32_t v) {
+            if (v >= lo && v < hi) return true;
+            if (gx_bridge::g_tracedArchiveMgr && v == gx_bridge::g_tracedArchiveMgr) return true;
+            for (uint32_t i = 0; i < gx_bridge::g_watchArcN && i < 8; ++i) {
+                if (gx_bridge::g_watchArcs[i] && v == gx_bridge::g_watchArcs[i]) return true;
+            }
+            return false;
+        };
+        bool hit = false;
+        int hitReg = -1;
+        if (cpu) {
+            for (int r = 3; r <= 10; ++r) {
+                if (watched(cpu->gpr[r])) { hit = true; hitReg = r; break; }
+            }
+        }
+        if (hit) {
+            static std::set<uint64_t> s_seenEntryTargets;
+            const uint64_t key = (static_cast<uint64_t>(gx_bridge::g_gxFrame) << 32) | target;
+            if (s_seenEntryTargets.size() < 400 && s_seenEntryTargets.insert(key).second) {
+                AppLog("[ArcWatch] target=%08X frame=%u reg=r%d lr=%08X\n",
+                    target, gx_bridge::g_gxFrame, hitReg, cpu->lr);
+            }
+        }
+    }
     if (target == 0x8061C96Cu && cpu && cpu->lr == 0x80601B40u) {
         const uint32_t page = cpu->gpr[3];
         const uint32_t vtable = ReadTraceWord(page);
@@ -3088,7 +3127,25 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         const uint32_t archiveType = cpu->gpr[4];
         const uint32_t mgrPtr = cpu->gpr[3];
         const uint32_t caller = cpu->lr;
-        if (!gx_bridge::g_tracedArchiveMgr) gx_bridge::g_tracedArchiveMgr = mgrPtr;
+        if (!gx_bridge::g_tracedArchiveMgr) {
+            gx_bridge::g_tracedArchiveMgr = mgrPtr;
+            // Populate the entry watch window immediately (the frame hook only runs every 20
+            // frames, which would miss the archive-load window entirely).
+            const uint32_t ab = mgrPtr ? Memory::Read32(mgrPtr + 4) : 0;
+            for (uint32_t ty = 0; ab && ty < 8 && Memory::Contains(ab + ty * 4, 4); ++ty) {
+                const uint32_t arc = Memory::Read32(ab + ty * 4);
+                if (!arc || !Memory::Contains(arc, 12)) break;
+                gx_bridge::g_watchArcs[ty] = arc;
+                gx_bridge::g_watchArcN = ty + 1;
+                if (ty == 0) {
+                    const uint32_t cnt = Memory::Read16(arc + 8);
+                    const uint32_t ent = Memory::Read32(arc + 4);
+                    if (ent) { gx_bridge::g_watchArcEntries = ent; gx_bridge::g_watchArcCount = cnt; }
+                }
+            }
+            AppLog("[ArcWatch] watching mgr=%08X entries=%08X count=%u arcs=%u\n",
+                mgrPtr, gx_bridge::g_watchArcEntries, gx_bridge::g_watchArcCount, gx_bridge::g_watchArcN);
+        }
         std::string reqName;
         if (namePtr && Memory::Contains(namePtr, 1)) {
             reqName = reinterpret_cast<const char*>(Memory::GetPointer(namePtr, 1));
