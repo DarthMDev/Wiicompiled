@@ -45,6 +45,7 @@ extern "C" void func_8052A954(CpuContext*);
 extern "C" void func_80540038(CpuContext*);
 extern "C" void func_805B9344(CpuContext*);
 extern "C" void func_805E889C(CpuContext*);
+extern "C" void func_805A08F0(CpuContext*);
 extern "C" void func_805E78F0(CpuContext*);
 extern "C" void func_80577064(CpuContext*);
 extern "C" void func_805A0A1C(CpuContext*);
@@ -5052,6 +5053,12 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             AppLog("[Arc Load] handle=%08X name='%s' steps=%d seq=%s frame=%u reqLr=%08X\n",
                 a3, nm.c_str(), iter + 1, seq.c_str(), gx_bridge::g_gxFrame, reqLr);
         }
+        return true;
+    }
+    case 0x805A08F0u: { // RaceCameraMgr constructor (linked 9,467th)
+        // Forwarded here because handle_startup_hle runs before the dispatch switch; dispatch.cpp
+        // also carries the case now that the address is in linked-functions.txt.
+        func_805A08F0(cpu);
         return true;
     }
     case 0x805E889Cu: { // ControlLoader: bind a control's panes to its loaded ".brlyt"
