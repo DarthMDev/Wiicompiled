@@ -2900,6 +2900,28 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 }
             }
         }
+        // Menu archives are loaded asynchronously by the game, and some menu resource groups
+        // are not mounted yet when their first lookup occurs. Search only the decompressed U8
+        // images already owned by the guest; this returns the archive's original resource bytes
+        // and avoids copying or allocating memory on the 3DS.
+        for (uint32_t arcData : g_decompressedArcs) {
+            if (!arcData || !Memory::Contains(arcData, 4)) continue;
+            uint32_t foundSize = 0;
+            const uint32_t found = FindU8Resource(arcData, name, &foundSize);
+            if (found != 0) {
+                cpu->gpr[3] = found;
+                if (sizeOut && Memory::Contains(sizeOut, 4)) {
+                    Memory::Write32(sizeOut, foundSize);
+                }
+                static std::set<std::string> s_seenUiResourceFallbacks;
+                const std::string key = std::string(name) + "|" + std::to_string(arcData);
+                if (s_seenUiResourceFallbacks.size() < 128 && s_seenUiResourceFallbacks.insert(key).second) {
+                    AppLog("[U8 GetResource HLE] Decompressed-archive fallback found '%s' in %08X at %08X (size=%u)\n",
+                        name, arcData, found, foundSize);
+                }
+                return true;
+            }
+        }
         AppLog("[U8 GetResource HLE] Not found: '%s' (type=%08X)\n", name, type);
         return true;
     }
@@ -3430,7 +3452,26 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
 
         func_805411FC(cpu);
-        const uint32_t result = cpu->gpr[3];
+        uint32_t result = cpu->gpr[3];
+        // Menu.bmg is stored inside localized UI U8 archives, so recover it from an already
+        // decompressed guest archive if the ArchiveMgr group has not mounted yet.
+        if (!result && reqName == "message/Menu.bmg") {
+            for (uint32_t arcData : g_decompressedArcs) {
+                if (!arcData || !Memory::Contains(arcData, 4)) continue;
+                uint32_t foundSize = 0;
+                const uint32_t found = FindU8Resource(arcData, "Menu.bmg", &foundSize);
+                if (!found) continue;
+                result = found;
+                cpu->gpr[3] = found;
+                static bool s_loggedMenuBmgFallback = false;
+                if (!s_loggedMenuBmgFallback) {
+                    s_loggedMenuBmgFallback = true;
+                    AppLog("[ArchiveMgr] recovered message/Menu.bmg from decompressed arc=%08X data=%08X size=%u frame=%u\n",
+                        arcData, found, foundSize, gx_bridge::g_gxFrame);
+                }
+                break;
+            }
+        }
         const auto* trace = FindTracedModelFilename(namePtr);
         if (trace) {
             AppLog("[Race Model] ArchiveMgr::GetFile %s lr=%08X type=%u brres=%08X magic=%08X\n",
