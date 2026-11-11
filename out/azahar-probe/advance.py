@@ -39,6 +39,28 @@ def read_linked_from_script():
         return []
     return list(eval('(' + m.group(1) + ')'))
 
+def read_linked_seed():
+    """Committed link list (one address per line).
+
+    `host_shards/*.cpp` and `pal_sections.S` are generated artifacts derived from the game
+    binaries, so they are NOT tracked in git. This seed file is the tracked bootstrap so a fresh
+    clone can regenerate everything from the user's own DOL/REL. It wins over the generated
+    build-pal-startup.sh so regeneration is reproducible.
+    """
+    seed = work_dir / 'linked-functions.txt'
+    if not seed.exists():
+        return []
+    out = []
+    for line in seed.read_text().split():
+        line = line.strip().upper()
+        if line and not line.startswith('#'):
+            out.append(line)
+    return out
+
+def write_linked_seed(linked):
+    seed = work_dir / 'linked-functions.txt'
+    seed.write_text('\n'.join(linked) + '\n')
+
 shards_cache = {}
 def get_shard(path):
     if path not in shards_cache:
@@ -283,6 +305,7 @@ sdk=${{DEVKITPRO:-/opt/devkitpro}}
 "$sdk/tools/bin/3dsxtool" wiicompiled-pal-startup.elf wiicompiled-pal-startup.3dsx
 '''
     build_pal_sh.write_text(content)
+    write_linked_seed(linked)
 
 def run_host_cycle():
     # Check pal_startup_main.cpp
@@ -381,7 +404,7 @@ if __name__ == '__main__':
         '801FEE74', '80205B6C', '8020B3E0', '80229540', '80229DE0', '80229814', '802434D8', '80229640'
     ]
 
-    linked = read_linked_from_script()
+    linked = read_linked_seed() or read_linked_from_script()
     if not linked:
         linked = list(base_linked)
     linked_set = set(linked)
