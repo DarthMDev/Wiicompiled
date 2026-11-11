@@ -4303,7 +4303,8 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             if (callback >= 0x80004000u && callback < 0x81000000u) {
                 const uint32_t arg = Memory::Read32(msg + 4);
                 const uint32_t onDone = Memory::Read32(msg + 0x14u);
-                AppLog("[TaskJob] Executing callback %08X(arg=%08X)\n", callback, arg);
+                AppLog("[TaskJob] frame=%u Executing callback %08X(arg=%08X) onDone=%08X\n",
+                    gx_bridge::g_gxFrame, callback, arg, onDone);
                 std::fflush(stdout);
                 CpuContext taskCtx = *cpu;
                 taskCtx.gpr[3] = arg;
