@@ -696,6 +696,13 @@ struct GxState {
 
     uint8_t chanMatColor[2][4] = {{255,255,255,255}, {255,255,255,255}};
     uint8_t chanAmbColor[2][4] = {{128,128,128,255}, {128,128,128,255}};
+
+    // Channel 0 lighting (the subset Mario Kart Wii actually uses: diffuse, one directional light).
+    uint32_t chanCtrl0 = 0;                                  // XF 0x100E
+    uint8_t  light0Color[4] = {255, 255, 255, 255};          // XF 0x0600
+    float    light0Dir[3] = {0.0f, 0.0f, 1.0f};              // XF 0x0607..0x0609
+    bool     light0DirWritten = false;
+    bool     lightEnabled = false;
     uint8_t tevColor[4][4] = {{255,255,255,255}, {255,255,255,255}, {255,255,255,255}, {255,255,255,255}};
     uint8_t tevKColor[4][4] = {{255,255,255,255}, {255,255,255,255}, {255,255,255,255}, {255,255,255,255}};
     uint8_t clearColor[4] = {105, 165, 235, 255}; // Default sky blue
@@ -1367,6 +1374,36 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
             cv[i].b = g_gx.chanMatColor[0][2];
             cv[i].a = g_gx.chanMatColor[0][3];
         }
+        // Diffuse lighting (GX channel 0): lit = ambient + material * lightColour * max(0, N.L).
+        // Without this every untextured surface renders as a flat blob.
+        if (g_gx.lightEnabled) {
+            float nx = vin.nrm[0], ny = vin.nrm[1], nz = vin.nrm[2];
+            const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl > 1e-6f) { nx /= nl; ny /= nl; nz /= nl; }
+            float lx = g_gx.light0Dir[0], ly = g_gx.light0Dir[1], lz = g_gx.light0Dir[2];
+            // The guest loads its light object through GX internals we do not model, so light0Dir
+            // usually stays at the power-on default (0,0,1). Substitute a plausible key light from
+            // above/behind so surfaces shade instead of rendering as flat blobs.
+            if (!g_gx.light0DirWritten) {
+                lx = 0.35f; ly = -0.88f; lz = 0.32f;
+            }
+            const float ll = std::sqrt(lx * lx + ly * ly + lz * lz);
+            if (ll > 1e-6f) { lx /= ll; ly /= ll; lz /= ll; }
+            float ndl = nx * lx + ny * ly + nz * lz;
+            if (ndl < 0.0f) ndl = 0.0f;
+            const float lr = g_gx.light0Color[0] / 255.0f;
+            const float lg = g_gx.light0Color[1] / 255.0f;
+            const float lb = g_gx.light0Color[2] / 255.0f;
+            const float mr = g_gx.chanMatColor[0][0] / 255.0f;
+            const float mg = g_gx.chanMatColor[0][1] / 255.0f;
+            const float mb = g_gx.chanMatColor[0][2] / 255.0f;
+            const float ar = g_gx.chanAmbColor[0][0] / 255.0f;
+            const float ag = g_gx.chanAmbColor[0][1] / 255.0f;
+            const float ab = g_gx.chanAmbColor[0][2] / 255.0f;
+            cv[i].r *= std::min(1.0f, ar + mr * ndl * lr);
+            cv[i].g *= std::min(1.0f, ag + mg * ndl * lg);
+            cv[i].b *= std::min(1.0f, ab + mb * ndl * lb);
+        }
     }
 
     float area = (cv[1].sx - cv[0].sx) * (cv[2].sy - cv[0].sy) -
@@ -1829,6 +1866,30 @@ static void HandleLoadXfReg(uint16_t baseAddr, uint16_t count, const uint8_t* da
             g_gx.chanMatColor[ch][1] = (c >> 16) & 0xFFu;
             g_gx.chanMatColor[ch][2] = (c >> 8)  & 0xFFu;
             g_gx.chanMatColor[ch][3] = c         & 0xFFu;
+        } else if (addr == 0x100Eu) { // Channel 0 control
+            const uint32_t ctrl = ReadBE32(wordPtr);
+            g_gx.chanCtrl0 = ctrl;
+            const bool enable = ((ctrl >> 1) & 1u) != 0;
+            const uint32_t lightMask = (ctrl >> 2) & 0xFu;
+            g_gx.lightEnabled = enable && lightMask != 0;
+            static uint32_t s_lastCtrl = 0xFFFFFFFFu;
+            if (ctrl != s_lastCtrl) {
+                s_lastCtrl = ctrl;
+                AppLog("[GX Light] chanCtrl0=%08X enable=%u mask=%u lightEnabled=%u dir=(%g,%g,%g) col=%u,%u,%u frame=%u\n",
+                    ctrl, enable ? 1u : 0u, lightMask, g_gx.lightEnabled ? 1u : 0u,
+                    g_gx.light0Dir[0], g_gx.light0Dir[1], g_gx.light0Dir[2],
+                    g_gx.light0Color[0], g_gx.light0Color[1], g_gx.light0Color[2],
+                    g_gxFrame);
+            }
+        } else if (addr == 0x0600u) { // Light0 colour
+            const uint32_t c = ReadBE32(wordPtr);
+            g_gx.light0Color[0] = static_cast<uint8_t>((c >> 24) & 0xFFu);
+            g_gx.light0Color[1] = static_cast<uint8_t>((c >> 16) & 0xFFu);
+            g_gx.light0Color[2] = static_cast<uint8_t>((c >> 8) & 0xFFu);
+            g_gx.light0Color[3] = static_cast<uint8_t>(c & 0xFFu);
+        } else if (addr >= 0x0607u && addr <= 0x0609u) { // Light0 position/direction
+            g_gx.light0Dir[addr - 0x0607u] = ReadBEFloat(wordPtr);
+            g_gx.light0DirWritten = true;
         } else if (addr == 0x1018u) { // MatrixIndex0
             uint32_t val = ReadBE32(wordPtr);
             g_gx.currentPnMtx = ((val & 0x3Fu) / 3u) % 10u;
@@ -3934,6 +3995,12 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             gx_bridge::g_gx.vtxArray[attr].stride = static_cast<uint8_t>(cpu->gpr[5] & 0xFFu);
         }
         return true;
+    }
+    case 0x80172FD8u:
+    case 0x801730CCu: {
+        AppLog("[GX Probe] target=%08X r3=%08X r4=%08X frame=%u\n",
+            target, cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0, gx_bridge::g_gxFrame);
+        return false;
     }
     case 0x8017301Cu: { // GXSetProjection(mtxAddr, type)
         uint32_t mtxAddr = cpu->gpr[3];
