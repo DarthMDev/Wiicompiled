@@ -880,7 +880,7 @@ static void LogDrawSamples(uint32_t order, FrameSamples before) {
 // Rasterise only every kRasterStride-th frame. The guest keeps running at full speed, so the race
 // simulation advances ~4x faster while the display shows the most recent fully-rendered frame.
 // Skipped frames must NOT clear the framebuffer, otherwise the screen strobes black.
-static constexpr uint32_t kRasterStride = 4;
+static constexpr uint32_t kRasterStride = 8;
 static bool RasterThisFrame() {
     return g_gxFrame < 40u || (g_gxFrame % kRasterStride) == 0u;
 }
@@ -5074,7 +5074,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         static uint32_t s_frameCount = 0;
         ++s_frameCount;
         gx_bridge::PresentFrameTo3DS(s_frameCount);
-        if (s_frameCount <= 20 || s_frameCount % 20 == 0) {
+        if (s_frameCount <= 20 || s_frameCount % 40 == 0) {
             const uint32_t sm = Memory::Read32(0x809C1E38u);
             const uint32_t curSecId = sm ? Memory::Read32(sm + 4) : 0;
             const uint32_t prevSecId = sm ? Memory::Read32(sm + 8) : 0;
