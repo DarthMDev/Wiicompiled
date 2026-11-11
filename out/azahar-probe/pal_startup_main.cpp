@@ -5035,11 +5035,6 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         // (0x805E7A34 -> func_805E78F0) until the host stack overflows. Bound the recursion: past a
         // sane depth just return, leaving the list order untouched.
         static uint32_t s_sortDepth = 0;
-        static uint32_t s_sortHits = 0;
-        if (++s_sortHits <= 3) {
-            AppLog("[LinkList] sort ENTER depth=%u r3=%08X frame=%u\n",
-                s_sortDepth, cpu ? cpu->gpr[3] : 0, gx_bridge::g_gxFrame);
-        }
         if (s_sortDepth > 32u) {
             static uint32_t s_skipped = 0;
             if (++s_skipped <= 4) {
