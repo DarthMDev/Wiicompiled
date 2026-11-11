@@ -29,6 +29,7 @@ extern "C" void func_805A8FBC(CpuContext*);
 extern "C" void func_805A900C(CpuContext*);
 extern "C" void func_8052A954(CpuContext*);
 extern "C" void func_80540038(CpuContext*);
+extern "C" void func_805B9344(CpuContext*);
 extern "C" void func_80577064(CpuContext*);
 extern "C" void func_805A0A1C(CpuContext*);
 extern "C" void func_805A8468(CpuContext*);
@@ -4981,10 +4982,34 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return true;
     }
     case 0x805B9344u: { // ArgumentParser::parse
+        // BOOT PATH SWITCH.
+        // false = let the game choose its own first section (intro -> menu -> character select ->
+        //         track select -> race). This is the "proper" path: every field we have been
+        //         patching by hand (racedata+0xB70, player counts, kart ids, camera mode) is
+        //         produced by it.
+        // true  = the old shortcut: force section 0x20 (kSectionP1Vs) and jump straight into a race.
+        // Currently left ON: with it off the game advances out of section 0x15 and dies in
+        // nw4r LinkList (NULL list) because the menu/UI scaffold is not constructed yet - that is
+        // the intro -> menu -> character select workstream. Flip to false to continue that work.
+        constexpr bool kForceRaceSection = true;
+
         const uint32_t sectionMgr = Memory::Read32(0x809C1E38u);
-        AppLog("[BootRace] Intercepted SectionMgr::Init! sm=%08X lr=%08X r3=%08X curSec=%d\n",
-            sectionMgr, cpu ? cpu->lr : 0, cpu ? cpu->gpr[3] : 0,
-            sectionMgr ? static_cast<int32_t>(Memory::Read32(sectionMgr + 4)) : -1);
+        AppLog("[BootPath] ArgumentParser::parse frame=%u sm=%08X curSec=%d lr=%08X forceRace=%d\n",
+            gx_bridge::g_gxFrame, sectionMgr,
+            sectionMgr ? static_cast<int32_t>(Memory::Read32(sectionMgr + 4)) : -1,
+            cpu ? cpu->lr : 0, kForceRaceSection ? 1 : 0);
+
+        if (!kForceRaceSection) {
+            // Run the real parser and report what section the game itself picked.
+            func_805B9344(cpu);
+            AppLog("[BootPath] real parser -> section %d (sm curSec=%d)\n",
+                cpu ? static_cast<int32_t>(cpu->gpr[3]) : -1,
+                sectionMgr ? static_cast<int32_t>(Memory::Read32(sectionMgr + 4)) : -1);
+            std::fflush(stdout);
+            return true;
+        }
+
+        SetUpBootRaceScenario(0x08);
         // PRELOAD: section 32 init creates karts immediately, but the ArchiveMgr groups do not
         // become usable until ~frame 100 (about 16 frames after the engine posts the archive
         // requests). Pump the archive-load jobs to completion here, before forcing the section,
@@ -4993,48 +5018,16 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             const uint32_t arcBase = Memory::Read32(0x809BD748u);
             AppLog("[Arc Preload] begin frame=%u base=%08X ready=%d\n",
                 gx_bridge::g_gxFrame, arcBase, gx_bridge::ArchivesReady() ? 1 : 0);
-            // Learn the real layout first: print handle + candidate name bytes for the first few
-            // slots, and only pump slots whose +824 looks like a live guest pointer.
             uint32_t scanned = 0;
             if (arcBase && !gx_bridge::ArchivesReady()) {
                 for (uint32_t k = 0; k < 24; ++k) {
                     const uint32_t e = arcBase + k * 84u;
                     if (!Memory::Contains(e + 904u, 4)) break;
                     const uint32_t h = Memory::Read32(e + 824u);
-                    if (k < 4) {
-                        char nm[24];
-                        std::memcpy(nm, Memory::GetPointer(e + 836u, 23), 23);
-                        nm[23] = 0;
-                        AppLog("[Arc Preload] k=%u entry=%08X h=%08X +836='%s' +900=%08X +904=%08X\n",
-                            k, e, h, nm, Memory::Read32(e + 900u), Memory::Read32(e + 904u));
-                    }
                     if (h < 0x80000000u || !Memory::Contains(h, 28)) break;
                     scanned = k + 1;
                 }
                 AppLog("[Arc Preload] %u plausible entries\n", scanned);
-                for (uint32_t pass = 0; pass < 12 && !gx_bridge::ArchivesReady(); ++pass) {
-                    for (uint32_t k = 0; k < scanned; ++k) {
-                        CpuContext pumpCtx = *cpu;
-                        pumpCtx.gpr[3] = k;
-                        CpuContextScope pumpScope(&pumpCtx);
-                        func_80540038(&pumpCtx);
-                    }
-                }
-                AppLog("[Arc Preload] done - ready=%d frame=%u\n",
-                    gx_bridge::ArchivesReady() ? 1 : 0, gx_bridge::g_gxFrame);
-            }
-        }
-        SetUpBootRaceScenario(0x08);
-        // func_805A8468 only creates the RaceCameraMgr when *(racedata + 0xB70) == 11; our forced
-        // boot never goes through the menu flow that sets it, so it stays 0 and the camera manager
-        // is never allocated - which is why *(0x809C1998) is NULL and the view never leaves the
-        // opening pan. Set the mode the race camera setup expects.
-        {
-            const uint32_t rd = Memory::Read32(0x809BD748u);
-            if (rd && Memory::Contains(rd + 2928u, 4)) {
-                AppLog("[CamMode] boot: racedata=%08X +2928 was %u -> 11\n",
-                    rd, Memory::Read32(rd + 2928u));
-                Memory::Write32(rd + 2928u, 11u);
             }
         }
         if (sectionMgr != 0) {
@@ -5047,7 +5040,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             CpuContextScope scope(&padCtx);
             InvokeIndirectCpu(0x8061B490u, &padCtx);
         }
-        cpu->gpr[3] = 0x20; // kSectionP1Vs
+        cpu->gpr[3] = 0x20;
         return true;
     }
     case 0x8072624Cu: // KartAIController::IsCPU
