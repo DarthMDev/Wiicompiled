@@ -869,6 +869,9 @@ static uint32_t g_tracedArchiveMgr = 0;
 // panic-retry loop (measured: 134M calls). Count per caller so the loop is visible.
 static std::map<uint32_t, uint32_t> g_panicSites;
 static uint32_t g_panicTotal = 0;
+// Dispatch accounting for one address: how many times handle_startup_hle is entered with it vs how
+// many times its case body actually runs. If these differ, something between the two intercepts it.
+
 // Watch window for the ArchiveMgr entry table (set by the [ArcState] dump) so the HLE trace can
 // report every function that is handed an archive entry pointer during the load window.
 static uint32_t g_watchArcEntries = 0;
