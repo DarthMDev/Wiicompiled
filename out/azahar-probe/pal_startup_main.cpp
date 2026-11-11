@@ -5395,30 +5395,6 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             ReportWorkingSet("Frame 600 Stable");
             std::fflush(stdout);
         }
-        static bool s_transitionTriggered = false;
-        if (!s_transitionTriggered && s_frameCount >= 200) {
-            const uint32_t sm = Memory::Read32(0x809C1E38u);
-            if (sm != 0 && Memory::Read32(sm + 4) == 0x15) {
-                s_transitionTriggered = true;
-                AppLog("[Transition] Frame %u: Triggering transition on active SectionMgr=%08X (curSec=%u)\n",
-                    s_frameCount, sm, Memory::Read32(sm + 4));
-                SetUpBootRaceScenario(0x08);
-                CpuContext transCtx = *cpu;
-                transCtx.gpr[3] = sm;
-                transCtx.gpr[4] = 0x20; // SECTION_P1_VS
-                transCtx.gpr[5] = 0;    // anim
-                CpuContextScope scope(&transCtx);
-                InvokeIndirectCpu(0x80635A3Cu, &transCtx);
-                // Trigger transition in SectionMgr (func_80635B2C)
-                Memory::Write32(sm + 48, 1);   // state = transitioning
-                Memory::Write32(sm + 28, 0);   // delay = 0 frames
-                Memory::Write32(sm + 40, 255); // fade color / alpha
-                AppLog("[Transition] SectionMgr transition initiated! nextSection=%u state=%u\n",
-                    Memory::Read32(sm + 12), Memory::Read32(sm + 48));
-                std::fflush(stdout);
-            }
-        }
-
         // The RaceCameraMgr is never allocated in this boot path: func_805A8468 only creates it
         // when *(racedata+0xB70) == 11, and even with that satisfied the call is not reached.
         // func_805A0A1C allocates 44 bytes and installs itself at *(0x809C1998), so create it here
