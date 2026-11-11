@@ -44,6 +44,7 @@ extern "C" void func_805A900C(CpuContext*);
 extern "C" void func_8052A954(CpuContext*);
 extern "C" void func_80540038(CpuContext*);
 extern "C" void func_805B9344(CpuContext*);
+extern "C" void func_805E889C(CpuContext*);
 extern "C" void func_805E78F0(CpuContext*);
 extern "C" void func_80577064(CpuContext*);
 extern "C" void func_805A0A1C(CpuContext*);
@@ -5053,6 +5054,30 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
         return true;
     }
+    case 0x805E889Cu: { // ControlLoader: bind a control's panes to its loaded ".brlyt"
+        // The name in gpr[4] points into the resource image the caller just fetched, so an empty
+        // name means the fetch returned NULL (the archive behind this accessor never finished
+        // loading - see the "ARCInitHandle: bad archive format" mounts at the same frame).
+        // func_805E889C then walks the layout's pane list at +0x14, which is still NULL, so nw4r
+        // raises LinkList.h:573; because VPanic is downgraded to a warning the guest re-enters the
+        // same NULL walk forever (measured: 5M panics per 10M dispatches, frame never completes).
+        // Leaving the build out keeps the layout in the empty state its constructor produced,
+        // where every sub-list is self-terminating.
+        const uint32_t lay = cpu ? cpu->gpr[3] : 0;
+        const uint32_t nm = cpu ? cpu->gpr[4] : 0;
+        const bool hasName = nm && Memory::Contains(nm, 1) && *Memory::GetPointer(nm, 1) != 0;
+        if (!hasName) {
+            static std::set<uint32_t> s_skipped;
+            if (s_skipped.size() < 8 && s_skipped.insert(lay).second) {
+                AppLog("[ControlLoader] no resource for lay=%08X acc=%08X frame=%u - keeping the layout empty\n",
+                    lay, (lay && Memory::Contains(lay + 40, 4)) ? Memory::Read32(lay + 36) : 0,
+                    gx_bridge::g_gxFrame);
+            }
+            return true;
+        }
+        func_805E889C(cpu);
+        return true;
+    }
     case 0x805E78F0u: { // nw4r LinkList sort (recursive). A malformed list makes it recurse forever.
         // nw4r's sort panics with "Pointer must not be NULL" when the list linkage is broken, and
         // because we downgrade VPanic to a warning the guest keeps recursing into itself
@@ -5079,18 +5104,19 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         //         patching by hand (racedata+0xB70, player counts, kart ids, camera mode) is
         //         produced by it.
         // true  = the old shortcut: force section 0x20 (kSectionP1Vs) and jump straight into a race.
-        // Currently left ON: with it off the game advances out of section 0x15 and dies in
-        // nw4r LinkList (NULL list) because the menu/UI scaffold is not constructed yet - that is
-        // the intro -> menu -> character select workstream. Flip to false to continue that work.
+        // Left false: the natural path now runs past the section-0x15 layout build (see the
+        // 0x805E889C case) instead of stalling in nw4r's LinkList walk at frame 84.
         constexpr bool kForceRaceSection = false;
+        bool forceRace = kForceRaceSection;
+        if (const char* e = std::getenv("MKW_FORCE_RACE")) forceRace = (e[0] == '1');
 
         const uint32_t sectionMgr = Memory::Read32(0x809C1E38u);
         AppLog("[BootPath] ArgumentParser::parse frame=%u sm=%08X curSec=%d lr=%08X forceRace=%d\n",
             gx_bridge::g_gxFrame, sectionMgr,
             sectionMgr ? static_cast<int32_t>(Memory::Read32(sectionMgr + 4)) : -1,
-            cpu ? cpu->lr : 0, kForceRaceSection ? 1 : 0);
+            cpu ? cpu->lr : 0, forceRace ? 1 : 0);
 
-        if (!kForceRaceSection) {
+        if (!forceRace) {
             // Run the real parser and report what section the game itself picked.
             func_805B9344(cpu);
             AppLog("[BootPath] real parser -> section %d (sm curSec=%d)\n",
