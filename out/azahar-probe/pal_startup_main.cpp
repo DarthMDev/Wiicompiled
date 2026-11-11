@@ -841,8 +841,10 @@ static void MulAffine3x4(const float* a, const float* b, float* out) {
 }
 static void BuildDebugCamera(float* out /*12 floats, GX row-major 3x4*/) {
     const float tx = -20115.0f, ty = 470.4f, tz = 25750.0f;
-    const float ex = tx, ey = ty + 260.0f, ez = tz - 900.0f;   // behind the grid (Z-), above it
-    float f[3] = {tx - ex, ty - ey, tz - ez};
+    // Chase framing: one kart-length behind and above the first grid slot, looking down the track.
+    const float ex = tx, ey = ty + 115.0f, ez = tz - 330.0f;
+    const float lookY = ty + 55.0f, lookZ = tz + 260.0f;
+    float f[3] = {tx - ex, lookY - ey, lookZ - ez};
     float fl = std::sqrt(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
     if (fl <= 1e-6f) { fl = 1.0f; }
     f[0] /= fl; f[1] /= fl; f[2] /= fl;
@@ -1873,8 +1875,10 @@ static void HandleLoadXfReg(uint16_t baseAddr, uint16_t count, const uint8_t* da
             const uint32_t lightMask = (ctrl >> 2) & 0xFu;
             g_gx.lightEnabled = enable && lightMask != 0;
             static uint32_t s_lastCtrl = 0xFFFFFFFFu;
-            if (ctrl != s_lastCtrl) {
+            static uint32_t s_lastLightLogFrame = 0;
+            if (ctrl != s_lastCtrl && g_gxFrame >= s_lastLightLogFrame + 60) {
                 s_lastCtrl = ctrl;
+                s_lastLightLogFrame = g_gxFrame;
                 AppLog("[GX Light] chanCtrl0=%08X enable=%u mask=%u lightEnabled=%u dir=(%g,%g,%g) col=%u,%u,%u frame=%u\n",
                     ctrl, enable ? 1u : 0u, lightMask, g_gx.lightEnabled ? 1u : 0u,
                     g_gx.light0Dir[0], g_gx.light0Dir[1], g_gx.light0Dir[2],
@@ -3995,12 +3999,6 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             gx_bridge::g_gx.vtxArray[attr].stride = static_cast<uint8_t>(cpu->gpr[5] & 0xFFu);
         }
         return true;
-    }
-    case 0x80172FD8u:
-    case 0x801730CCu: {
-        AppLog("[GX Probe] target=%08X r3=%08X r4=%08X frame=%u\n",
-            target, cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0, gx_bridge::g_gxFrame);
-        return false;
     }
     case 0x8017301Cu: { // GXSetProjection(mtxAddr, type)
         uint32_t mtxAddr = cpu->gpr[3];
