@@ -809,8 +809,37 @@ static void SanitizeModelViewMatrix(float* m) {
 }
 
 // PresentFrameTo3DS numbers frames from 1.
-static constexpr uint32_t kGxTraceFrame = 120;
+// Per-draw tracing is only useful for offline debugging. Enabling it costs ~6800 console
+// lines in a SINGLE frame (3385 draws x 2 lines) which stalls the device for minutes, so it is
+// switched off by default. Set to a real frame number to debug a specific frame.
+static constexpr uint32_t kGxTraceFrame = 0xFFFFFFFFu;
 static uint32_t g_gxFrame = 1;
+// --- Debug chase camera -------------------------------------------------------------
+// The guest never registers a race camera in this boot path (the camera manager stays empty),
+// so the view is stuck in the opening flyover. Build a look-at camera ourselves and use it for
+// perspective draws. Coordinates come from Luigi Circuit KTPT 0: (-20115, 470.4, 25750).
+// Set kDebugCamera = false to go back to the guest's own matrices.
+static constexpr bool kDebugCamera = true;
+static void BuildDebugCamera(float* out /*12 floats, GX row-major 3x4*/) {
+    const float tx = -20115.0f, ty = 470.4f, tz = 25750.0f;
+    const float ex = tx, ey = ty + 260.0f, ez = tz - 900.0f;   // behind the grid (Z-), above it
+    float f[3] = {tx - ex, ty - ey, tz - ez};
+    float fl = std::sqrt(f[0]*f[0] + f[1]*f[1] + f[2]*f[2]);
+    if (fl <= 1e-6f) { fl = 1.0f; }
+    f[0] /= fl; f[1] /= fl; f[2] /= fl;
+    // right = f x up(world Y)
+    float r[3] = { f[1]*0.0f - f[2]*1.0f, f[2]*0.0f - f[0]*0.0f, f[0]*1.0f - f[1]*0.0f };
+    float rl = std::sqrt(r[0]*r[0] + r[1]*r[1] + r[2]*r[2]);
+    if (rl <= 1e-6f) { r[0] = 1.0f; r[1] = 0.0f; r[2] = 0.0f; rl = 1.0f; }
+    r[0] /= rl; r[1] /= rl; r[2] /= rl;
+    // up = r x f
+    float u[3] = { r[1]*f[2] - r[2]*f[1], r[2]*f[0] - r[0]*f[2], r[0]*f[1] - r[1]*f[0] };
+    out[0] = r[0]; out[1]  = r[1]; out[2]  = r[2]; out[3]  = -(r[0]*ex + r[1]*ey + r[2]*ez);
+    out[4] = u[0]; out[5]  = u[1]; out[6]  = u[2]; out[7]  = -(u[0]*ex + u[1]*ey + u[2]*ez);
+    out[8] = -f[0]; out[9] = -f[1]; out[10] = -f[2]; out[11] = (f[0]*ex + f[1]*ey + f[2]*ez);
+}
+
+
 // ArchiveMgr instance captured on the first GetFile call; used by the per-frame [ArcState] dump.
 static uint32_t g_tracedArchiveMgr = 0;
 // Watch window for the ArchiveMgr entry table (set by the [ArcState] dump) so the HLE trace can
@@ -1232,7 +1261,11 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
     const bool tracePerspective = (g_gxFrame == kGxTraceFrame) && g_gx.projType == 0;
     const float* rawMv = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
     float mv[12];
-    std::memcpy(mv, rawMv, sizeof(mv));
+    if (kDebugCamera && g_gx.projType == 0) {
+        BuildDebugCamera(mv);
+    } else {
+        std::memcpy(mv, rawMv, sizeof(mv));
+    }
     if (g_gx.projType == 1) {
         // In 2D ortho mode, enforce clean 2D identity modelview
         mv[0] = 1.0f; mv[1] = 0.0f; mv[2] = 0.0f; mv[3] = 0.0f;
@@ -1817,6 +1850,7 @@ static void HandleLoadIndx(uint8_t cmd, const uint8_t* d) {
         HandleLoadXfReg(static_cast<uint16_t>(xfDest), static_cast<uint16_t>(count), srcPtr);
     }
 }
+
 
 static void ExecutePrimitive(uint8_t primCmd, uint16_t vtxCount, const uint8_t*& p) {
     if (!RasterThisFrame()) { ++g_gx.drawCallsSkipped; return; }
@@ -2592,6 +2626,25 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 AppLog("[ArcNew] frame=%u target=%08X lr=%08X r3=%08X r4=%08X\n",
                     gx_bridge::g_gxFrame, target, cpu ? cpu->lr : 0,
                     cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0);
+            }
+        }
+    }
+    // Camera watch: who touches RaceCameraMgr (*(0x809C1998)) or its embedded camera container
+    // (mgr+16)? The container is empty, so the function that should register the kart cameras
+    // either never runs or runs without the manager.
+    if (cpu && gx_bridge::g_gxFrame >= 84 && gx_bridge::g_gxFrame <= 400) {
+        const uint32_t camMgr = Memory::Read32(0x809C1998u);
+        if (camMgr) {
+            static std::set<uint32_t> s_seenCamTargets;
+            bool hit = false;
+            for (int r = 3; r <= 6 && !hit; ++r) {
+                const uint32_t v = cpu->gpr[r];
+                if (v == camMgr || v == camMgr + 16u) hit = true;
+            }
+            if (hit && s_seenCamTargets.size() < 48 && s_seenCamTargets.insert(target).second) {
+                AppLog("[CamWatch] frame=%u target=%08X lr=%08X r3=%08X r4=%08X count=%u\n",
+                    gx_bridge::g_gxFrame, target, cpu->lr, cpu->gpr[3], cpu->gpr[4],
+                    Memory::Contains(camMgr + 32u, 4) ? Memory::Read32(camMgr + 32u) : 0xFFFFFFFFu);
             }
         }
     }
