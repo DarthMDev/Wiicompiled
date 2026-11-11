@@ -30,6 +30,7 @@ extern "C" void func_805A900C(CpuContext*);
 extern "C" void func_8052A954(CpuContext*);
 extern "C" void func_80540038(CpuContext*);
 extern "C" void func_805B9344(CpuContext*);
+extern "C" void func_805E78F0(CpuContext*);
 extern "C" void func_80577064(CpuContext*);
 extern "C" void func_805A0A1C(CpuContext*);
 extern "C" void func_805A8468(CpuContext*);
@@ -864,6 +865,10 @@ static void BuildDebugCamera(float* out /*12 floats, GX row-major 3x4*/) {
 
 // ArchiveMgr instance captured on the first GetFile call; used by the per-frame [ArcState] dump.
 static uint32_t g_tracedArchiveMgr = 0;
+// Panic-site histogram. nw4r panics are downgraded to warnings, so a failing lookup turns into a
+// panic-retry loop (measured: 134M calls). Count per caller so the loop is visible.
+static std::map<uint32_t, uint32_t> g_panicSites;
+static uint32_t g_panicTotal = 0;
 // Watch window for the ArchiveMgr entry table (set by the [ArcState] dump) so the HLE trace can
 // report every function that is handed an archive entry pointer during the load window.
 static uint32_t g_watchArcEntries = 0;
@@ -2293,6 +2298,16 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
         const float* m0 = g_gx.pnMtx[0];
         AppLog("[GX Stats Frame %u] draws=%u tris=%u quads2D=%u dls=%u texCache=%zuKB\n",
             frameNumber, g_gx.drawCallsThisFrame, g_gx.trisThisFrame, g_gx.quads2DThisFrame, g_gx.dlCallsThisFrame, g_texCacheBytes / 1024);
+        if (gx_bridge::g_panicTotal != 0 && (frameNumber % 200 == 0)) {
+            std::string sites;
+            uint32_t shown = 0;
+            for (const auto& kv : gx_bridge::g_panicSites) {
+                if (shown++ >= 6) break;
+                sites += " " + std::to_string(kv.first) + "x" + std::to_string(kv.second);
+            }
+            AppLog("[PanicLoop] frame=%u total=%u sites:%s\n",
+                frameNumber, gx_bridge::g_panicTotal, sites.c_str());
+        }
         AppLog("[GX Mtx Frame %u] loadCalls=%u xfWrites=%u nonIdentity=%u curPn=%u camUpdate=%u m0 r0=(%g,%g,%g,%g) r1=(%g,%g,%g,%g) r2=(%g,%g,%g,%g)\n",
             frameNumber, g_gx.mtxLoadCalls, g_gx.xfMtxWrites, g_gx.mtxNonIdentity,
             g_gx.currentPnMtx, g_gx.camUpdateCalls,
@@ -2695,6 +2710,35 @@ static const CourseModelTrace* FindTracedModelFilename(uint32_t address) {
 
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
+    // Stack-depth guard. Each recompiled guest frame consumes ~4 KB of host stack (0xF20 in the
+    // prologue), so a guest loop that recurses a few thousand deep overflows the stack and dies
+    // with an opaque SIGSEGV in ___chkstk_darwin. Track high-water usage and log the cycle that
+    // drives it instead of crashing.
+    {
+        static uintptr_t s_stackBase = 0;
+        static bool s_reported = false;
+        uint8_t probe;
+        const uintptr_t sp = reinterpret_cast<uintptr_t>(&probe);
+        if (s_stackBase == 0 || sp > s_stackBase) s_stackBase = sp;
+        const uintptr_t used = s_stackBase - sp;
+        if (used > 5u * 1024u * 1024u && !s_reported) {
+            s_reported = true;
+            AppLog("[StackGuard] used=%zuKB target=%08X lr=%08X pc=%08X frame=%u\n",
+                static_cast<size_t>(used / 1024), target,
+                cpu ? cpu->lr : 0, cpu ? cpu->pc : 0, gx_bridge::g_gxFrame);
+            std::fflush(stdout);
+        }
+        if (used > 7u * 1024u * 1024u) {
+            static uint32_t s_dumpCount = 0;
+            if (s_dumpCount < 40) {
+                ++s_dumpCount;
+                AppLog("[StackGuard] refusing deeper call target=%08X lr=%08X\n",
+                    target, cpu ? cpu->lr : 0);
+            }
+            if (cpu) cpu->gpr[3] = 0;
+            return true;
+        }
+    }
     // First-appearance filter for the archive-load window. The ArchiveMgr entries flip 0 -> 4
     // between frames ~84 and ~100, but no call that receives an archive pointer happens after
     // frame 84 and no task job runs in that window. So build a baseline of everything called at
@@ -3277,6 +3321,10 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         std::string fileStr = "unknown", msgStr = "unknown";
         if (file && Memory::Contains(file, 1)) fileStr = reinterpret_cast<const char*>(Memory::GetPointer(file, 1));
         if (msg && Memory::Contains(msg, 1)) msgStr = reinterpret_cast<const char*>(Memory::GetPointer(msg, 1));
+        if (cpu) {
+            ++gx_bridge::g_panicTotal;
+            ++gx_bridge::g_panicSites[cpu->lr];
+        }
         static int s_panicPrints = 0;
         if (++s_panicPrints <= 10) {
             AppLog("[NW4R Panic] %s:%u (caller lr=%08X): %s\n", fileStr.c_str(), line, cpu ? cpu->lr : 0, msgStr.c_str());
@@ -4979,6 +5027,30 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             AppLog("[Arc Load] handle=%08X name='%s' steps=%d seq=%s frame=%u reqLr=%08X\n",
                 a3, nm.c_str(), iter + 1, seq.c_str(), gx_bridge::g_gxFrame, reqLr);
         }
+        return true;
+    }
+    case 0x805E78F0u: { // nw4r LinkList sort (recursive). A malformed list makes it recurse forever.
+        // nw4r's sort panics with "Pointer must not be NULL" when the list linkage is broken, and
+        // because we downgrade VPanic to a warning the guest keeps recursing into itself
+        // (0x805E7A34 -> func_805E78F0) until the host stack overflows. Bound the recursion: past a
+        // sane depth just return, leaving the list order untouched.
+        static uint32_t s_sortDepth = 0;
+        static uint32_t s_sortHits = 0;
+        if (++s_sortHits <= 3) {
+            AppLog("[LinkList] sort ENTER depth=%u r3=%08X frame=%u\n",
+                s_sortDepth, cpu ? cpu->gpr[3] : 0, gx_bridge::g_gxFrame);
+        }
+        if (s_sortDepth > 32u) {
+            static uint32_t s_skipped = 0;
+            if (++s_skipped <= 4) {
+                AppLog("[LinkList] sort recursion depth exceeded - skipping sort (frame=%u)\n",
+                    gx_bridge::g_gxFrame);
+            }
+            return true;
+        }
+        ++s_sortDepth;
+        func_805E78F0(cpu);
+        --s_sortDepth;
         return true;
     }
     case 0x805B9344u: { // ArgumentParser::parse
