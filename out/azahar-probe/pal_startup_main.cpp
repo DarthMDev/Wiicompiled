@@ -820,6 +820,18 @@ static uint32_t g_gxFrame = 1;
 // perspective draws. Coordinates come from Luigi Circuit KTPT 0: (-20115, 470.4, 25750).
 // Set kDebugCamera = false to go back to the guest's own matrices.
 static constexpr bool kDebugCamera = true;
+
+// out = a * b for two GX-style row-major 3x4 affine matrices (a applied after b).
+static void MulAffine3x4(const float* a, const float* b, float* out) {
+    for (int row = 0; row < 3; ++row) {
+        const float a0 = a[row * 4 + 0], a1 = a[row * 4 + 1];
+        const float a2 = a[row * 4 + 2], a3 = a[row * 4 + 3];
+        out[row * 4 + 0] = a0 * b[0] + a1 * b[4] + a2 * b[8];
+        out[row * 4 + 1] = a0 * b[1] + a1 * b[5] + a2 * b[9];
+        out[row * 4 + 2] = a0 * b[2] + a1 * b[6] + a2 * b[10];
+        out[row * 4 + 3] = a0 * b[3] + a1 * b[7] + a2 * b[11] + a3;
+    }
+}
 static void BuildDebugCamera(float* out /*12 floats, GX row-major 3x4*/) {
     const float tx = -20115.0f, ty = 470.4f, tz = 25750.0f;
     const float ex = tx, ey = ty + 260.0f, ez = tz - 900.0f;   // behind the grid (Z-), above it
@@ -1262,7 +1274,14 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
     const float* rawMv = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
     float mv[12];
     if (kDebugCamera && g_gx.projType == 0) {
-        BuildDebugCamera(mv);
+        // Compose: debug view * the object's own model matrix. Replacing the matrix outright
+        // discards per-object transforms, which puts every kart at the wrong place.
+        float view[12];
+        BuildDebugCamera(view);
+        float model[12];
+        std::memcpy(model, rawMv, sizeof(model));
+        SanitizeModelViewMatrix(model);
+        MulAffine3x4(view, model, mv);
     } else {
         std::memcpy(mv, rawMv, sizeof(mv));
     }
