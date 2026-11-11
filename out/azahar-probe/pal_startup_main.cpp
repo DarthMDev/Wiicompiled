@@ -30,6 +30,8 @@ extern "C" void func_805A900C(CpuContext*);
 extern "C" void func_8052A954(CpuContext*);
 extern "C" void func_80540038(CpuContext*);
 extern "C" void func_80577064(CpuContext*);
+extern "C" void func_805A0A1C(CpuContext*);
+extern "C" void func_805A8468(CpuContext*);
 extern "C" void func_80124894(CpuContext*);
 extern "C" void func_8020FA80(CpuContext*);
 extern "C" void func_8004C240(CpuContext*);
@@ -4886,6 +4888,18 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             }
         }
         SetUpBootRaceScenario(0x08);
+        // func_805A8468 only creates the RaceCameraMgr when *(racedata + 0xB70) == 11; our forced
+        // boot never goes through the menu flow that sets it, so it stays 0 and the camera manager
+        // is never allocated - which is why *(0x809C1998) is NULL and the view never leaves the
+        // opening pan. Set the mode the race camera setup expects.
+        {
+            const uint32_t rd = Memory::Read32(0x809BD748u);
+            if (rd && Memory::Contains(rd + 2928u, 4)) {
+                AppLog("[CamMode] boot: racedata=%08X +2928 was %u -> 11\n",
+                    rd, Memory::Read32(rd + 2928u));
+                Memory::Write32(rd + 2928u, 11u);
+            }
+        }
         if (sectionMgr != 0) {
             Memory::Write32(sectionMgr + 4, 0x20); // Force current = 0x20 (kSectionP1Vs)
             Memory::Write32(sectionMgr + 12, 0x20); // Force next = 0x20
@@ -4913,8 +4927,43 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         func_805A8FBC(cpu);
         return true;
     }
+    case 0x805A0A1Cu: { // RaceCameraMgr ctor/init - this is what stores *(0x809C1998)
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            AppLog("[CamInit] RaceCameraMgr init CALLED frame=%u r3=%08X\n",
+                gx_bridge::g_gxFrame, cpu ? cpu->gpr[3] : 0);
+        }
+        func_805A0A1C(cpu);
+        return true;
+    }
+    case 0x805A8468u: { // caller of the camera-mgr init
+        static bool s_logged2 = false;
+        if (!s_logged2) {
+            s_logged2 = true;
+            const uint32_t rd = Memory::Read32(0x809BD748u);
+            AppLog("[CamInit] camera-setup root CALLED frame=%u rd=%08X rd+2928=%u (+2932=%u)\n",
+                gx_bridge::g_gxFrame, rd,
+                (rd && Memory::Contains(rd + 2928, 4)) ? Memory::Read32(rd + 2928) : 0xFFFFFFFFu,
+                (rd && Memory::Contains(rd + 2932, 4)) ? Memory::Read32(rd + 2932) : 0xFFFFFFFFu);
+        }
+        func_805A8468(cpu);
+        return true;
+    }
     case 0x805A900Cu: { // RaceCameraMgr::Update - must run every frame
         ++gx_bridge::g_gx.camUpdateCalls;
+        // RaceCameraMgr::Update reads the camera-manager POINTER from *(0x809C1998) and a camera
+        // MODE BYTE from 0x809C19A0, then calls func_805A0FA0(mgr, mode). Log both: the view has
+        // never left the opening pan, so we need to see which mode the game thinks it is in.
+        static uint32_t s_lastCamLog = 0;
+        const uint32_t camFrame = gx_bridge::g_gxFrame;
+        if (camFrame % 40 == 0 && s_lastCamLog != camFrame) {
+            s_lastCamLog = camFrame;
+            AppLog("[CamMode] frame=%u camMgr=%08X mode=%u r1874=%08X\n",
+                camFrame, Memory::Read32(0x809C1998u),
+                Memory::Contains(0x809C19A0u, 1) ? Memory::Read8(0x809C19A0u) : 0xFFFFu,
+                Memory::Read32(0x809C1874u));
+        }
         func_805A900C(cpu);
         return true;
     }
@@ -5113,6 +5162,24 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                     Memory::Read32(sm + 12), Memory::Read32(sm + 48));
                 std::fflush(stdout);
             }
+        }
+
+        // The RaceCameraMgr is never allocated in this boot path: func_805A8468 only creates it
+        // when *(racedata+0xB70) == 11, and even with that satisfied the call is not reached.
+        // func_805A0A1C allocates 44 bytes and installs itself at *(0x809C1998), so create it here
+        // once, then let RaceCameraMgr::Update drive it.
+        static bool s_camBootTried = false;
+        if (!s_camBootTried && s_frameCount >= 88 && Memory::Read32(0x809C1998u) == 0) {
+            s_camBootTried = true;
+            CpuContext camCtx = *cpu;
+            camCtx.gpr[3] = 0;
+            {
+                CpuContextScope camScope(&camCtx);
+                func_805A0A1C(&camCtx);
+            }
+            AppLog("[CamBoot] frame=%u created camMgr=%08X\n",
+                s_frameCount, Memory::Read32(0x809C1998u));
+            std::fflush(stdout);
         }
 
         // FINDING (documented in docs/CLAUDE_FABLE_52_TASK.md O2): section 32 init runs at frame ~84
