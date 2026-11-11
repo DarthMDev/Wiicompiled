@@ -2606,6 +2606,154 @@ static uint32_t FindU8Resource(uint32_t arcBase, const char* targetName, uint32_
     return 0;
 }
 
+static const uint8_t* FindHostU8Resource(const std::vector<uint8_t>& arc, const char* targetName,
+                                        uint32_t* outSize = nullptr) {
+    if (arc.size() < 0x20 || gx_bridge::ReadBE32(arc.data()) != 0x55AA382Du) return nullptr;
+    const uint32_t root = gx_bridge::ReadBE32(arc.data() + 4);
+    if (root > arc.size() || arc.size() - root < 12) return nullptr;
+    const uint32_t count = gx_bridge::ReadBE32(arc.data() + root + 8);
+    if (count > (arc.size() - root) / 12) return nullptr;
+    const size_t strings = static_cast<size_t>(root) + static_cast<size_t>(count) * 12;
+    if (strings > arc.size()) return nullptr;
+    for (uint32_t i = 0; i < count; ++i) {
+        const size_t node = static_cast<size_t>(root) + static_cast<size_t>(i) * 12;
+        if (arc[node] != 0) continue;
+        const uint32_t nameOff = (static_cast<uint32_t>(arc[node + 1]) << 16) |
+                                 (static_cast<uint32_t>(arc[node + 2]) << 8) | arc[node + 3];
+        const size_t name = strings + nameOff;
+        if (name >= arc.size()) continue;
+        size_t end = name;
+        while (end < arc.size() && arc[end] != 0) ++end;
+        if (end == arc.size()) continue;
+        const std::string nodeName(reinterpret_cast<const char*>(arc.data() + name), end - name);
+        if (strcasecmp(nodeName.c_str(), targetName) != 0) continue;
+        const uint32_t offset = gx_bridge::ReadBE32(arc.data() + node + 4);
+        const uint32_t size = gx_bridge::ReadBE32(arc.data() + node + 8);
+        if (offset > arc.size() || size > arc.size() - offset) return nullptr;
+        if (outSize) *outSize = size;
+        return arc.data() + offset;
+    }
+    return nullptr;
+}
+
+static uint32_t LoadMenuOtherResource(const char* requestedName, uint32_t* outSize) {
+    struct CachedResource { const char* name; uint32_t address; uint32_t size; };
+    static CachedResource s_resources[] = {
+        {"OptionBG.brctr", 0, 0},
+        {"option_bg.brlyt", 0, 0},
+        {"option_bg_Loop.brlan", 0, 0},
+    };
+    static bool s_loaded = false;
+    if (s_loaded) {
+        for (const auto& resource : s_resources) {
+            if (strcasecmp(requestedName, resource.name) == 0 && resource.address) {
+                if (outSize) *outSize = resource.size;
+                return resource.address;
+            }
+        }
+        return 0;
+    }
+
+    const char* paths[] = {
+#ifdef __3DS__
+        "sdmc:/mkwii/Scene/UI/MenuOther.szs",
+#endif
+        "../../Assets/extracted-rmcp01/DATA/files/Scene/UI/MenuOther.szs",
+        "Assets/extracted-rmcp01/DATA/files/Scene/UI/MenuOther.szs"
+    };
+    std::FILE* file = nullptr;
+    for (const char* path : paths) {
+        file = std::fopen(path, "rb");
+        if (file) break;
+    }
+    if (!file) return 0;
+    std::fseek(file, 0, SEEK_END);
+    const long fileSize = std::ftell(file);
+    std::fseek(file, 0, SEEK_SET);
+    if (fileSize < 16) { std::fclose(file); return 0; }
+    std::vector<uint8_t> compressed;
+    try {
+        compressed.resize(static_cast<size_t>(fileSize));
+    } catch (...) {
+        std::fclose(file);
+        return 0;
+    }
+    if (std::fread(compressed.data(), 1, compressed.size(), file) != compressed.size()) {
+        std::fclose(file);
+        return 0;
+    }
+    std::fclose(file);
+
+    if (std::memcmp(compressed.data(), "Yaz0", 4) != 0) return 0;
+    const uint32_t expandedSize = gx_bridge::ReadBE32(compressed.data() + 4);
+    if (expandedSize == 0 || expandedSize > 16u * 1024u * 1024u) return 0;
+    std::vector<uint8_t> archive;
+    try {
+        archive.resize(expandedSize);
+    } catch (...) {
+        return 0;
+    }
+    size_t src = 16;
+    size_t dst = 0;
+    while (dst < archive.size() && src < compressed.size()) {
+        uint8_t flags = compressed[src++];
+        for (int bit = 7; bit >= 0 && dst < archive.size(); --bit) {
+            if (flags & (1u << bit)) {
+                if (src >= compressed.size()) return 0;
+                archive[dst++] = compressed[src++];
+                continue;
+            }
+            if (src + 1 >= compressed.size()) return 0;
+            const uint8_t a = compressed[src++];
+            const uint8_t b = compressed[src++];
+            const size_t distance = (((static_cast<size_t>(a) & 0x0Fu) << 8) | b) + 1;
+            size_t count = a >> 4;
+            if (count == 0) {
+                if (src >= compressed.size()) return 0;
+                count = static_cast<size_t>(compressed[src++]) + 18;
+            } else {
+                count += 2;
+            }
+            if (distance > dst) return 0;
+            for (size_t i = 0; i < count && dst < archive.size(); ++i) {
+                archive[dst] = archive[dst - distance];
+                ++dst;
+            }
+        }
+    }
+    if (dst != archive.size()) return 0;
+
+    // PAL Race_E.szs expands to 1,195,840 bytes in a 1,310,720-byte reserved slot;
+    // this final 64 KiB of the dedicated race buffer is outside the archive's data.
+    constexpr uint32_t kMenuResourceAddress = kRaceSzsBase + kRaceSzsSize - 0x10000u;
+    constexpr uint32_t kMenuResourceCapacity = 0x10000u;
+    uint32_t cursor = 0;
+    for (auto& cached : s_resources) {
+        uint32_t resourceSize = 0;
+        const uint8_t* resource = FindHostU8Resource(archive, cached.name, &resourceSize);
+        if (!resource || resourceSize == 0 || resourceSize > 0x1000) continue;
+        cursor = (cursor + 31u) & ~31u;
+        if (cursor > kMenuResourceCapacity || resourceSize > kMenuResourceCapacity - cursor) return 0;
+        const uint32_t guestAddress = kMenuResourceAddress + cursor;
+        uint8_t* guest = Memory::GetPointer(guestAddress, resourceSize);
+        if (!guest) return 0;
+        std::memcpy(guest, resource, resourceSize);
+        cached.address = guestAddress;
+        cached.size = resourceSize;
+        cursor += resourceSize;
+        AppLog("[MenuResource] Extracted %s from MenuOther.szs to %08X (size=%u)\n",
+            cached.name, guestAddress, resourceSize);
+    }
+    s_loaded = true;
+    for (const auto& resource : s_resources) {
+        if (strcasecmp(requestedName, resource.name) == 0 && resource.address) {
+            if (outSize) *outSize = resource.size;
+            return resource.address;
+        }
+    }
+    return 0;
+}
+
 static uint32_t g_raceSzsBase = 0;
 static uint32_t g_raceESzsBase = 0;
 
@@ -2919,6 +3067,17 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                     AppLog("[U8 GetResource HLE] Decompressed-archive fallback found '%s' in %08X at %08X (size=%u)\n",
                         name, arcData, found, foundSize);
                 }
+                return true;
+            }
+        }
+        if (strcasecmp(name, "OptionBG.brctr") == 0 ||
+            strcasecmp(name, "option_bg.brlyt") == 0 ||
+            strcasecmp(name, "option_bg_Loop.brlan") == 0) {
+            uint32_t foundSize = 0;
+            const uint32_t found = LoadMenuOtherResource(name, &foundSize);
+            if (found) {
+                cpu->gpr[3] = found;
+                if (sizeOut && Memory::Contains(sizeOut, 4)) Memory::Write32(sizeOut, foundSize);
                 return true;
             }
         }
