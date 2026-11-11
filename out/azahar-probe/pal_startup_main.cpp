@@ -25,6 +25,10 @@ extern "C" void InitializeDataSections();
 extern "C" const uint8_t kStartupFst[], kStartupFstEnd[];
 extern "C" void func_800841B0(CpuContext*);
 extern "C" void func_805411FC(CpuContext*);
+extern "C" void func_805A8FBC(CpuContext*);
+extern "C" void func_805A900C(CpuContext*);
+extern "C" void func_8052A954(CpuContext*);
+extern "C" void func_80540038(CpuContext*);
 extern "C" void func_80124894(CpuContext*);
 extern "C" void func_8020FA80(CpuContext*);
 extern "C" void func_8004C240(CpuContext*);
@@ -667,6 +671,12 @@ struct GxState {
     float pnMtx[10][12];
     uint32_t currentPnMtx = 0;
 
+    // Per-frame diagnostics: did the guest actually push a view/model matrix this frame?
+    uint32_t mtxLoadCalls = 0;     // GXLoadPosMtxImm / GXLoadPosMtxIndx calls
+    uint32_t xfMtxWrites = 0;      // completed 12-float XF position-matrix writes
+    uint32_t mtxNonIdentity = 0;   // loads whose row0/row1 were not the sanitized identity
+    uint32_t camUpdateCalls = 0;   // RaceCameraMgr::Update calls this frame
+
     float vpLeft = 0.0f, vpTop = 0.0f, vpWidth = 608.0f, vpHeight = 456.0f;
     float vpNear = 0.0f, vpFar = 1.0f;
     uint32_t efbWidth = 608, efbHeight = 456;
@@ -797,6 +807,35 @@ static void SanitizeModelViewMatrix(float* m) {
 // PresentFrameTo3DS numbers frames from 1.
 static constexpr uint32_t kGxTraceFrame = 120;
 static uint32_t g_gxFrame = 1;
+// ArchiveMgr instance captured on the first GetFile call; used by the per-frame [ArcState] dump.
+static uint32_t g_tracedArchiveMgr = 0;
+// True when every registered ArchiveMgr group has a loaded entry (state 4 or 5), i.e. every
+// archive is usable. func_805411FC refuses entries in any other state.
+static bool ArchivesReady() {
+    if (!g_tracedArchiveMgr || !Memory::Contains(g_tracedArchiveMgr, 64)) return false;
+    const auto* mgr = reinterpret_cast<const uint8_t*>(Memory::GetPointer(g_tracedArchiveMgr, 64));
+    (void)mgr;
+    const uint32_t arrayBase = Memory::Read32(g_tracedArchiveMgr + 4);
+    if (!arrayBase || !Memory::Contains(arrayBase, 32)) return false;
+    // Only the first four groups are loaded eagerly; higher groups load lazily on demand, so
+    // requiring them would never be satisfied.
+    bool any = false;
+    for (uint32_t ty = 0; ty < 4; ++ty) {
+        const uint32_t arc = Memory::Read32(arrayBase + ty * 4);
+        if (!arc || !Memory::Contains(arc, 12)) break;
+        const uint32_t count = Memory::Read16(arc + 8);
+        const uint32_t entries = Memory::Read32(arc + 4);
+        if (!count || !entries) continue;
+        bool haveLoaded = false;
+        for (uint32_t e = 0; e < count && e < 8; ++e) {
+            if (!Memory::Contains(entries + e * 36u, 36)) break;
+            const uint32_t state = Memory::Read32(entries + e * 36u + 32);
+            if (state == 4 || state == 5) { haveLoaded = true; any = true; }
+        }
+        if (!haveLoaded) return false;
+    }
+    return any;
+}
 static uint32_t g_traceDrawOrder = 0;
 struct PerspectiveTrace {
     uint32_t nonFinite = 0;
@@ -1696,6 +1735,12 @@ static void HandleLoadXfReg(uint16_t baseAddr, uint16_t count, const uint8_t* da
                 g_gx.pnMtx[mtxIdx][comp] = ReadBEFloat(wordPtr);
                 if (comp == 11) {
                     SanitizeModelViewMatrix(g_gx.pnMtx[mtxIdx]);
+                    ++g_gx.xfMtxWrites;
+                    const float* m = g_gx.pnMtx[mtxIdx];
+                    if (m[0] != 1.0f || m[1] != 0.0f || m[2] != 0.0f ||
+                        m[4] != 0.0f || m[5] != 1.0f || m[6] != 0.0f || m[3] != 0.0f || m[7] != 0.0f) {
+                        ++g_gx.mtxNonIdentity;
+                    }
                 }
             }
         } else if (addr == 0x100Au || addr == 0x100Bu) { // AmbColor
@@ -2105,8 +2150,35 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
         }
     }
     if (frameNumber <= 20 || frameNumber % 20 == 0) {
+        const float* m0 = g_gx.pnMtx[0];
         AppLog("[GX Stats Frame %u] draws=%u tris=%u quads2D=%u dls=%u texCache=%zuKB\n",
             frameNumber, g_gx.drawCallsThisFrame, g_gx.trisThisFrame, g_gx.quads2DThisFrame, g_gx.dlCallsThisFrame, g_texCacheBytes / 1024);
+        AppLog("[GX Mtx Frame %u] loadCalls=%u xfWrites=%u nonIdentity=%u curPn=%u camUpdate=%u m0 r0=(%g,%g,%g,%g) r1=(%g,%g,%g,%g) r2=(%g,%g,%g,%g)\n",
+            frameNumber, g_gx.mtxLoadCalls, g_gx.xfMtxWrites, g_gx.mtxNonIdentity,
+            g_gx.currentPnMtx, g_gx.camUpdateCalls,
+            m0[0], m0[1], m0[2], m0[3], m0[4], m0[5], m0[6], m0[7], m0[8], m0[9], m0[10], m0[11]);
+        // ArchiveMgr entry states: func_805411FC only accepts entries whose state is 4 or 5,
+        // so this shows whether/when each archive group becomes usable.
+        if (g_tracedArchiveMgr && Memory::Contains(g_tracedArchiveMgr, 64)) {
+            const uint32_t arrayBase = Memory::Read32(g_tracedArchiveMgr + 4);
+            std::string arcOut;
+            if (arrayBase && Memory::Contains(arrayBase, 32)) {
+                for (uint32_t ty = 0; ty < 8; ++ty) {
+                    const uint32_t arc = Memory::Read32(arrayBase + ty * 4);
+                    if (!arc || !Memory::Contains(arc, 12)) break;
+                    const uint32_t count = Memory::Read16(arc + 8);
+                    const uint32_t entries = Memory::Read32(arc + 4);
+                    arcOut += " t" + std::to_string(ty) + "=[";
+                    for (uint32_t e = 0; e < count && e < 6; ++e) {
+                        if (!entries || !Memory::Contains(entries + e * 36u, 36)) break;
+                        if (e) arcOut += ",";
+                        arcOut += std::to_string(Memory::Read32(entries + e * 36u + 32));
+                    }
+                    arcOut += "]";
+                }
+            }
+            AppLog("[ArcState] frame=%u%s\n", frameNumber, arcOut.c_str());
+        }
     }
     if (frameNumber == kGxTraceFrame || (frameNumber % 20 == 0 && (g_perspectiveTrace.rasterized > 0 || g_perspectiveTrace.area > 0 || g_perspectiveTrace.nonFinite > 0))) {
         AppLog("[GX Perspective Frame %u] nonFinite=%u nearPlane=%u area=%u offscreen=%u rasterized=%u wrotePixels=%u\n",
@@ -2120,6 +2192,10 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
     g_gx.trisThisFrame = 0;
     g_gx.quads2DThisFrame = 0;
     g_gx.dlCallsThisFrame = 0;
+    g_gx.mtxLoadCalls = 0;
+    g_gx.xfMtxWrites = 0;
+    g_gx.mtxNonIdentity = 0;
+    g_gx.camUpdateCalls = 0;
     g_fifoStream.clear();
     ClearFramebuffer();
 }
@@ -3002,14 +3078,65 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         if (cpu) cpu->gpr[3] = 0;
         return true;
     }
-    case 0x805411FCu: { // ArchiveMgr::GetFile
-        const auto* trace = FindTracedModelFilename(cpu->gpr[5]);
-        if (!trace) return false;
-        const uint32_t caller = cpu->lr;
+    case 0x805411FCu: { // ArchiveMgr::GetFile(mgr, type, name, flags)
+        // func_805411FC only accepts ArchiveMgr entries whose state (entry+32) is 4 or 5:
+        //   array = *(mgr+4); arc = *(array + type*4);
+        //   count = *(u16*)(arc+8); entries = *(arc+4); stride 36
+        // When every lookup in every type returns 0, no archive group is usable and NOTHING can
+        // be loaded (karts, fonts, post effects). That is exactly the kart blocker.
+        const uint32_t namePtr = cpu->gpr[5];
         const uint32_t archiveType = cpu->gpr[4];
+        const uint32_t mgrPtr = cpu->gpr[3];
+        const uint32_t caller = cpu->lr;
+        if (!gx_bridge::g_tracedArchiveMgr) gx_bridge::g_tracedArchiveMgr = mgrPtr;
+        std::string reqName;
+        if (namePtr && Memory::Contains(namePtr, 1)) {
+            reqName = reinterpret_cast<const char*>(Memory::GetPointer(namePtr, 1));
+        }
+
+        // Compact per-type state snapshot: shows when/whether an archive group becomes usable.
+        {
+            static std::set<uint32_t> s_dumpedFrames;
+            const uint32_t f = gx_bridge::g_gxFrame;
+            if ((f < 90 || f % 100 == 0) && mgrPtr && Memory::Contains(mgrPtr, 64) &&
+                s_dumpedFrames.size() < 40 && s_dumpedFrames.insert(f).second) {
+                const uint32_t arrayBase = Memory::Read32(mgrPtr + 4);
+                std::string out;
+                if (arrayBase && Memory::Contains(arrayBase, 32)) {
+                    for (uint32_t ty = 0; ty < 8; ++ty) {
+                        const uint32_t arc = Memory::Read32(arrayBase + ty * 4);
+                        if (!arc || !Memory::Contains(arc, 12)) break;
+                        const uint32_t count = Memory::Read16(arc + 8);
+                        const uint32_t entries = Memory::Read32(arc + 4);
+                        out += " t" + std::to_string(ty) + "=[";
+                        for (uint32_t e = 0; e < count && e < 6; ++e) {
+                            if (!entries || !Memory::Contains(entries + e * 36u, 36)) break;
+                            if (e) out += ",";
+                            out += std::to_string(Memory::Read32(entries + e * 36u + 32));
+                        }
+                        out += "]";
+                    }
+                }
+                AppLog("[ArcState] frame=%u%s\n", f, out.c_str());
+            }
+        }
+
         func_805411FC(cpu);
-        AppLog("[Race Model] ArchiveMgr::GetFile %s lr=%08X type=%u brres=%08X magic=%08X\n",
-            trace->filename, caller, archiveType, cpu->gpr[3], ReadTraceWord(cpu->gpr[3]));
+        const uint32_t result = cpu->gpr[3];
+        const auto* trace = FindTracedModelFilename(namePtr);
+        if (trace) {
+            AppLog("[Race Model] ArchiveMgr::GetFile %s lr=%08X type=%u brres=%08X magic=%08X\n",
+                trace->filename, caller, archiveType, result, ReadTraceWord(result));
+        }
+        if (!reqName.empty()) {
+            static std::set<std::string> s_seenArchiveLookups;
+            std::string key = std::to_string(archiveType) + "|" + reqName;
+            if (s_seenArchiveLookups.size() < 200 && s_seenArchiveLookups.insert(key).second) {
+                AppLog("[ArchiveMgr] type=%u name='%s' -> %08X (magic=%08X) frame=%u\n",
+                    archiveType, reqName.c_str(), result, ReadTraceWord(result),
+                    gx_bridge::g_gxFrame);
+            }
+        }
         return true;
     }
     case 0x80124894u: { // ARC::ConvertPathToEntrynum
@@ -3062,7 +3189,36 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x8004C350u: { // nw4r::g3d::ResFile::GetResMdl(u32 index)
         const uint32_t archive = ReadTraceWord(channel);
         auto* trace = FindTracedModel(archive);
-        if (!trace) return false;
+        if (!trace) {
+            // Non-traced archive (kart/driver models). Call through and record whether the lookup
+            // EVER succeeds and at which frame - this is what tells us whether the synchronous
+            // kart creation at frame 84 permanently misses the archives that finish at ~frame 100.
+            std::string nm;
+            if (target == 0x8004C240u) {
+                const uint32_t namePtr = cpu->gpr[4];
+                if (namePtr && Memory::Contains(namePtr, 1)) {
+                    nm = reinterpret_cast<const char*>(Memory::GetPointer(namePtr, 1));
+                }
+                func_8004C240(cpu);
+            } else if (target == 0x8004C2B0u) {
+                func_8004C2B0(cpu);
+            } else {
+                func_8004C350(cpu);
+            }
+            const uint32_t mdl = cpu->gpr[3];
+            static std::set<std::string> s_seenOk, s_seenFail;
+            std::string key = nm + "|res=" + std::to_string(channel);
+            if (mdl != 0) {
+                if (s_seenOk.size() < 64 && s_seenOk.insert(key).second) {
+                    AppLog("[Model Ok] '%s' resFile=%08X -> mdl=%08X magic=%08X frame=%u\n",
+                        nm.c_str(), channel, mdl, ReadTraceWord(mdl), gx_bridge::g_gxFrame);
+                }
+            } else if (s_seenFail.size() < 64 && s_seenFail.insert(key).second) {
+                AppLog("[Model Fail] '%s' resFile=%08X archive=%08X frame=%u lr=%08X\n",
+                    nm.c_str(), channel, archive, gx_bridge::g_gxFrame, cpu->lr);
+            }
+            return true;
+        }
         const uint32_t query = cpu->gpr[4];
         const uint32_t caller = cpu->lr;
         if (target == 0x8004C240u) func_8004C240(cpu);
@@ -4478,11 +4634,105 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x801630D0u: // DVD::CancelAll
         cpu->gpr[3] = 1;
         return true;
+    case 0x80540038u: { // archive load job; arg indexes entries at *(0x809BD748) + arg*84
+        const uint32_t argIn = cpu ? cpu->gpr[3] : 0;
+        const uint32_t baseIn = Memory::Read32(0x809BD748u);
+        static std::set<uint32_t> s_seenJobArgs;
+        if (s_seenJobArgs.size() < 48 && s_seenJobArgs.insert(argIn).second) {
+            const uint32_t e = baseIn + argIn * 84u;
+            std::string nm;
+            if (Memory::Contains(e + 836u, 1)) {
+                nm = reinterpret_cast<const char*>(Memory::GetPointer(e + 836u, 1));
+            }
+            AppLog("[Arc Job] arg=%u base=%08X entry=%08X h824=%08X name836='%s' f900=%08X f904=%08X frame=%u\n",
+                argIn, baseIn, e, Memory::Contains(e + 824u, 4) ? Memory::Read32(e + 824u) : 0xDEADBEEFu,
+                nm.c_str(),
+                Memory::Contains(e + 900u, 4) ? Memory::Read32(e + 900u) : 0,
+                Memory::Contains(e + 904u, 4) ? Memory::Read32(e + 904u) : 0,
+                gx_bridge::g_gxFrame);
+        }
+        func_80540038(cpu);
+        return true;
+    }
+    case 0x8052A954u: { // archive loader step: (handle, namePtr, table, r6, r7)
+        // Returns 4 when the archive group is ready. It advances roughly one step per frame, which
+        // is fatal for karts: section 32 init creates karts at frame 84 while the archives only
+        // become usable around frame 100. Our disc/decompression HLE is synchronous, so drive the
+        // state machine to completion here instead of letting it creep forward frame by frame.
+        const uint32_t a3 = cpu ? cpu->gpr[3] : 0;
+        const uint32_t a4 = cpu ? cpu->gpr[4] : 0;
+        const uint32_t a5 = cpu ? cpu->gpr[5] : 0;
+        const uint32_t a6 = cpu ? cpu->gpr[6] : 0;
+        const uint32_t a7 = cpu ? cpu->gpr[7] : 0;
+        std::string nm;
+        if (a4 && Memory::Contains(a4, 1)) {
+            nm = reinterpret_cast<const char*>(Memory::GetPointer(a4, 1));
+        }
+        const uint32_t reqLr = cpu ? cpu->lr : 0;
+        std::string seq;
+        uint32_t ret = 0;
+        int iter = 0;
+        for (; iter < 16; ++iter) {
+            cpu->gpr[3] = a3; cpu->gpr[4] = a4; cpu->gpr[5] = a5;
+            cpu->gpr[6] = a6; cpu->gpr[7] = a7;
+            func_8052A954(cpu);
+            ret = cpu->gpr[3];
+            seq += std::to_string(ret);
+            seq += ' ';
+            if (ret == 4 || ret == 0) break;
+        }
+        static std::set<std::string> s_seenArcLoads;
+        std::string key = std::to_string(a3) + "|" + nm;
+        if (s_seenArcLoads.size() < 48 && s_seenArcLoads.insert(key).second) {
+            AppLog("[Arc Load] handle=%08X name='%s' steps=%d seq=%s frame=%u reqLr=%08X\n",
+                a3, nm.c_str(), iter + 1, seq.c_str(), gx_bridge::g_gxFrame, reqLr);
+        }
+        return true;
+    }
     case 0x805B9344u: { // ArgumentParser::parse
         const uint32_t sectionMgr = Memory::Read32(0x809C1E38u);
         AppLog("[BootRace] Intercepted SectionMgr::Init! sm=%08X lr=%08X r3=%08X curSec=%d\n",
             sectionMgr, cpu ? cpu->lr : 0, cpu ? cpu->gpr[3] : 0,
             sectionMgr ? static_cast<int32_t>(Memory::Read32(sectionMgr + 4)) : -1);
+        // PRELOAD: section 32 init creates karts immediately, but the ArchiveMgr groups do not
+        // become usable until ~frame 100 (about 16 frames after the engine posts the archive
+        // requests). Pump the archive-load jobs to completion here, before forcing the section,
+        // so kart model lookups resolve against real archives instead of NULL.
+        {
+            const uint32_t arcBase = Memory::Read32(0x809BD748u);
+            AppLog("[Arc Preload] begin frame=%u base=%08X ready=%d\n",
+                gx_bridge::g_gxFrame, arcBase, gx_bridge::ArchivesReady() ? 1 : 0);
+            // Learn the real layout first: print handle + candidate name bytes for the first few
+            // slots, and only pump slots whose +824 looks like a live guest pointer.
+            uint32_t scanned = 0;
+            if (arcBase && !gx_bridge::ArchivesReady()) {
+                for (uint32_t k = 0; k < 24; ++k) {
+                    const uint32_t e = arcBase + k * 84u;
+                    if (!Memory::Contains(e + 904u, 4)) break;
+                    const uint32_t h = Memory::Read32(e + 824u);
+                    if (k < 4) {
+                        char nm[24];
+                        std::memcpy(nm, Memory::GetPointer(e + 836u, 23), 23);
+                        nm[23] = 0;
+                        AppLog("[Arc Preload] k=%u entry=%08X h=%08X +836='%s' +900=%08X +904=%08X\n",
+                            k, e, h, nm, Memory::Read32(e + 900u), Memory::Read32(e + 904u));
+                    }
+                    if (h < 0x80000000u || !Memory::Contains(h, 28)) break;
+                    scanned = k + 1;
+                }
+                AppLog("[Arc Preload] %u plausible entries\n", scanned);
+                for (uint32_t pass = 0; pass < 12 && !gx_bridge::ArchivesReady(); ++pass) {
+                    for (uint32_t k = 0; k < scanned; ++k) {
+                        CpuContext pumpCtx = *cpu;
+                        pumpCtx.gpr[3] = k;
+                        CpuContextScope pumpScope(&pumpCtx);
+                        func_80540038(&pumpCtx);
+                    }
+                }
+                AppLog("[Arc Preload] done - ready=%d frame=%u\n",
+                    gx_bridge::ArchivesReady() ? 1 : 0, gx_bridge::g_gxFrame);
+            }
+        }
         SetUpBootRaceScenario(0x08);
         if (sectionMgr != 0) {
             Memory::Write32(sectionMgr + 4, 0x20); // Force current = 0x20 (kSectionP1Vs)
@@ -4501,24 +4751,19 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         cpu->gpr[3] = 1;
         return true;
     case 0x805A8FBCu: { // RaceCameraMgr::HasEveryOpeningPanEnded
-        static bool loggedOpeningPanCheck = false;
-        if (!loggedOpeningPanCheck) {
-            AppLog("[Race Opening Pan] HasEveryOpeningPanEnded forced true at frame=%u lr=%08X\n",
-                gx_bridge::g_gxFrame, cpu->lr);
-            loggedOpeningPanCheck = true;
-        }
-        // Force camera to gameplay mode immediately by setting RaceCameraMgr state
-        // RaceCameraMgr at 0x809C0000:
-        // +0x1874 (6260): camera state bit 0 = pan ended / gameplay mode active
-        // +0x1998 (6552): pan active flag (0 = pan not active)
-        // +0x19A0 (6560): camera mode byte
-        constexpr uint32_t kRaceCameraMgr = 0x809C0000u;
-        if (Memory::Contains(kRaceCameraMgr, 6600)) {
-            Memory::Write32(kRaceCameraMgr + 0x1874u, 1); // gameplay mode active
-            Memory::Write32(kRaceCameraMgr + 0x1998u, 0); // pan not active
-            Memory::Write8(kRaceCameraMgr + 0x19A0u, 2);  // camera mode = gameplay (2)
-        }
-        cpu->gpr[3] = 1; // Pan has ended -> transition to start line & countdown
+        // NOTE: this used to force a "pan ended" result and write to GUESSED globals
+        // (0x809C1874 / 0x809C1998 / 0x809C19A0). Those offsets were never verified and this
+        // function is in fact never even called, so the hack gated nothing while corrupting real
+        // globals. The real function is now executed normally.
+        //
+        // Real logic: count = *(mgr+32); for each cam = *(*(mgr+24) + i*4), test bit 0x8 of
+        // *(uint16*)(*(cam+408) + 108).
+        func_805A8FBC(cpu);
+        return true;
+    }
+    case 0x805A900Cu: { // RaceCameraMgr::Update - must run every frame
+        ++gx_bridge::g_gx.camUpdateCalls;
+        func_805A900C(cpu);
         return true;
     }
     case 0x80590664u: { // KartLink::IsCPU
@@ -4717,6 +4962,13 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 std::fflush(stdout);
             }
         }
+
+        // FINDING (documented in docs/CLAUDE_FABLE_52_TASK.md O2): section 32 init runs at frame ~84
+        // but the ArchiveMgr groups only become usable at ~frame 100, so kart creation resolves
+        // every model against a NULL archive and is never retried.
+        // Re-entering section 32 once the archives were ready was tried here and REGRESSED the run
+        // (stopped advancing at ~frame 100), so it has been removed. The fix has to make either
+        // (a) the archive load complete before section init, or (b) kart creation retry later.
         cpu->gpr[3] = 0;
         return true;
     }
@@ -4828,12 +5080,17 @@ bool handle_unlinked_dispatch(uint32_t target, CpuContext* cpu)
     }
 
     // 6. Relocated Course Objects / Effects / Particles (0x80680000 - 0x808B0000)
+    //    This range contains REAL recompiled object/kart code that is simply not in the legacy
+    //    `linked` set. Returning 0 here no-ops it. Every unique target is logged so one run yields
+    //    the complete "needs linking" set; link them instead of widening this bypass.
     if (target >= 0x80680000u && target < 0x808B0000u) {
-        static uint32_t s_lastRelTarget = 0;
-        if (s_lastRelTarget != target) {
-            s_lastRelTarget = target;
-            AppLog("[Batch HLE] Object/Effect bypassed target=%08X (pc=%08X lr=%08X)\n", target, pc, lr);
+        static std::set<uint32_t> s_relBypassSeen;
+        static uint32_t s_relBypassCalls = 0;
+        if (s_relBypassSeen.size() < 512 && s_relBypassSeen.insert(target).second) {
+            AppLog("[Batch HLE] Object/Effect bypassed target=%08X (pc=%08X lr=%08X unique=%zu calls=%u)\n",
+                target, pc, lr, s_relBypassSeen.size(), s_relBypassCalls);
         }
+        ++s_relBypassCalls;
         if (cpu) cpu->gpr[3] = 0;
         return true;
     }
