@@ -23,6 +23,20 @@ uint32_t run_guest_boot(CpuContext& cpu);
 void InvokeIndirectCpu(uint32_t address, CpuContext* cpu);
 extern "C" void InitializeDataSections();
 extern "C" const uint8_t kStartupFst[], kStartupFstEnd[];
+
+// lwbrx / stwbrx helpers. Declared in isa/ppc_isa_int.h but never defined in this build; they were
+// not needed until the UI/layout cluster pulled in code that uses them.
+static inline uint32_t ByteSwap32(uint32_t v) {
+    return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |
+           ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24);
+}
+extern "C" uint32_t PPC_LoadWordByteReverse(uint32_t addr) {
+    return ByteSwap32(Memory::Read32(addr));
+}
+extern "C" void PPC_StoreWordByteReverse(uint32_t addr, uint32_t value) {
+    Memory::Write32(addr, ByteSwap32(value));
+}
+
 extern "C" void func_800841B0(CpuContext*);
 extern "C" void func_805411FC(CpuContext*);
 extern "C" void func_805A8FBC(CpuContext*);
@@ -2310,6 +2324,13 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
             }
             AppLog("[PanicLoop] frame=%u total=%u sites:%s\n",
                 frameNumber, gx_bridge::g_panicTotal, sites.c_str());
+        }
+        if (frameNumber % 10 == 0 && frameNumber <= 120) {
+            AppLog("[RegistryWatch] frame=%u sentinel=[%08X %08X %08X %08X %08X %08X]\n",
+                frameNumber,
+                Memory::Read32(0x80386168u), Memory::Read32(0x8038616Cu),
+                Memory::Read32(0x80386170u), Memory::Read32(0x80386174u),
+                Memory::Read32(0x80386178u), Memory::Read32(0x8038617Cu));
         }
         AppLog("[GX Mtx Frame %u] loadCalls=%u xfWrites=%u nonIdentity=%u curPn=%u camUpdate=%u m0 r0=(%g,%g,%g,%g) r1=(%g,%g,%g,%g) r2=(%g,%g,%g,%g)\n",
             frameNumber, g_gx.mtxLoadCalls, g_gx.xfMtxWrites, g_gx.mtxNonIdentity,
@@ -5061,7 +5082,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         // Currently left ON: with it off the game advances out of section 0x15 and dies in
         // nw4r LinkList (NULL list) because the menu/UI scaffold is not constructed yet - that is
         // the intro -> menu -> character select workstream. Flip to false to continue that work.
-        constexpr bool kForceRaceSection = true;
+        constexpr bool kForceRaceSection = false;
 
         const uint32_t sectionMgr = Memory::Read32(0x809C1E38u);
         AppLog("[BootPath] ArgumentParser::parse frame=%u sm=%08X curSec=%d lr=%08X forceRace=%d\n",
