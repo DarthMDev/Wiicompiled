@@ -2998,8 +2998,9 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     static uint64_t s_hleCallCount = 0;
     ++s_hleCallCount;
     if (s_hleCallCount % 100000 == 0) {
-        std::fprintf(stderr, "[HLE Loop] target=%08X pc=%08X count=%llu\n",
-            target, cpu ? cpu->pc : 0, (unsigned long long)s_hleCallCount);
+        std::fprintf(stderr, "[HLE Loop] target=%08X pc=%08X count=%llu frame=%u lr=%08X\n",
+            target, cpu ? cpu->pc : 0, (unsigned long long)s_hleCallCount,
+            gx_bridge::g_gxFrame, cpu ? cpu->lr : 0);
     }
     static bool interruptsEnabled = true;
     static uint32_t pendingConfigCommand = 0;
