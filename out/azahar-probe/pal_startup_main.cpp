@@ -53,6 +53,11 @@ extern "C" void func_80540038(CpuContext*);
 extern "C" void func_805B9344(CpuContext*);
 extern "C" void func_805E889C(CpuContext*);
 extern "C" void func_80631588(CpuContext*);
+extern "C" void func_8051BC78(CpuContext*);
+extern "C" void func_80602530(CpuContext*);
+extern "C" void func_80013040(CpuContext*);
+extern "C" void func_800135F0(CpuContext*);
+extern "C" void func_80631C10(CpuContext*);
 extern "C" void func_805A08F0(CpuContext*);
 extern "C" void func_805E78F0(CpuContext*);
 extern "C" void func_80577064(CpuContext*);
@@ -2636,6 +2641,8 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
         const float* m0 = g_gx.pnMtx[0];
         AppLog("[GX Stats Frame %u] draws=%u tris=%u quads2D=%u dls=%u texCache=%zuKB px3D=%u entered3D=%u bounds3D=%u a0_2D=%u wrote2D=%u\n",
             frameNumber, g_gx.drawCallsThisFrame, g_gx.trisThisFrame, g_gx.quads2DThisFrame, g_gx.dlCallsThisFrame, g_texCacheBytes / 1024, g_gx.pixels3DThisFrame, g_gx.tri3DEntered, g_gx.tri3DBounds, g_gx.tri2DAlphaZero, g_gx.tri2DWritten);
+        AppLog("[GlobeFlag] frame=%u flag=%u bits=%08X\n",
+            frameNumber, Memory::Read8(0x809C19A0u), Memory::Read32(0x809C1874u));
         if (gx_bridge::g_panicTotal != 0 && (frameNumber % 200 == 0)) {
             std::string sites;
             uint32_t shown = 0;
@@ -2688,6 +2695,13 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
             g_perspectiveTrace.area, g_perspectiveTrace.offscreen, g_perspectiveTrace.rasterized,
             g_perspectiveTrace.wrotePixels);
         g_perspectiveTrace = {};
+    }
+    if (std::getenv("MKW_FORCE_GLOBE") && frameNumber >= 90) {
+        Memory::Write8(0x809C19A0u, 1);
+        const uint32_t globeObj = Memory::Read32(0x809C1988u);
+        if (globeObj && Memory::Contains(globeObj + 32, 1)) {
+            Memory::Write8(globeObj + 32, 1);
+        }
     }
     g_gxFrame = frameNumber + 1;
     g_gx.drawCallsThisFrame = 0;
@@ -3295,6 +3309,22 @@ static const CourseModelTrace* FindTracedModelFilename(uint32_t address) {
     return nullptr;
 }
 
+extern "C" void MkwOnDirectCall(uint32_t target) {
+    static std::map<uint32_t, uint32_t> s_counts;
+    ++s_counts[target];
+    static uint32_t s_last = 0;
+    if (gx_bridge::g_gxFrame != s_last && gx_bridge::g_gxFrame >= 200) {
+        s_last = gx_bridge::g_gxFrame;
+        std::string out;
+        for (const auto& kv : s_counts) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), " %08X=%u", kv.first, kv.second);
+            out += buf;
+        }
+        AppLog("[DirectDraw] frame=%u%s\n", gx_bridge::g_gxFrame, out.c_str());
+    }
+}
+
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
     // Stack-depth guard. Each recompiled guest frame consumes ~4 KB of host stack (0xF20 in the
@@ -3617,6 +3647,123 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         if (s_seenSectionDispatch.size() < 16 && s_seenSectionDispatch.insert(target).second) {
             AppLog("[SectionDispatch] target=%08X lr=%08X this=%08X frame=%u\n",
                 target, cpu->lr, cpu->gpr[3], gx_bridge::g_gxFrame);
+        }
+    }
+    if (cpu && cpu->lr == 0x80830784u) {
+        static std::set<uint32_t> s_seenGlobeEntry;
+        const uint32_t key = target;
+        if (s_seenGlobeEntry.size() < 16 && s_seenGlobeEntry.insert(key).second) {
+            AppLog("[GlobeEntry] target=%08X entry=%08X frame=%u\n",
+                target, cpu->gpr[3], gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x8059E1FCu) {
+        static std::set<uint32_t> s_seenE1FC;
+        const uint32_t obj = cpu ? cpu->gpr[3] : 0;
+        if (s_seenE1FC.size() < 8 && s_seenE1FC.insert(obj).second) {
+            AppLog("[GlobeObj] obj=%08X vt=%08X b32=%u p4=%08X b9=%u p20=%08X p24=%08X p28=%08X frame=%u\n",
+                obj, obj ? Memory::Read32(obj) : 0, obj ? Memory::Read8(obj + 32) : 0, obj ? Memory::Read32(obj + 4) : 0,
+                obj ? Memory::Read8(obj + 9) : 0, obj ? Memory::Read32(obj + 20) : 0,
+                obj ? Memory::Read32(obj + 24) : 0, obj ? Memory::Read32(obj + 28) : 0,
+                gx_bridge::g_gxFrame);
+            const uint32_t list = obj ? Memory::Read32(obj + 4) : 0;
+            if (list && Memory::Contains(list, 40)) {
+                const uint32_t e0 = list;
+                AppLog("[GlobeEntry0] e0=%08X vt=%08X p12=%08X p16=%08X\n",
+                    e0, Memory::Read32(e0), Memory::Read32(e0 + 12), Memory::Read32(e0 + 16));
+            }
+        }
+    }
+    if (target == 0x80555264u || target == 0x8055472Cu || target == 0x8051BD34u || target == 0x8059E1FCu) {
+        static std::set<uint32_t> s_seenGlobePath;
+        if (s_seenGlobePath.size() < 16 && s_seenGlobePath.insert(target).second) {
+            AppLog("[GlobePath] target=%08X lr=%08X this=%08X frame=%u\n",
+                target, cpu ? cpu->lr : 0, cpu ? cpu->gpr[3] : 0, gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x8051BC78u) {
+        static std::set<uint32_t> s_seenSceneDraw;
+        const uint32_t obj = cpu ? cpu->gpr[3] : 0;
+        if (s_seenSceneDraw.size() < 8 && s_seenSceneDraw.insert(obj).second) {
+            AppLog("[SceneDrawObj] obj=%08X p9516=%08X b9520=%u b9521=%u frame=%u\n",
+                obj, obj ? Memory::Read32(obj + 9516) : 0,
+                obj ? Memory::Read8(obj + 9520) : 0, obj ? Memory::Read8(obj + 9521) : 0,
+                gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x80214C74u) {
+        static std::set<uint32_t> s_seenGlobeDraw;
+        const uint32_t obj = cpu ? cpu->gpr[3] : 0;
+        if (s_seenGlobeDraw.size() < 8 && s_seenGlobeDraw.insert(obj).second) {
+            AppLog("[GlobeDraw] obj=%08X r4=%08X r5=%08X r6=%08X r7=%08X frame=%u\n",
+                obj, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0,
+                cpu ? cpu->gpr[6] : 0, cpu ? cpu->gpr[7] : 0, gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x805A1A18u) {
+        static std::set<uint32_t> s_seenA18;
+        const uint32_t obj = cpu ? cpu->gpr[3] : 0;
+        const uint32_t vt = (obj && Memory::Contains(obj, 4)) ? Memory::Read32(obj) : 0;
+        const uint32_t draw20 = (vt && Memory::Contains(vt + 20, 4)) ? Memory::Read32(vt + 20) : 0;
+        const uint32_t key = (obj << 8) ^ (draw20 & 0xFFu);
+        if (s_seenA18.size() < 16 && s_seenA18.insert(key).second) {
+            AppLog("[EarthA18] obj=%08X vt=%08X draw20=%08X r4=%u frame=%u\n",
+                obj, vt, draw20, cpu ? cpu->gpr[4] : 0, gx_bridge::g_gxFrame);
+        }
+    }
+    if (cpu && (cpu->lr == 0x805A1B2Cu || cpu->lr == 0x805A1B60u)) {
+        static std::set<uint32_t> s_seenEarth;
+        const uint32_t key = (cpu->lr << 16) ^ (target & 0xFFFFu);
+        if (s_seenEarth.size() < 12 && s_seenEarth.insert(key).second) {
+            AppLog("[EarthDraw] lr=%08X target=%08X this=%08X frame=%u\n",
+                cpu->lr, target, cpu->gpr[3], gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x80554D10u || target == 0x80554E6Cu || target == 0x80554AD4u) {
+        static std::set<uint32_t> s_seenGlobeShow;
+        if (s_seenGlobeShow.size() < 12 && s_seenGlobeShow.insert(target).second) {
+            AppLog("[GlobeShow] target=%08X lr=%08X this=%08X flag=%u frame=%u\n",
+                target, cpu ? cpu->lr : 0, cpu ? cpu->gpr[3] : 0,
+                Memory::Read8(0x809C19A0u), gx_bridge::g_gxFrame);
+        }
+    }
+    if (cpu && cpu->lr == 0x805A1A20u) {
+        static std::set<uint32_t> s_seenEarthDraw20;
+        const uint32_t key = target;
+        if (s_seenEarthDraw20.size() < 16 && s_seenEarthDraw20.insert(key).second) {
+            const uint32_t obj = cpu->gpr[3];
+            const uint32_t vt = (obj && Memory::Contains(obj, 4)) ? Memory::Read32(obj) : 0;
+            AppLog("[EarthDraw20] target=%08X obj=%08X vt=%08X frame=%u\n",
+                target, obj, vt, gx_bridge::g_gxFrame);
+        }
+    }
+    if (cpu && cpu->lr >= 0x8051B3C8u && cpu->lr < 0x8051B7B0u) {
+        static std::set<uint32_t> s_seenCalcCalls;
+        if (s_seenCalcCalls.size() < 24 && s_seenCalcCalls.insert(target).second) {
+            AppLog("[MenuCalcCall] target=%08X lr=%08X this=%08X frame=%u\n",
+                target, cpu->lr, cpu->gpr[3], gx_bridge::g_gxFrame);
+        }
+    }
+    if (cpu && (cpu->lr == 0x80562504u || cpu->lr == 0x8051BC9Cu || cpu->lr == 0x8051BCA8u)) {
+        static std::set<uint32_t> s_seenSceneCalls;
+        if (s_seenSceneCalls.size() < 12 && s_seenSceneCalls.insert(target).second) {
+            AppLog("[SceneCall] target=%08X lr=%08X this=%08X frame=%u\n",
+                target, cpu->lr, cpu->gpr[3], gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x8051BC78u || target == 0x80009988u || target == 0x8023AEACu) {
+        static std::map<uint32_t, uint32_t> s_drawChain;
+        ++s_drawChain[target];
+        static uint32_t s_lastDrawLog = 0;
+        if (gx_bridge::g_gxFrame != s_lastDrawLog && gx_bridge::g_gxFrame >= 200) {
+            s_lastDrawLog = gx_bridge::g_gxFrame;
+            std::string out;
+            for (const auto& kv : s_drawChain) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), " %08X=%u", kv.first, kv.second);
+                out += buf;
+            }
+            AppLog("[DrawChain] frame=%u%s\n", gx_bridge::g_gxFrame, out.c_str());
         }
     }
     if (cpu && gx_bridge::g_gxFrame >= 90 && gx_bridge::g_gxFrame <= 92) {
@@ -6179,7 +6326,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             // Default to section 16 (the game's main menu). The natural parser result is -1
             // because the launch-argument string is NULL, which SectionMgr turns into the
             // Mario Kart Channel (section 21). MKW_NATURAL_BOOT=1 restores that path.
-            if (!std::getenv("MKW_NATURAL_BOOT")) {
+            if (std::getenv("MKW_FORCE_SECTION")) {
                 const char* e = std::getenv("MKW_FORCE_SECTION");
                 // Default to section 13 (the title screen) so the boot flow matches the real
                 // game: strap -> online notice -> title -> main menu. Section 16 is the main
@@ -6206,6 +6353,53 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                     char buf[33] = {};
                     for (int i = 0; i < 32; ++i) buf[i] = static_cast<char>(Memory::Read8(argPtr + i));
                     AppLog("[BootArgString] ptr=%08X '%s'\n", argPtr, buf);
+                    constexpr uint32_t kScratch = 0x955F8200u;
+                    CpuContext findCtx = *cpu;
+                    findCtx.gpr[3] = argPtr;
+                    findCtx.gpr[4] = 0x808B73A0u;
+                    CpuContextScope findScope(&findCtx);
+                    func_800135F0(&findCtx);
+                    const uint32_t found = findCtx.gpr[3];
+                    AppLog("[ParseTest] strstr=%08X (arg+%d)\n", found, found ? static_cast<int>(found - argPtr) : -1);
+                    Memory::Write8(0x955F8300u, '-');
+                    Memory::Write8(0x955F8301u, 's');
+                    Memory::Write8(0x955F8302u, 0);
+                    CpuContext findSCtx = *cpu;
+                    findSCtx.gpr[3] = argPtr;
+                    findSCtx.gpr[4] = 0x955F8300u;
+                    CpuContextScope findSScope(&findSCtx);
+                    func_800135F0(&findSCtx);
+                    const uint32_t foundS = findSCtx.gpr[3];
+                    AppLog("[ParseTest2] strstrS=%08X (arg+%d)\n", foundS,
+                        foundS ? static_cast<int>(foundS - argPtr) : -1);
+                    if (foundS) {
+                        Memory::Write32(0x955F8304u, 0xDEADBEEFu);
+                        CpuContext psCtx = *cpu;
+                        psCtx.gpr[3] = foundS + 2;
+                        psCtx.gpr[4] = 0x808927CBu;
+                        psCtx.gpr[5] = 0x955F8304u;
+                        CpuContextScope psScope(&psCtx);
+                        func_80013040(&psCtx);
+                        const uint32_t sv = Memory::Read32(0x955F8304u);
+                        CpuContext mapCtx = *cpu;
+                        mapCtx.gpr[3] = sv;
+                        CpuContextScope mapScope(&mapCtx);
+                        func_80631C10(&mapCtx);
+                        AppLog("[ParseTest2] sRet=%08X sVal=%d mapRet=%d\n",
+                            psCtx.gpr[3], static_cast<int32_t>(sv),
+                            static_cast<int32_t>(mapCtx.gpr[3]));
+                    }
+                    if (found) {
+                        Memory::Write32(kScratch, 0xDEADBEEFu);
+                        CpuContext parseCtx = *cpu;
+                        parseCtx.gpr[3] = found + 2;
+                        parseCtx.gpr[4] = 0x808927C8u;
+                        parseCtx.gpr[5] = kScratch;
+                        CpuContextScope parseScope(&parseCtx);
+                        func_80013040(&parseCtx);
+                        AppLog("[ParseTest] parse ret=%08X n=%d\n",
+                            parseCtx.gpr[3], static_cast<int32_t>(Memory::Read32(kScratch)));
+                    }
                 }
             }
             // Run the real parser and report what section the game itself picked.
@@ -6475,6 +6669,158 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         if (!s_profiled100 && s_frameCount >= 100) {
             s_profiled100 = true;
             ReportWorkingSet("Frame 100 (title/menu page creation)");
+        }
+        if (s_frameCount == 200 || s_frameCount == 400) {
+            const uint32_t pm = 0x80AB3A18u;
+            const uint32_t page = 0x80AB5EFCu;
+            if (page && Memory::Contains(page, 0x44)) {
+                std::string dump;
+                for (int i = 0; i < 17; ++i) {
+                    char buf[16];
+                    std::snprintf(buf, sizeof(buf), " %08X", Memory::Read32(page + i * 4));
+                    dump += buf;
+                }
+                {
+                    const uint32_t vt = (pm && Memory::Contains(pm, 4)) ? Memory::Read32(pm) : 0;
+                    std::string vts;
+                    if (vt && Memory::Contains(vt, 48)) {
+                        for (int i = 0; i < 12; ++i) {
+                            char vb[16]; std::snprintf(vb, sizeof(vb), " %08X", Memory::Read32(vt + i * 4));
+                            vts += vb;
+                        }
+                    }
+                    AppLog("[SecObj] frame=%u obj=%08X vt=%08X%s\n", s_frameCount, pm, vt, vts.c_str());
+                }
+                AppLog("[PageFinal] frame=%u pm=%08X page=%08X cgData=%08X cgSorted=%08X cgParent=%08X cgPage=%08X cgSize=%d%s\n",
+                    s_frameCount, pm, page,
+                    Memory::Read32(page + 0x24), Memory::Read32(page + 0x28),
+                    Memory::Read32(page + 0x2C), Memory::Read32(page + 0x30),
+                    static_cast<int32_t>(Memory::Read32(page + 0x34)), dump.c_str());
+            }
+        }
+        if (s_frameCount >= 140 && s_frameCount <= 145) {
+            const uint32_t page = 0x80AB5EFCu;
+            if (Memory::Contains(page, 0x44)) {
+                CpuContext c = *cpu;
+                c.gpr[3] = page;
+                c.gpr[4] = 0;
+                const uint32_t qBefore = gx_bridge::g_gx.quads2DThisFrame;
+                const uint32_t dBefore = gx_bridge::g_gx.drawCallsThisFrame;
+                {
+                    CpuContextScope sc(&c);
+                    func_80602530(&c);
+                }
+                AppLog("[PageDrawTest] frame=%u page=%08X q %u->%u draws %u->%u\n",
+                    s_frameCount, page, qBefore, gx_bridge::g_gx.quads2DThisFrame,
+                    dBefore, gx_bridge::g_gx.drawCallsThisFrame);
+            }
+        }
+        if (s_frameCount >= 120 && s_frameCount <= 125) {
+            const uint32_t sys = Memory::Read32(0x80385FC8u);
+            const uint32_t scnMgr = (sys && Memory::Contains(sys + 0x54, 4)) ? Memory::Read32(sys + 0x54) : 0;
+            const uint32_t scene = (scnMgr && Memory::Contains(scnMgr + 0x0C, 4)) ? Memory::Read32(scnMgr + 0x0C) : 0;
+            if (scene && Memory::Contains(scene, 16)) {
+                CpuContext drawCtx = *cpu;
+                drawCtx.gpr[3] = scene;
+                CpuContextScope drawScope(&drawCtx);
+                func_8051BC78(&drawCtx);
+                AppLog("[SceneDrawTest] frame=%u scene=%08X\n", s_frameCount, scene);
+            }
+        }
+        if (s_frameCount == 100) {
+            const uint32_t sys = Memory::Read32(0x80385FC8u);
+            const uint32_t scnMgr = (sys && Memory::Contains(sys + 0x54, 4)) ? Memory::Read32(sys + 0x54) : 0;
+            const uint32_t scene = (scnMgr && Memory::Contains(scnMgr + 0x0C, 4)) ? Memory::Read32(scnMgr + 0x0C) : 0;
+            if (scene && Memory::Contains(scene, 32)) {
+                AppLog("[SceneDump] scene=%08X vt=%08X vt0=%08X vt1=%08X vt2=%08X vt3=%08X vt4=%08X vt5=%08X\n",
+                    scene, Memory::Read32(scene),
+                    Memory::Read32(scene), Memory::Read32(scene + 4), Memory::Read32(scene + 8),
+                    Memory::Read32(scene + 12), Memory::Read32(scene + 16), Memory::Read32(scene + 20));
+                const uint32_t vt = Memory::Read32(scene);
+                if (vt && Memory::Contains(vt, 32)) {
+                    AppLog("[SceneDump] vtslots=%08X %08X %08X %08X %08X %08X %08X %08X\n",
+                        Memory::Read32(vt), Memory::Read32(vt + 4), Memory::Read32(vt + 8), Memory::Read32(vt + 12),
+                        Memory::Read32(vt + 16), Memory::Read32(vt + 20), Memory::Read32(vt + 24), Memory::Read32(vt + 28));
+                }
+            }
+        }
+        if (s_frameCount == 100) {
+            const uint32_t sys = Memory::Read32(0x80386000u);
+            if (sys && Memory::Contains(sys, 128)) {
+                std::string dump;
+                for (int i = 0; i < 32; ++i) {
+                    char buf[16];
+                    std::snprintf(buf, sizeof(buf), " %08X", Memory::Read32(sys + i * 4));
+                    dump += buf;
+                }
+                AppLog("[SysDump] sys=%08X%s\n", sys, dump.c_str());
+            }
+        }
+        if (s_frameCount >= 84 && s_frameCount <= 130) {
+            const uint32_t dvd = Memory::Read32(0x80385FC0u);
+            const uint32_t fPtr = (dvd && Memory::Contains(dvd + 0x51, 1)) ? Memory::Read8(dvd + 0x51) : 0xFFu;
+            const uint32_t fInline = Memory::Contains(0x80385FC0u + 0x51, 1) ? Memory::Read8(0x80385FC0u + 0x51) : 0xFFu;
+            AppLog("[DvdStatus] frame=%u dvd=%08X flagAtPtr=%u flagInline=%u\n", s_frameCount, dvd, fPtr, fInline);
+        }
+        if (s_frameCount == 90) {
+            const uint32_t sys = Memory::Read32(0x80385FC8u);
+            const uint32_t scnMgr = (sys && Memory::Contains(sys + 0x54, 4)) ? Memory::Read32(sys + 0x54) : 0;
+            const uint32_t scene = (scnMgr && Memory::Contains(scnMgr + 0x0C, 4)) ? Memory::Read32(scnMgr + 0x0C) : 0;
+            const uint32_t parent = (scene && Memory::Contains(scene + 0x20, 4)) ? Memory::Read32(scene + 0x20) : 0;
+            for (int which = 0; which < 2; ++which) {
+                const uint32_t obj = which == 0 ? scene : parent;
+                if (!obj || !Memory::Contains(obj, 4)) continue;
+                const uint32_t vt = Memory::Read32(obj);
+                std::string vts;
+                if (vt && Memory::Contains(vt, 64)) {
+                    for (int i = 0; i < 16; ++i) {
+                        char vb[16]; std::snprintf(vb, sizeof(vb), " %08X", Memory::Read32(vt + i * 4));
+                        vts += vb;
+                    }
+                }
+                AppLog("[SceneVT] %s obj=%08X id=%d vt=%08X%s\n", which == 0 ? "child" : "parent",
+                    obj, static_cast<int32_t>(Memory::Read32(obj + 0x28)), vt, vts.c_str());
+            }
+        }
+        if (s_frameCount == 60) {
+            const uint32_t sys = Memory::Read32(0x80385FC8u);
+            const uint32_t scnMgr = (sys && Memory::Contains(sys + 0x54, 4)) ? Memory::Read32(sys + 0x54) : 0;
+            const uint32_t scene = (scnMgr && Memory::Contains(scnMgr + 0x0C, 4)) ? Memory::Read32(scnMgr + 0x0C) : 0;
+            if (scene && Memory::Contains(scene, 4)) {
+                const uint32_t vt = Memory::Read32(scene);
+                std::string vts;
+                if (vt && Memory::Contains(vt, 64)) {
+                    for (int i = 0; i < 16; ++i) {
+                        char vb[16]; std::snprintf(vb, sizeof(vb), " %08X", Memory::Read32(vt + i * 4));
+                        vts += vb;
+                    }
+                }
+                AppLog("[BootScene] scene=%08X vt=%08X%s\n", scene, vt, vts.c_str());
+            }
+        }
+        if (s_frameCount == 84) {
+            const uint32_t sm = Memory::Read32(0x80386000u);
+            if (sm && Memory::Contains(sm + 0x70, 0x40)) {
+                AppLog("[LaunchType] sm=%08X launchType=%u lang=%u aspect=%u prog=%u rgb60=%u b50=%d ndev=%d\n",
+                    sm, Memory::Read32(sm + 0x70), Memory::Read32(sm + 0x5C),
+                    Memory::Read32(sm + 0x58), Memory::Read32(sm + 0x64),
+                    Memory::Read32(sm + 0x68), static_cast<int32_t>(Memory::Read32(sm + 0x6C)),
+                    Memory::Read8(sm + 0x80));
+            }
+        }
+        if (s_frameCount >= 60 && s_frameCount <= 100) {
+            const uint32_t sys = Memory::Read32(0x80385FC8u);
+            const uint32_t scnMgr = (sys && Memory::Contains(sys + 0x54, 4)) ? Memory::Read32(sys + 0x54) : 0;
+            const int32_t curScene = (scnMgr && Memory::Contains(scnMgr + 0x18, 4))
+                ? static_cast<int32_t>(Memory::Read32(scnMgr + 0x18)) : -999;
+            const int32_t nextScene = (scnMgr && Memory::Contains(scnMgr + 0x14, 4))
+                ? static_cast<int32_t>(Memory::Read32(scnMgr + 0x14)) : -999;
+            const uint32_t scene = (scnMgr && Memory::Contains(scnMgr + 0x0C, 4)) ? Memory::Read32(scnMgr + 0x0C) : 0;
+            const int32_t sceneId = (scene && Memory::Contains(scene + 0x28, 4)) ? static_cast<int32_t>(Memory::Read32(scene + 0x28)) : -999;
+            const uint32_t parent = (scene && Memory::Contains(scene + 0x20, 4)) ? Memory::Read32(scene + 0x20) : 0;
+            const int32_t parentId = (parent && Memory::Contains(parent + 0x28, 4)) ? static_cast<int32_t>(Memory::Read32(parent + 0x28)) : -999;
+            AppLog("[SceneMgr] frame=%u sys=%08X scnMgr=%08X curScene=%d nextScene=%d scene=%08X sceneId=%d parent=%08X parentId=%d\n",
+                s_frameCount, sys, scnMgr, curScene, nextScene, scene, sceneId, parent, parentId);
         }
         if (s_frameCount == 100) {
             const uint32_t gm = Memory::Read32(0x809BD6F8u);
