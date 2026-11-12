@@ -6049,7 +6049,10 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             // Mario Kart Channel (section 21). MKW_NATURAL_BOOT=1 restores that path.
             if (!std::getenv("MKW_NATURAL_BOOT")) {
                 const char* e = std::getenv("MKW_FORCE_SECTION");
-                const uint32_t sec = e ? static_cast<uint32_t>(std::atoi(e)) : 16u;
+                // Default to section 13 (the title screen) so the boot flow matches the real
+                // game: strap -> online notice -> title -> main menu. Section 16 is the main
+                // menu, 21/22 the Mario Kart Channel, 25+ race.
+                const uint32_t sec = e ? static_cast<uint32_t>(std::atoi(e)) : 13u;
                 if (sectionMgr) {
                     Memory::Write32(sectionMgr + 4, sec);
                     Memory::Write32(sectionMgr + 12, sec);
