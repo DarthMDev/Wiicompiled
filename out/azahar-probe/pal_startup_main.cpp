@@ -3937,6 +3937,16 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
         return false;
     }
+    case 0x80554E14u: { // gates the page-manager update on *(mgr+76)
+        static uint32_t s_lastFrame = 0;
+        if (gx_bridge::g_gxFrame >= 84 && gx_bridge::g_gxFrame <= 130 && gx_bridge::g_gxFrame != s_lastFrame) {
+            s_lastFrame = gx_bridge::g_gxFrame;
+            const uint32_t mgr = Memory::Read32(0x809BD748u);
+            const uint32_t flag = (mgr && Memory::Contains(mgr + 76, 1)) ? Memory::Read8(mgr + 76) : 0xFFu;
+            AppLog("[PageGate] frame=%u mgr=%08X flag=%u\n", gx_bridge::g_gxFrame, mgr, flag);
+        }
+        return false;
+    }
     case 0x806223A0u: { // PageManager entry (page switch / create)
         static std::set<uint32_t> s_seenArgs;
         const uint32_t key = (cpu->gpr[3] & 0xFFFF0000u) ^ (cpu->gpr[4] & 0xFFFFu) ^ (cpu->gpr[5] << 8);
@@ -6392,6 +6402,11 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         static uint32_t s_frameCount = 0;
         ++s_frameCount;
         gx_bridge::PresentFrameTo3DS(s_frameCount);
+        if (s_frameCount >= 80 && s_frameCount <= 140 && s_frameCount % 10 == 0) {
+            const uint32_t mgr = Memory::Read32(0x809BD748u);
+            const uint32_t flag = (mgr && Memory::Contains(mgr + 76, 1)) ? Memory::Read8(mgr + 76) : 0xFFu;
+            AppLog("[PageGate] frame=%u mgr=%08X flag=%u\n", s_frameCount, mgr, flag);
+        }
         if (s_frameCount <= 20 || s_frameCount % 40 == 0) {
             const uint32_t sm = Memory::Read32(0x809C1E38u);
             const uint32_t curSecId = sm ? Memory::Read32(sm + 4) : 0;
