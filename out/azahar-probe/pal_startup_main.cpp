@@ -6199,6 +6199,15 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 AppLog("[BootPath] forced section -> %u\n", sec);
                 return true;
             }
+            const uint32_t bootArgStruct = Memory::Read32(0x80386000u);
+            if (bootArgStruct && Memory::Contains(bootArgStruct + 152, 4)) {
+                const uint32_t argPtr = Memory::Read32(bootArgStruct + 152);
+                if (argPtr && Memory::Contains(argPtr, 32)) {
+                    char buf[33] = {};
+                    for (int i = 0; i < 32; ++i) buf[i] = static_cast<char>(Memory::Read8(argPtr + i));
+                    AppLog("[BootArgString] ptr=%08X '%s'\n", argPtr, buf);
+                }
+            }
             // Run the real parser and report what section the game itself picked.
             func_805B9344(cpu);
             AppLog("[BootPath] real parser -> section %d (sm curSec=%d)\n",
