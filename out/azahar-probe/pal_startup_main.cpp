@@ -311,7 +311,10 @@ static bool prepare_memory()
     guestRam = ram;
 
 #ifdef __3DS__
-    for (size_t trySize : {32u * 1024 * 1024, 28u * 1024 * 1024, 24u * 1024 * 1024, 20u * 1024 * 1024}) {
+    // The guest only touches ~8 MiB of MEM2 on the menu/race paths, so allocating the full
+    // 32 MiB leaves the app heap at 0 - every later host allocation (texture cache, NAND)
+    // then fails. Start lower so there is headroom for the host-side caches.
+    for (size_t trySize : {20u * 1024 * 1024, 18u * 1024 * 1024, 16u * 1024 * 1024, 14u * 1024 * 1024}) {
         mem2Ram = static_cast<uint8_t*>(std::calloc(1, trySize));
         if (mem2Ram) {
             mem2Size = trySize;
