@@ -36,6 +36,13 @@ extern "C" uint32_t PPC_LoadWordByteReverse(uint32_t addr) {
 extern "C" void PPC_StoreWordByteReverse(uint32_t addr, uint32_t value) {
     Memory::Write32(addr, ByteSwap32(value));
 }
+extern "C" uint32_t PPC_LoadHalfwordByteReverse(uint32_t addr) {
+    const uint32_t v = Memory::Read16(addr);
+    return ((v & 0xFFu) << 8) | ((v >> 8) & 0xFFu);
+}
+extern "C" void PPC_StoreHalfwordByteReverse(uint32_t addr, uint32_t value) {
+    Memory::Write16(addr, static_cast<uint16_t>(((value & 0xFFu) << 8) | ((value >> 8) & 0xFFu)));
+}
 
 extern "C" void func_800841B0(CpuContext*);
 extern "C" void func_805411FC(CpuContext*);
@@ -648,10 +655,12 @@ struct DecodedTex {
     uint8_t  format = 0;
     uint32_t hash = 0;
     std::vector<uint32_t> rgba; // width * height of 0xRRGGBBAA
+    std::vector<std::vector<uint32_t>> mips; // box-filtered levels, mips[0] unused/empty
 };
 
 static std::map<uint64_t, DecodedTex> g_texCache;
 static size_t g_texCacheBytes = 0;
+static void BuildMipChain(DecodedTex& tex);
 static constexpr size_t kMaxTexCacheBytes = 6 * 1024 * 1024; // 6 MiB budget on Old 3DS
 
 struct TexSlot {
@@ -700,10 +709,19 @@ struct GxState {
     uint32_t drawCallsSkipped = 0; // draws dropped by the raster frame-skip
     uint32_t lastTrianglePixels = 0; // diagnostic result from the most recent software triangle
     bool trackTrianglePixels = false;
+    uint32_t pixels3DThisFrame = 0; // pixels written by perspective draws, for menu diagnostics
+    uint32_t tri3DEntered = 0;      // perspective triangles reaching the rasteriser
+    uint32_t tri3DBounds = 0;       // perspective triangles with on-screen bounds
 
     float vpLeft = 0.0f, vpTop = 0.0f, vpWidth = 608.0f, vpHeight = 456.0f;
     float vpNear = 0.0f, vpFar = 1.0f;
     uint32_t efbWidth = 608, efbHeight = 456;
+
+    // GX scissor box, in EFB pixels. Menu layouts rely on this to keep full-screen
+    // effect quads (checkered ribbons, flares) inside their own strip.
+    uint32_t scissorX = 0, scissorY = 0, scissorW = 608, scissorH = 456;
+    bool scissorSet = false;
+    int clipX0 = 0, clipY0 = 0, clipX1 = 400, clipY1 = 240; // screen-space scissor
 
     uint32_t vtxDesc[21] = {}; // 0=NONE, 1=DIRECT, 2=INDEX8, 3=INDEX16
     VtxAttrFmt vtxFmt[8][21] = {};
@@ -977,6 +995,19 @@ static void ClearFramebuffer() {
     }
 }
 
+static void UpdateScissorScreenRect() {
+    const uint32_t efbW = g_gx.efbWidth ? g_gx.efbWidth : 608u;
+    const uint32_t efbH = g_gx.efbHeight ? g_gx.efbHeight : 456u;
+    auto scaleClamp = [](uint32_t value, uint32_t efb, int target) {
+        const int64_t scaled = static_cast<int64_t>(value) * target / static_cast<int64_t>(efb);
+        return static_cast<int>(scaled < 0 ? 0 : (scaled > target ? target : scaled));
+    };
+    g_gx.clipX0 = scaleClamp(g_gx.scissorX, efbW, kScreenW);
+    g_gx.clipY0 = scaleClamp(g_gx.scissorY, efbH, kScreenH);
+    g_gx.clipX1 = scaleClamp(g_gx.scissorX + g_gx.scissorW, efbW, kScreenW);
+    g_gx.clipY1 = scaleClamp(g_gx.scissorY + g_gx.scissorH, efbH, kScreenH);
+}
+
 static void EnsureInitialized() {
     if (g_gxInitialized) return;
     g_gxInitialized = true;
@@ -1068,7 +1099,7 @@ static const DecodedTex* GetOrDecodeTexture(const TexSlot& slot) {
         return &it->second;
     }
 
-    size_t neededBytes = static_cast<size_t>(slot.width) * static_cast<size_t>(slot.height) * sizeof(uint32_t);
+    size_t neededBytes = static_cast<size_t>(slot.width) * static_cast<size_t>(slot.height) * sizeof(uint32_t) * 4 / 3;
     if (g_texCacheBytes + neededBytes > kMaxTexCacheBytes) {
         g_texCache.clear();
         g_texCacheBytes = 0;
@@ -1244,37 +1275,114 @@ static const DecodedTex* GetOrDecodeTexture(const TexSlot& slot) {
     default:
         break;
     }
+    BuildMipChain(tex);
     return &tex;
 }
 
-static inline uint32_t SampleTexture(const DecodedTex* tex, const TexSlot& slot, float u, float v) {
+static inline float WrapTexCoord(float t, bool repeat) {
+    if (!repeat) return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    return t - std::floor(t);
+}
+
+static void BuildMipChain(DecodedTex& tex) {
+    tex.mips.clear();
+    int w = tex.width;
+    int h = tex.height;
+    const std::vector<uint32_t>* src = &tex.rgba;
+    while (w > 1 || h > 1) {
+        const int nw = w > 1 ? w / 2 : 1;
+        const int nh = h > 1 ? h / 2 : 1;
+        std::vector<uint32_t> level(static_cast<size_t>(nw) * nh);
+        for (int y = 0; y < nh; ++y) {
+            for (int x = 0; x < nw; ++x) {
+                auto accumulate = [&](int sx, int sy) -> uint32_t {
+                    sx = sx < w ? sx : w - 1;
+                    sy = sy < h ? sy : h - 1;
+                    return (*src)[sy * w + sx];
+                };
+                const uint32_t c0 = accumulate(x * 2, y * 2);
+                const uint32_t c1 = accumulate(x * 2 + 1, y * 2);
+                const uint32_t c2 = accumulate(x * 2, y * 2 + 1);
+                const uint32_t c3 = accumulate(x * 2 + 1, y * 2 + 1);
+                uint32_t out = 0;
+                for (int shift = 24; shift >= 0; shift -= 8) {
+                    const uint32_t sum = ((c0 >> shift) & 0xFFu) + ((c1 >> shift) & 0xFFu) +
+                                         ((c2 >> shift) & 0xFFu) + ((c3 >> shift) & 0xFFu);
+                    out |= ((sum + 2u) / 4u) << shift;
+                }
+                level[static_cast<size_t>(y) * nw + x] = out;
+            }
+        }
+        tex.mips.push_back(std::move(level));
+        w = nw;
+        h = nh;
+        src = &tex.mips.back();
+    }
+}
+
+static inline uint32_t SampleLevelBilinear(const std::vector<uint32_t>& data, int w, int h,
+    float u, float v, bool repeatS, bool repeatT) {
+    auto wrapIndex = [](int i, int n, bool repeat) {
+        if (repeat) {
+            i %= n;
+            if (i < 0) i += n;
+            return i;
+        }
+        return i < 0 ? 0 : (i >= n ? n - 1 : i);
+    };
+    const float fu = WrapTexCoord(u, repeatS);
+    const float fv = WrapTexCoord(v, repeatT);
+    const float fx = fu * static_cast<float>(w) - 0.5f;
+    const float fy = fv * static_cast<float>(h) - 0.5f;
+    const int ix = static_cast<int>(std::floor(fx));
+    const int iy = static_cast<int>(std::floor(fy));
+    const float ax = fx - static_cast<float>(ix);
+    const float ay = fy - static_cast<float>(iy);
+    const int x0 = wrapIndex(ix, w, repeatS);
+    const int x1 = wrapIndex(ix + 1, w, repeatS);
+    const int y0 = wrapIndex(iy, h, repeatT);
+    const int y1 = wrapIndex(iy + 1, h, repeatT);
+    const uint32_t c00 = data[static_cast<size_t>(y0) * w + x0];
+    const uint32_t c10 = data[static_cast<size_t>(y0) * w + x1];
+    const uint32_t c01 = data[static_cast<size_t>(y1) * w + x0];
+    const uint32_t c11 = data[static_cast<size_t>(y1) * w + x1];
+    auto lerpChannel = [&](int shift) {
+        const float t00 = static_cast<float>((c00 >> shift) & 0xFFu);
+        const float t10 = static_cast<float>((c10 >> shift) & 0xFFu);
+        const float t01 = static_cast<float>((c01 >> shift) & 0xFFu);
+        const float t11 = static_cast<float>((c11 >> shift) & 0xFFu);
+        const float top = t00 + (t10 - t00) * ax;
+        const float bottom = t01 + (t11 - t01) * ax;
+        const float value = top + (bottom - top) * ay;
+        return static_cast<uint32_t>(value + 0.5f) & 0xFFu;
+    };
+    return (lerpChannel(24) << 24) | (lerpChannel(16) << 16) | (lerpChannel(8) << 8) | lerpChannel(0);
+}
+
+static inline uint32_t SampleTexture(const DecodedTex* tex, const TexSlot& slot, float u, float v, float lod = 0.0f) {
     if (!tex || tex->rgba.empty()) return 0xFFFFFFFFu;
-    const int w = static_cast<int>(tex->width);
-    const int h = static_cast<int>(tex->height);
-    int tx, ty;
-    if (slot.wrapS == 0) { // CLAMP
-        tx = static_cast<int>(u * static_cast<float>(w));
-        if (tx < 0) tx = 0; else if (tx >= w) tx = w - 1;
-    } else { // REPEAT
-        float fu = u - static_cast<float>(static_cast<int>(u));
-        if (fu < 0.0f) fu += 1.0f;
-        tx = static_cast<int>(fu * static_cast<float>(w));
-        if (tx < 0) tx = 0; else if (tx >= w) tx = w - 1;
+    const bool repeatS = slot.wrapS != 0;
+    const bool repeatT = slot.wrapT != 0;
+    int level = 0;
+    if (lod > 0.0f && !tex->mips.empty()) {
+        level = static_cast<int>(lod + 0.5f);
+        if (level > static_cast<int>(tex->mips.size())) level = static_cast<int>(tex->mips.size());
     }
-    if (slot.wrapT == 0) { // CLAMP
-        ty = static_cast<int>(v * static_cast<float>(h));
-        if (ty < 0) ty = 0; else if (ty >= h) ty = h - 1;
-    } else { // REPEAT
-        float fv = v - static_cast<float>(static_cast<int>(v));
-        if (fv < 0.0f) fv += 1.0f;
-        ty = static_cast<int>(fv * static_cast<float>(h));
-        if (ty < 0) ty = 0; else if (ty >= h) ty = h - 1;
+    if (level <= 0) {
+        return SampleLevelBilinear(tex->rgba, tex->width, tex->height, u, v, repeatS, repeatT);
     }
-    return tex->rgba[ty * w + tx];
+    const std::vector<uint32_t>& data = tex->mips[static_cast<size_t>(level - 1)];
+    int w = tex->width, h = tex->height;
+    for (int i = 0; i < level; ++i) {
+        w = w > 1 ? w / 2 : 1;
+        h = h > 1 ? h / 2 : 1;
+    }
+    return SampleLevelBilinear(data, w, h, u, v, repeatS, repeatT);
 }
 
 static inline bool BlendPixel(int x, int y, float z, uint8_t sr, uint8_t sg, uint8_t sb, uint8_t sa, bool ignoreDepth) {
     if (x < 0 || x >= kScreenW || y < 0 || y >= kScreenH) return false;
+    if (g_gx.scissorSet && (x < g_gx.clipX0 || x >= g_gx.clipX1 || y < g_gx.clipY0 || y >= g_gx.clipY1)) return false;
     if (sa == 0) return false; // Discard fully transparent pixels
     int idx = y * kScreenW + x;
     if (!ignoreDepth && g_gx.depthCompare) {
@@ -1307,6 +1415,7 @@ static inline bool BlendPixel(int x, int y, float z, uint8_t sr, uint8_t sg, uin
 static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVertex& v2, uint32_t pnMtxIdx) {
     EnsureInitialized();
     g_gx.lastTrianglePixels = 0;
+    if (g_gx.projType == 0) ++g_gx.tri3DEntered;
     const bool tracePerspective = (g_gxFrame == kGxTraceFrame) && g_gx.projType == 0;
     const float* rawMv = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
     float mv[12];
@@ -1482,6 +1591,7 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
         }
         return;
     }
+    if (g_gx.projType == 0) ++g_gx.tri3DBounds;
 
     int texSlotIdx = -1;
     if (g_gx.texStageEnabled[0] && g_gx.stageTexMap[0] < 8 && g_gx.texSlots[g_gx.stageTexMap[0]].valid) {
@@ -1498,6 +1608,23 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
     }
     const TexSlot& slot = (texSlotIdx >= 0) ? g_gx.texSlots[texSlotIdx] : g_gx.texSlots[0];
     const DecodedTex* tex = (v0.hasUv0 && texSlotIdx >= 0 && slot.valid) ? GetOrDecodeTexture(slot) : nullptr;
+
+    // Pick a mip level from the UV footprint of this triangle. Menu layouts tile tiny textures
+    // over huge quads (a 32x32 checker repeated 160x); without this the sampler aliases them
+    // into harsh 1px stripes instead of the intended soft gradient.
+    float texLod = 0.0f;
+    if (tex) {
+        const float minU = std::min({cv[0].u, cv[1].u, cv[2].u});
+        const float maxU = std::max({cv[0].u, cv[1].u, cv[2].u});
+        const float minV = std::min({cv[0].v, cv[1].v, cv[2].v});
+        const float maxV = std::max({cv[0].v, cv[1].v, cv[2].v});
+        const float spanX = static_cast<float>(maxX - minX + 1);
+        const float spanY = static_cast<float>(maxY - minY + 1);
+        const float texelsX = (maxU - minU) * static_cast<float>(tex->width) / spanX;
+        const float texelsY = (maxV - minV) * static_cast<float>(tex->height) / spanY;
+        const float footprint = std::max(texelsX, texelsY);
+        texLod = std::log2(std::max(footprint, 1e-6f));
+    }
     const bool ignoreDepth = (g_gx.projType == 1); // Ortho 2D pass
 
     float invArea = 1.0f / area;
@@ -1535,7 +1662,7 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
                                                            : (w0 * cv[0].u + w1 * cv[1].u + w2 * cv[2].u);
                     float v = (std::fabs(sumInvW) > 1e-8f) ? ((pw0 * cv[0].v + pw1 * cv[1].v + pw2 * cv[2].v) / sumInvW)
                                                            : (w0 * cv[0].v + w1 * cv[1].v + w2 * cv[2].v);
-                    uint32_t tc = SampleTexture(tex, slot, u, v);
+                    uint32_t tc = SampleTexture(tex, slot, u, v, texLod);
                     r = (r * ((tc >> 24) & 0xFFu)) >> 8;
                     g = (g * ((tc >> 16) & 0xFFu)) >> 8;
                     b = (b * ((tc >> 8)  & 0xFFu)) >> 8;
@@ -1545,6 +1672,7 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
                     static_cast<uint8_t>(b), static_cast<uint8_t>(a), ignoreDepth);
                 wrotePixel |= written;
                 if (written && g_gx.trackTrianglePixels) ++g_gx.lastTrianglePixels;
+                if (written && g_gx.projType == 0) ++g_gx.pixels3DThisFrame;
             }
             w0 += dw0_dx;
             w1 += dw1_dx;
@@ -2160,9 +2288,15 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
     v[2].pos[0] = x1; v[2].pos[1] = y1; v[2].pos[2] = 0.0f;
     v[3].pos[0] = x0; v[3].pos[1] = y1; v[3].pos[2] = 0.0f;
 
+    // nw4r::lyt::detail::DrawQuad supplies corner attributes in scan order
+    // (left-top, right-top, left-bottom, right-bottom), not the triangle-fan order used
+    // for the positions above. Pairing the texcoords/colors straight through swaps the
+    // last two corners and shears every textured layout quad.
+    constexpr int kCornerOrder[4] = {0, 1, 3, 2};
     for (int i = 0; i < 4; ++i) {
-        if (colorAddr != 0 && Memory::Contains(colorAddr + i * 4, 4)) {
-            uint32_t c = Memory::Read32(colorAddr + i * 4);
+        const int src = kCornerOrder[i];
+        if (colorAddr != 0 && Memory::Contains(colorAddr + src * 4, 4)) {
+            uint32_t c = Memory::Read32(colorAddr + src * 4);
             v[i].color0[0] = (c >> 24) & 0xFFu;
             v[i].color0[1] = (c >> 16) & 0xFFu;
             v[i].color0[2] = (c >> 8)  & 0xFFu;
@@ -2175,12 +2309,11 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
         }
         v[i].hasColor0 = true;
 
-        // nw4r::lyt::detail::DrawQuad receives four contiguous VEC2 corner coordinates
-        // for its active texture set. The previous 32-byte stride walked past that array,
-        // yielding huge/NaN UVs for vertices 1-3 and corrupting textured menu quads.
-        if (texCoordCount > 0 && texCoordAddr != 0 && Memory::Contains(texCoordAddr + i * 8, 8)) {
-            v[i].uv0[0] = gx_bridge::ReadGuestFloat(texCoordAddr + i * 8);
-            v[i].uv0[1] = gx_bridge::ReadGuestFloat(texCoordAddr + i * 8 + 4);
+        // Four contiguous VEC2 corners; the old 32-byte stride walked past the array and
+        // produced huge/NaN UVs on vertices 1-3.
+        if (texCoordCount > 0 && texCoordAddr != 0 && Memory::Contains(texCoordAddr + src * 8, 8)) {
+            v[i].uv0[0] = gx_bridge::ReadGuestFloat(texCoordAddr + src * 8);
+            v[i].uv0[1] = gx_bridge::ReadGuestFloat(texCoordAddr + src * 8 + 4);
             v[i].hasUv0 = true;
         }
     }
@@ -2196,6 +2329,27 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
         }
         AppLog("[GX Trace %u] layout hook=%08X lr=%08X projection=%u rect=(%f,%f %fx%f) rgba=%08X,%08X,%08X,%08X\n",
             g_traceDrawOrder, hook, caller, g_gx.projType, x0, y0, w, h, rgba[0], rgba[1], rgba[2], rgba[3]);
+    }
+
+    // Diagnostic: dump the raw texcoord array words for the first few menu quads. This
+    // distinguishes a wrong hook ABI from genuinely tiled UVs.
+    static uint32_t s_menuRawDiagnostics = 0;
+    if (g_gxFrame >= 80 && g_gxFrame <= 90 && s_menuRawDiagnostics < 8 && texCoordAddr != 0) {
+        ++s_menuRawDiagnostics;
+        char words[384];
+        int off = 0;
+        for (int i = 0; i < 10 && off < static_cast<int>(sizeof(words)) - 12; ++i) {
+            const uint32_t wv = Memory::Read32(texCoordAddr + i * 4);
+            off += std::snprintf(words + off, sizeof(words) - off, " %08X", wv);
+        }
+        float f[20]{};
+        for (int i = 0; i < 10; ++i) {
+            const uint32_t wv = Memory::Read32(texCoordAddr + i * 4);
+            std::memcpy(&f[i * 2], &wv, 4);
+        }
+        AppLog("[MenuRaw] n=%u lr=%08X texCoord=%08X cnt=%u raw:%s f=[%.3f,%.3f][%.3f,%.3f][%.3f,%.3f][%.3f,%.3f]\n",
+            s_menuRawDiagnostics, caller, texCoordAddr, texCoordCount, words,
+            f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7]);
     }
 
     // Capture a small sample of the first menu's layout quads. This lets us distinguish bad
@@ -2252,6 +2406,27 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
             diagTex && diagTex->valid ? 1u : 0u);
         const DecodedTex* sampledTexture = (diagTex && diagTex->valid && v[0].hasUv0)
             ? GetOrDecodeTexture(*diagTex) : nullptr;
+        // Dump the decoded tile art once per unique texture so texture decode errors are visible.
+        static std::set<uint32_t> s_dumpedTex;
+        if (sampledTexture && s_dumpedTex.size() < 12 && s_dumpedTex.insert(diagTex->dataAddr).second) {
+            char texPath[64];
+            std::snprintf(texPath, sizeof(texPath), "%stex_%08X_%ux%u_f%u.ppm",
+                (g_gxFrame == 0xFFFFFFFFu) ? "sdmc:/" : "",
+                diagTex->dataAddr, sampledTexture->width, sampledTexture->height, sampledTexture->format);
+            FILE* tf = std::fopen(texPath, "wb");
+            if (tf) {
+                std::fprintf(tf, "P6\n%d %d\n255\n", sampledTexture->width, sampledTexture->height);
+                for (uint32_t pi = 0; pi < sampledTexture->width * sampledTexture->height; ++pi) {
+                    const uint32_t c = sampledTexture->rgba[pi];
+                    const uint8_t rgb[3] = {
+                        static_cast<uint8_t>((c >> 24) & 0xFFu),
+                        static_cast<uint8_t>((c >> 16) & 0xFFu),
+                        static_cast<uint8_t>((c >> 8) & 0xFFu)};
+                    std::fwrite(rgb, 1, 3, tf);
+                }
+                std::fclose(tf);
+            }
+        }
         if (sampledTexture) {
             const float centerU = (v[0].uv0[0] + v[1].uv0[0] + v[2].uv0[0] + v[3].uv0[0]) * 0.25f;
             const float centerV = (v[0].uv0[1] + v[1].uv0[1] + v[2].uv0[1] + v[3].uv0[1]) * 0.25f;
@@ -2379,11 +2554,18 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
         gspWaitForVBlank();
     }
 #endif
-    if (frameNumber == kGxTraceFrame || frameNumber == 300 || frameNumber == 450 || frameNumber == 580 ||
+    if (frameNumber == kGxTraceFrame || frameNumber == 86 || frameNumber == 90 || frameNumber == 100 ||
+        frameNumber == 150 || frameNumber == 300 || frameNumber == 450 || frameNumber == 580 ||
         (frameNumber > 600 && frameNumber % 300 == 0)) {
         char path[64];
         std::snprintf(path, sizeof(path), "sdmc:/frame_%u.ppm", frameNumber);
         FILE* fp = std::fopen(path, "wb");
+        if (!fp) {
+            // The host harness has no SDMC mount; keep the dump next to the binary so the
+            // headless image can be inspected without Azahar.
+            std::snprintf(path, sizeof(path), "frame_%u.ppm", frameNumber);
+            fp = std::fopen(path, "wb");
+        }
         if (fp) {
             std::fprintf(fp, "P6\n%d %d\n255\n", kScreenW, kScreenH);
             for (int i = 0; i < kScreenW * kScreenH; ++i) {
@@ -2402,8 +2584,8 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
     }
     if (frameNumber <= 20 || frameNumber % 20 == 0) {
         const float* m0 = g_gx.pnMtx[0];
-        AppLog("[GX Stats Frame %u] draws=%u tris=%u quads2D=%u dls=%u texCache=%zuKB\n",
-            frameNumber, g_gx.drawCallsThisFrame, g_gx.trisThisFrame, g_gx.quads2DThisFrame, g_gx.dlCallsThisFrame, g_texCacheBytes / 1024);
+        AppLog("[GX Stats Frame %u] draws=%u tris=%u quads2D=%u dls=%u texCache=%zuKB px3D=%u entered3D=%u bounds3D=%u\n",
+            frameNumber, g_gx.drawCallsThisFrame, g_gx.trisThisFrame, g_gx.quads2DThisFrame, g_gx.dlCallsThisFrame, g_texCacheBytes / 1024, g_gx.pixels3DThisFrame, g_gx.tri3DEntered, g_gx.tri3DBounds);
         if (gx_bridge::g_panicTotal != 0 && (frameNumber % 200 == 0)) {
             std::string sites;
             uint32_t shown = 0;
@@ -2461,6 +2643,9 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
     g_gx.drawCallsThisFrame = 0;
     g_gx.trisThisFrame = 0;
     g_gx.quads2DThisFrame = 0;
+    g_gx.pixels3DThisFrame = 0;
+    g_gx.tri3DEntered = 0;
+    g_gx.tri3DBounds = 0;
     g_gx.dlCallsThisFrame = 0;
     g_gx.mtxLoadCalls = 0;
     g_gx.xfMtxWrites = 0;
@@ -3363,6 +3548,51 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     static uint32_t pendingConfigCommand = 0;
     constexpr uint32_t configOpenCallback = 0x801B0450u;
     constexpr uint32_t nandMissing = static_cast<uint32_t>(-12);
+
+    // --- In-memory NAND backing -------------------------------------------------
+    // Mario Kart Wii keeps its license in NAND:/rksys.dat. The port previously failed every
+    // NANDOpen, so the game sat on the "new save data" prompt forever. Serve a real save from
+    // disk (SDMC on device, the extracted assets on the host) and keep writes in memory.
+    struct NandFile {
+        std::string path;
+        size_t pos = 0;
+    };
+    static std::map<std::string, std::vector<uint8_t>> s_nandStore;
+    static std::map<std::string, bool> s_nandLoaded;
+    static std::map<uint32_t, NandFile> s_nandOpen;
+    static uint32_t s_nandNextFd = 0x500;
+    auto nandLoad = [](const std::string& path) -> bool {
+        if (s_nandLoaded[path]) return s_nandStore.find(path) != s_nandStore.end();
+        s_nandLoaded[path] = true;
+        if (path.find("rksys.dat") == std::string::npos) return false;
+        const char* candidates[] = {
+            "sdmc:/mkwii/rksys.dat",
+            "../../Assets/extracted-rmcp01/save/rksys.dat",
+            "Assets/extracted-rmcp01/save/rksys.dat",
+            "../../Assets/save/rksys.dat",
+        };
+        for (const char* candidate : candidates) {
+            FILE* fp = std::fopen(candidate, "rb");
+            if (!fp) continue;
+            std::fseek(fp, 0, SEEK_END);
+            const long size = std::ftell(fp);
+            std::fseek(fp, 0, SEEK_SET);
+            if (size > 0) {
+                std::vector<uint8_t>& data = s_nandStore[path];
+                data.resize(static_cast<size_t>(size));
+                const size_t got = std::fread(data.data(), 1, data.size(), fp);
+                data.resize(got);
+                std::fclose(fp);
+                AppLog("[NAND] loaded '%s' from %s (%zu bytes)\n", path.c_str(), candidate, got);
+                return got != 0;
+            }
+            std::fclose(fp);
+        }
+        return false;
+    };
+    auto nandInfoFd = [](uint32_t info) -> uint32_t {
+        return (info && Memory::Contains(info, 12)) ? Memory::Read32(info) : 0;
+    };
     const uint32_t channel = cpu->gpr[3];
     switch (target) {
     case 0x802439B4u: // func_802439B4: returns 0
@@ -3788,21 +4018,29 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 
         func_805411FC(cpu);
         uint32_t result = cpu->gpr[3];
-        // Menu.bmg is stored inside localized UI U8 archives, so recover it from an already
-        // decompressed guest archive if the ArchiveMgr group has not mounted yet.
-        if (!result && reqName == "message/Menu.bmg") {
+        // Some resources (Menu.bmg, the Font.szs .brfnt files) live in UI archives that the
+        // ArchiveMgr group has not mounted yet when the menu layout first asks for them, and
+        // the game never retries. Recover the bytes from any UI archive we have already
+        // decompressed into guest memory. The returned pointer is the archive's own resource
+        // data, so no copy or extra allocation is involved.
+        if (!result && !reqName.empty() && reqName.size() < 160) {
+            const char* leaf = reqName.c_str();
+            const char* slash = std::strrchr(leaf, '/');
+            if (slash) leaf = slash + 1;
             for (uint32_t arcData : g_decompressedArcs) {
                 if (!arcData || !Memory::Contains(arcData, 4)) continue;
                 uint32_t foundSize = 0;
-                const uint32_t found = FindU8Resource(arcData, "Menu.bmg", &foundSize);
+                uint32_t found = FindU8Resource(arcData, reqName.c_str(), &foundSize);
+                if (!found && leaf != reqName.c_str()) {
+                    found = FindU8Resource(arcData, leaf, &foundSize);
+                }
                 if (!found) continue;
                 result = found;
                 cpu->gpr[3] = found;
-                static bool s_loggedMenuBmgFallback = false;
-                if (!s_loggedMenuBmgFallback) {
-                    s_loggedMenuBmgFallback = true;
-                    AppLog("[ArchiveMgr] recovered message/Menu.bmg from decompressed arc=%08X data=%08X size=%u frame=%u\n",
-                        arcData, found, foundSize, gx_bridge::g_gxFrame);
+                static std::set<std::string> s_loggedArchiveRecoveries;
+                if (s_loggedArchiveRecoveries.size() < 64 && s_loggedArchiveRecoveries.insert(reqName).second) {
+                    AppLog("[ArchiveMgr] recovered '%s' from decompressed arc=%08X data=%08X size=%u frame=%u\n",
+                        reqName.c_str(), arcData, found, foundSize, gx_bridge::g_gxFrame);
                 }
                 break;
             }
@@ -3814,7 +4052,22 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
         if (!reqName.empty()) {
             static std::set<std::string> s_seenArchiveLookups;
+            static std::set<std::string> s_resolvedArchiveLookups;
+            static uint32_t s_fontLookupLogs = 0;
             std::string key = std::to_string(archiveType) + "|" + reqName;
+            const bool fontLike = reqName.find("font") != std::string::npos ||
+                reqName.find(".brfnt") != std::string::npos ||
+                reqName.find(".bmg") != std::string::npos;
+            if (fontLike && result && s_resolvedArchiveLookups.size() < 40 &&
+                s_resolvedArchiveLookups.insert(key).second) {
+                AppLog("[ArchiveMgr] RESOLVED type=%u name='%s' -> %08X frame=%u\n",
+                    archiveType, reqName.c_str(), result, gx_bridge::g_gxFrame);
+            }
+            if (fontLike && !result && gx_bridge::g_gxFrame <= 400 && s_fontLookupLogs < 40) {
+                ++s_fontLookupLogs;
+                AppLog("[ArchiveMgr] font lookup failed type=%u name='%s' frame=%u\n",
+                    archiveType, reqName.c_str(), gx_bridge::g_gxFrame);
+            }
             if (s_seenArchiveLookups.size() < 200 && s_seenArchiveLookups.insert(key).second) {
                 AppLog("[ArchiveMgr] type=%u name='%s' -> %08X (magic=%08X) frame=%u\n",
                     archiveType, reqName.c_str(), result, ReadTraceWord(result),
@@ -4395,6 +4648,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         if (cpu->gpr[5] >= 320 && cpu->gpr[6] >= 200) {
             gx_bridge::g_gx.efbWidth = cpu->gpr[5];
             gx_bridge::g_gx.efbHeight = cpu->gpr[6];
+            gx_bridge::UpdateScissorScreenRect();
         }
         return true;
     }
@@ -4719,6 +4973,25 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         gx_bridge::ParseDisplayList(cpu->gpr[3], cpu->gpr[4], 0);
         return true;
     }
+    case 0x80173430u: { // GX::SetScissor(x, y, w, h)
+        gx_bridge::g_gx.scissorX = cpu->gpr[3];
+        gx_bridge::g_gx.scissorY = cpu->gpr[4];
+        gx_bridge::g_gx.scissorW = cpu->gpr[5];
+        gx_bridge::g_gx.scissorH = cpu->gpr[6];
+        gx_bridge::g_gx.scissorSet = (gx_bridge::g_gx.scissorW != 0 && gx_bridge::g_gx.scissorH != 0);
+        gx_bridge::UpdateScissorScreenRect();
+        static uint32_t s_scissorLogs = 0;
+        if (gx_bridge::g_gxFrame >= 80 && gx_bridge::g_gxFrame <= 110 && s_scissorLogs < 16) {
+            ++s_scissorLogs;
+            AppLog("[MenuScissor] frame=%u box=(%u,%u %ux%u) efb=%ux%u screen=(%d,%d)-(%d,%d) lr=%08X\n",
+                gx_bridge::g_gxFrame, gx_bridge::g_gx.scissorX, gx_bridge::g_gx.scissorY,
+                gx_bridge::g_gx.scissorW, gx_bridge::g_gx.scissorH,
+                gx_bridge::g_gx.efbWidth, gx_bridge::g_gx.efbHeight,
+                gx_bridge::g_gx.clipX0, gx_bridge::g_gx.clipY0,
+                gx_bridge::g_gx.clipX1, gx_bridge::g_gx.clipY1, cpu->lr);
+        }
+        return true;
+    }
     case 0x8016E37Cu: { // GX::SetTexCoordGen2
         static uint32_t s_logged = 0;
         if (gx_bridge::g_gxFrame >= 80 && gx_bridge::g_gxFrame <= 110 && s_logged < 24) {
@@ -4785,7 +5058,6 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x80173188u: // GX::LoadNrmMtxImm
     case 0x801731E0u: // GX::LoadNrmMtxIndx3x3
     case 0x80173400u: // GX::SetZScaleOffset
-    case 0x80173430u: // GX::SetScissor
     case 0x801734E0u: // GX::SetScissorBoxOffset
     case 0x8017351Cu: // GX::SetClipMode
     case 0x801735CCu: // GX::SetGPMetric
@@ -5164,7 +5436,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         pendingConfigCommand = cpu->gpr[7];
         cpu->gpr[3] = nandMissing;
         return true;
-    case 0x8019C800u: { // NANDOpen
+    case 0x8019C800u: { // NANDOpen(path, NANDFileInfo* info, mode)
         const uint32_t pathPtr = cpu->gpr[3];
         std::string path;
         for (size_t i = 0; i < 256 && Memory::Contains(pathPtr + i); ++i) {
@@ -5172,23 +5444,54 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             if (c == 0) break;
             path.push_back(c);
         }
-        AppLog("[NAND] NANDOpen: '%s' -> missing\n", path.c_str());
-        cpu->gpr[3] = nandMissing;
+        const uint32_t info = cpu->gpr[4];
+        const bool exists = nandLoad(path);
+        if (exists && Memory::Contains(info, 12)) {
+            const uint32_t fd = s_nandNextFd++;
+            s_nandOpen[fd] = NandFile{path, 0};
+            Memory::Write32(info, fd);
+            Memory::Write32(info + 4, 0);
+            Memory::Write8(info + 8, 1);
+            Memory::Write8(info + 9, 0);
+            AppLog("[NAND] NANDOpen: '%s' mode=%u -> fd=%u size=%zu\n",
+                path.c_str(), cpu->gpr[5], fd, s_nandStore[path].size());
+            cpu->gpr[3] = 0;
+        } else {
+            AppLog("[NAND] NANDOpen: '%s' mode=%u -> missing\n", path.c_str(), cpu->gpr[5]);
+            cpu->gpr[3] = nandMissing;
+        }
         return true;
     }
-    case 0x8019CA80u: // NANDClose
+    case 0x8019CA80u: // NANDClose(info)
+        if (const uint32_t fd = nandInfoFd(cpu->gpr[3])) s_nandOpen.erase(fd);
         cpu->gpr[3] = 0;
         return true;
-    case 0x8019B43Cu: // NANDCreate
-        cpu->gpr[3] = 0;
-        return true;
-    case 0x8019E770u: { // NANDGetType
+    case 0x8019B43Cu: { // NANDCreate(path, perm, attr)
         const uint32_t pathPtr = cpu->gpr[3];
         std::string path;
         for (size_t i = 0; i < 256 && Memory::Contains(pathPtr + i); ++i) {
             char c = static_cast<char>(Memory::Read8(pathPtr + i));
             if (c == 0) break;
             path.push_back(c);
+        }
+        s_nandLoaded[path] = true;
+        s_nandStore[path];
+        AppLog("[NAND] NANDCreate '%s'\n", path.c_str());
+        cpu->gpr[3] = 0;
+        return true;
+    }
+    case 0x8019E770u: { // NANDGetType(path, u8* type)
+        const uint32_t pathPtr = cpu->gpr[3];
+        std::string path;
+        for (size_t i = 0; i < 256 && Memory::Contains(pathPtr + i); ++i) {
+            char c = static_cast<char>(Memory::Read8(pathPtr + i));
+            if (c == 0) break;
+            path.push_back(c);
+        }
+        if (nandLoad(path)) {
+            if (Memory::Contains(cpu->gpr[4], 1)) Memory::Write8(cpu->gpr[4], 1); // file
+            cpu->gpr[3] = 0;
+            return true;
         }
         AppLog("[NAND] NANDGetType: '%s' -> missing\n", path.c_str());
         cpu->gpr[3] = nandMissing;
@@ -5201,12 +5504,71 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         cpu->gpr[3] = 0;
         return true;
     case 0x8019C380u: // NANDGetStatus
-        cpu->gpr[3] = nandMissing;
+        cpu->gpr[3] = 0;
         return true;
-    case 0x8019B7A4u: // NANDRead
-    case 0x8019B884u: // NANDWrite
-    case 0x8019B964u: // NANDSeek
-    case 0x8019BF4Cu: // NANDGetLength
+    case 0x8019B7A4u: { // NANDRead(info, buf, len)
+        const uint32_t fd = nandInfoFd(cpu->gpr[3]);
+        auto mit = s_nandOpen.find(fd);
+        if (mit == s_nandOpen.end()) { cpu->gpr[3] = nandMissing; return true; }
+        const std::vector<uint8_t>& data = s_nandStore[mit->second.path];
+        const uint32_t buf = cpu->gpr[4];
+        uint32_t len = cpu->gpr[5];
+        size_t pos = mit->second.pos;
+        if (pos >= data.size()) { cpu->gpr[3] = 0; return true; }
+        if (len > data.size() - pos) len = static_cast<uint32_t>(data.size() - pos);
+        if (Memory::Contains(buf, len)) {
+            for (uint32_t i = 0; i < len; ++i) Memory::Write8(buf + i, data[pos + i]);
+        } else {
+            len = 0;
+        }
+        mit->second.pos = pos + len;
+        cpu->gpr[3] = len;
+        return true;
+    }
+    case 0x8019B884u: { // NANDWrite(info, buf, len)
+        const uint32_t fd = nandInfoFd(cpu->gpr[3]);
+        auto mit = s_nandOpen.find(fd);
+        if (mit == s_nandOpen.end()) { cpu->gpr[3] = nandMissing; return true; }
+        std::vector<uint8_t>& data = s_nandStore[mit->second.path];
+        const uint32_t buf = cpu->gpr[4];
+        const uint32_t len = cpu->gpr[5];
+        const size_t pos = mit->second.pos;
+        if (pos + len > data.size()) data.resize(pos + len, 0);
+        if (Memory::Contains(buf, len)) {
+            for (uint32_t i = 0; i < len; ++i) data[pos + i] = Memory::Read8(buf + i);
+            mit->second.pos = pos + len;
+            cpu->gpr[3] = len;
+        } else {
+            cpu->gpr[3] = 0;
+        }
+        return true;
+    }
+    case 0x8019B964u: { // NANDSeek(info, offset, whence)
+        const uint32_t fd = nandInfoFd(cpu->gpr[3]);
+        auto mit = s_nandOpen.find(fd);
+        if (mit == s_nandOpen.end()) { cpu->gpr[3] = nandMissing; return true; }
+        const std::vector<uint8_t>& data = s_nandStore[mit->second.path];
+        const int32_t offset = static_cast<int32_t>(cpu->gpr[4]);
+        int64_t base = 0;
+        if (cpu->gpr[5] == 1) base = static_cast<int64_t>(mit->second.pos);
+        else if (cpu->gpr[5] == 2) base = static_cast<int64_t>(data.size());
+        int64_t next = base + offset;
+        if (next < 0) next = 0;
+        if (next > static_cast<int64_t>(data.size())) next = static_cast<int64_t>(data.size());
+        mit->second.pos = static_cast<size_t>(next);
+        cpu->gpr[3] = static_cast<uint32_t>(next);
+        return true;
+    }
+    case 0x8019BF4Cu: { // NANDGetLength(info, u32* length)
+        const uint32_t fd = nandInfoFd(cpu->gpr[3]);
+        auto mit = s_nandOpen.find(fd);
+        if (mit == s_nandOpen.end()) { cpu->gpr[3] = nandMissing; return true; }
+        if (Memory::Contains(cpu->gpr[4], 4)) {
+            Memory::Write32(cpu->gpr[4], static_cast<uint32_t>(s_nandStore[mit->second.path].size()));
+        }
+        cpu->gpr[3] = 0;
+        return true;
+    }
     case 0x8019B59Cu: // NANDDelete
     case 0x8019BBE0u: // NANDCreateDir
     case 0x8019BEE8u: // NANDMove
