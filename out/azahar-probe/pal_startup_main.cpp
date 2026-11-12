@@ -3612,6 +3612,20 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         if (cpu) cpu->gpr[3] = 0;
         return true;
     }
+    if (cpu && cpu->lr >= 0x805BB200u && cpu->lr < 0x805BB400u) {
+        static std::set<uint32_t> s_seenSectionDispatch;
+        if (s_seenSectionDispatch.size() < 16 && s_seenSectionDispatch.insert(target).second) {
+            AppLog("[SectionDispatch] target=%08X lr=%08X this=%08X frame=%u\n",
+                target, cpu->lr, cpu->gpr[3], gx_bridge::g_gxFrame);
+        }
+    }
+    if (cpu && gx_bridge::g_gxFrame >= 90 && gx_bridge::g_gxFrame <= 92) {
+        static std::set<uint32_t> s_seenIndirect;
+        if (s_seenIndirect.size() < 120 && s_seenIndirect.insert(target).second) {
+            AppLog("[Indirect] frame=%u target=%08X lr=%08X this=%08X\n",
+                gx_bridge::g_gxFrame, target, cpu->lr, cpu->gpr[3]);
+        }
+    }
     static uint64_t s_hleCallCount = 0;
     ++s_hleCallCount;
     if (s_hleCallCount % 100000 == 0) {
@@ -3966,6 +3980,17 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return false;
     }
     case 0x806223A0u: { // PageManager entry (page switch / create)
+        static bool s_dumpedMgr = false;
+        if (!s_dumpedMgr && cpu->gpr[3] && Memory::Contains(cpu->gpr[3], 160)) {
+            s_dumpedMgr = true;
+            std::string dump;
+            for (int i = 0; i < 40; ++i) {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), " %08X", Memory::Read32(cpu->gpr[3] + i * 4));
+                dump += buf;
+            }
+            AppLog("[PageMgrDump] this=%08X%s\n", cpu->gpr[3], dump.c_str());
+        }
         static std::set<uint32_t> s_seenArgs;
         const uint32_t key = (cpu->gpr[3] & 0xFFFF0000u) ^ (cpu->gpr[4] & 0xFFFFu) ^ (cpu->gpr[5] << 8);
         if (s_seenArgs.size() < 24 && s_seenArgs.insert(key).second) {
@@ -6425,6 +6450,18 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             s_profiled100 = true;
             ReportWorkingSet("Frame 100 (title/menu page creation)");
         }
+        if (s_frameCount == 100) {
+            const uint32_t gm = Memory::Read32(0x809BD6F8u);
+            if (gm && Memory::Contains(gm, 160)) {
+                std::string dump;
+                for (int i = 0; i < 40; ++i) {
+                    char buf[16];
+                    std::snprintf(buf, sizeof(buf), " %08X", Memory::Read32(gm + i * 4));
+                    dump += buf;
+                }
+                AppLog("[GateDump] gm=%08X%s\n", gm, dump.c_str());
+            }
+        }
         if (s_frameCount == 90) {
             const uint32_t mgr = Memory::Read32(0x809BD748u);
             if (mgr && Memory::Contains(mgr, 96)) {
@@ -6447,9 +6484,11 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             std::fflush(stdout);
         }
         if (s_frameCount >= 80 && s_frameCount <= 140 && s_frameCount % 10 == 0) {
-            const uint32_t mgr = Memory::Read32(0x809BD748u);
-            const uint32_t flag = (mgr && Memory::Contains(mgr + 76, 1)) ? Memory::Read8(mgr + 76) : 0xFFu;
-            AppLog("[PageGate] frame=%u mgr=%08X flag=%u\n", s_frameCount, mgr, flag);
+            // func_80554E14 reads *(0x809C0000 - 10504) = *(0x809BD6F8), then +76.
+            const uint32_t gateMgr = Memory::Read32(0x809BD6F8u);
+            const uint32_t gateFlag = (gateMgr && Memory::Contains(gateMgr + 76, 1)) ? Memory::Read8(gateMgr + 76) : 0xFFu;
+            const uint32_t arcMgr = Memory::Read32(0x809BD748u);
+            AppLog("[PageGate] frame=%u gateMgr=%08X flag=%u arcMgr=%08X\n", s_frameCount, gateMgr, gateFlag, arcMgr);
         }
         if (s_frameCount <= 20 || s_frameCount % 40 == 0) {
             const uint32_t sm = Memory::Read32(0x809C1E38u);
