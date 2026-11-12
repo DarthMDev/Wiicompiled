@@ -1163,8 +1163,11 @@ static const DecodedTex* GetOrDecodeTexture(const TexSlot& slot) {
                 for (int y = 0; y < 4; ++y) {
                     for (int x = 0; x < 8; ++x) {
                         uint8_t byte = *p++;
-                        uint32_t a = (byte >> 4) * 17u;
-                        uint32_t v = (byte & 0xFu) * 17u;
+                        // GX IA4: intensity in the high nibble, alpha in the low nibble.
+                        // Swapping them made every font glyph sample alpha from its intensity
+                        // (and vice versa), so menu text rendered invisible.
+                        uint32_t v = (byte >> 4) * 17u;
+                        uint32_t a = (byte & 0xFu) * 17u;
                         int px = bx * 8 + x, py = by * 4 + y;
                         if (px < w && py < h) tex.rgba[py * w + px] = (v << 24) | (v << 16) | (v << 8) | a;
                     }
@@ -1180,8 +1183,9 @@ static const DecodedTex* GetOrDecodeTexture(const TexSlot& slot) {
             for (int bx = 0; bx < bw; ++bx) {
                 for (int y = 0; y < 4; ++y) {
                     for (int x = 0; x < 4; ++x) {
-                        uint32_t a = p[0];
-                        uint32_t v = p[1];
+                        // GX IA8 is stored intensity first, then alpha.
+                        uint32_t v = p[0];
+                        uint32_t a = p[1];
                         p += 2;
                         int px = bx * 4 + x, py = by * 4 + y;
                         if (px < w && py < h) tex.rgba[py * w + px] = (v << 24) | (v << 16) | (v << 8) | a;
@@ -1684,6 +1688,19 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
         w1_row += dw1_dy;
     }
     if (g_gx.projType == 1 && wrotePixel) ++g_gx.tri2DWritten;
+    if (g_gx.projType == 1 && g_gxFrame == 296u && slot.width >= 512) {
+        static uint32_t s_tri2DLogs = 0;
+        if (s_tri2DLogs < 60) {
+            ++s_tri2DLogs;
+            AppLog("[Tri2D] n=%u bounds=(%d,%d)-(%d,%d) col0=%02X%02X%02X%02X col1=%02X%02X%02X%02X col2=%02X%02X%02X%02X uv0=(%.3f,%.3f) uv1=(%.3f,%.3f) uv2=(%.3f,%.3f) texSlot=%d tex=%08X %ux%u f%u wrote=%d\n",
+                s_tri2DLogs, minX, minY, maxX, maxY,
+                cv[0].r, cv[0].g, cv[0].b, cv[0].a,
+                cv[1].r, cv[1].g, cv[1].b, cv[1].a,
+                cv[2].r, cv[2].g, cv[2].b, cv[2].a,
+                cv[0].u, cv[0].v, cv[1].u, cv[1].v, cv[2].u, cv[2].v,
+                texSlotIdx, slot.dataAddr, slot.width, slot.height, slot.format, wrotePixel ? 1 : 0);
+        }
+    }
     if (tracePerspective) {
         ++g_perspectiveTrace.rasterized;
         if (wrotePixel) ++g_perspectiveTrace.wrotePixels;
@@ -2558,8 +2575,8 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
         gspWaitForVBlank();
     }
 #endif
-    if (frameNumber == kGxTraceFrame || frameNumber == 86 || frameNumber == 90 || frameNumber == 100 ||
-        frameNumber == 150 || frameNumber == 300 || frameNumber == 450 || frameNumber == 580 ||
+    if (frameNumber == kGxTraceFrame || frameNumber == 88 || frameNumber == 96 || frameNumber == 104 ||
+        frameNumber == 152 || frameNumber == 296 || frameNumber == 448 || frameNumber == 584 ||
         (frameNumber > 600 && frameNumber % 300 == 0)) {
         char path[64];
         std::snprintf(path, sizeof(path), "sdmc:/frame_%u.ppm", frameNumber);
@@ -3376,6 +3393,14 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
 
         func_800841B0(cpu);
+        if (gx_bridge::g_gxFrame >= 80 && gx_bridge::g_gxFrame <= 95) {
+            static uint32_t s_accessorLogs = 0;
+            if (s_accessorLogs < 60 && name && name[0]) {
+                ++s_accessorLogs;
+                AppLog("[Accessor] frame=%u '%s' type=%u -> %08X lr=%08X\n",
+                    gx_bridge::g_gxFrame, name, type, cpu->gpr[3], cpu->lr);
+            }
+        }
         if (cpu->gpr[3] != 0) return true;
 
         if (resAcc && Memory::Contains(resAcc, 16)) {
@@ -3471,14 +3496,20 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return false;
     }
     if (target == 0x80124500u) {
-        AppLog("[ARC::InitHandle] arcData=%08X handle=%08X (magic=%08X)\n",
+        AppLog("[ARC::InitHandle] arcData=%08X handle=%08X (magic=%08X) lr=%08X r4=%08X r5=%08X r6=%08X\n",
             cpu->gpr[3], cpu->gpr[4],
-            (cpu->gpr[3] && Memory::Contains(cpu->gpr[3], 4)) ? Memory::Read32(cpu->gpr[3]) : 0);
+            (cpu->gpr[3] && Memory::Contains(cpu->gpr[3], 4)) ? Memory::Read32(cpu->gpr[3]) : 0,
+            cpu->lr, cpu->gpr[4], cpu->gpr[5], cpu->gpr[6]);
         return false;
     }
     if (cpu && (cpu->lr == 0x805C2CD4u || cpu->lr == 0x805E88F4u || cpu->lr == 0x805E8910u || cpu->lr == 0x805E8958u)) {
-        AppLog("[ControlLoader Trace] lr=%08X target=%08X r3=%08X r4=%08X r5=%08X\n",
-            cpu->lr, target, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5]);
+        {
+            const uint32_t namePtr = cpu->gpr[5];
+            const char* resName = (namePtr && Memory::Contains(namePtr, 1))
+                ? reinterpret_cast<const char*>(Memory::GetPointer(namePtr, 1)) : "";
+            AppLog("[ControlLoader Trace] lr=%08X target=%08X r3=%08X r4=%08X r5=%08X name='%s'\n",
+                cpu->lr, target, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], resName);
+        }
         if ((cpu->lr == 0x805C2CD4u || cpu->lr == 0x805E88F4u) && cpu->gpr[5] && Memory::Contains(cpu->gpr[5], 32)) {
             AppLog("  GetResource name='%s'\n", reinterpret_cast<const char*>(Memory::GetPointer(cpu->gpr[5], 1)));
             const uint32_t resAcc = cpu->gpr[3];
@@ -3651,6 +3682,37 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x8012E5D0u: case 0x8012E5D8u: case 0x8012E5E0u:
     case 0x8012E654u: case 0x8012E684u:
         return true;
+    case 0x80197380u: { // WPAD status read (chan, out, len) - unlinked, so fill it explicitly
+        const uint32_t out = cpu->gpr[4];
+        const uint32_t len = cpu->gpr[5];
+        static uint32_t s_wpadStatusLogs = 0;
+        if (s_wpadStatusLogs < 4) {
+            ++s_wpadStatusLogs;
+            AppLog("[WPAD] status read chan=%u out=%08X len=%u lr=%08X\n",
+                cpu->gpr[3], out, len, cpu->lr);
+        }
+        if (out && len && len <= 0x100 && Memory::Contains(out, len)) {
+            // No buttons pressed. Leaving this buffer untouched let stale guest memory decide
+            // the HOME button state, which put the game on the "Return to the Wii Menu" page.
+            std::memset(Memory::GetPointer(out, len), 0, len);
+        }
+        cpu->gpr[3] = 0;
+        return true;
+    }
+    case 0x801BD734u: { // WPAD::Read(chan, status) - must fill the buffer, not leave it stale
+        static uint32_t s_wpadReadLogs = 0;
+        if (s_wpadReadLogs < 6) {
+            ++s_wpadReadLogs;
+            AppLog("[WPAD] Read chan=%u status=%08X r5=%08X r6=%08X lr=%08X\n",
+                cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6], cpu->lr);
+        }
+        const uint32_t statusPtr = cpu->gpr[4];
+        if (statusPtr && Memory::Contains(statusPtr, 0x60)) {
+            std::memset(Memory::GetPointer(statusPtr, 0x60), 0, 0x60);
+        }
+        cpu->gpr[3] = 0;
+        return true;
+    }
     case 0x801BF5C4u: // WPAD::Init
     case 0x801BF64Cu: // WPAD::GetStatus
         cpu->gpr[3] = 2; // WPAD_STATE_ENABLED
@@ -3699,7 +3761,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 gx_bridge::WriteGuestFloat(statusPtr + 0x3C, lx);
                 gx_bridge::WriteGuestFloat(statusPtr + 0x40, ly);
 #endif
-                if (gx_bridge::g_gxFrame >= 20 && gx_bridge::g_gxFrame <= 900) {
+                if (gx_bridge::g_gxFrame >= 20 && gx_bridge::g_gxFrame <= 100000) {
                     if ((gx_bridge::g_gxFrame % 4) < 2) {
                         hold |= 0x0010; // Auto-pulse Classic A to skip intro
                     }
@@ -3764,7 +3826,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 #endif
 
             // Auto-pulse A + START between frame 20 and 900 to guarantee skipping intro flyover
-            if (gx_bridge::g_gxFrame >= 20 && gx_bridge::g_gxFrame <= 900) {
+            if (gx_bridge::g_gxFrame >= 20 && gx_bridge::g_gxFrame <= 100000) {
                 if ((gx_bridge::g_gxFrame % 4) < 2) {
                     buttons |= 0x1100; // PAD_BUTTON_A (0x0100) | PAD_BUTTON_START (0x1000)
                 }
@@ -3831,6 +3893,17 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x800BD860u: // RFLiIsWorking
         cpu->gpr[3] = 0;
         return true;
+    case 0x80601D24u: { // Page::Init(page)
+        const uint32_t page = cpu->gpr[3];
+        static uint32_t s_pageInitLogs = 0;
+        if (s_pageInitLogs < 20 && page && Memory::Contains(page, 64)) {
+            ++s_pageInitLogs;
+            AppLog("[PageInit] page=%08X vt=%08X f4=%08X f8=%08X fC=%08X f10=%08X f14=%08X lr=%08X\n",
+                page, Memory::Read32(page), Memory::Read32(page + 4), Memory::Read32(page + 8),
+                Memory::Read32(page + 12), Memory::Read32(page + 16), Memory::Read32(page + 20), cpu->lr);
+        }
+        return false; // let the real Page::Init run
+    }
     case 0x805EF688u: { // PageManipulatorManager::OnReset
         if (cpu && cpu->gpr[3]) {
             const uint32_t manipMgr = cpu->gpr[3];
@@ -5469,6 +5542,13 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return true;
     }
     case 0x8019CA80u: // NANDClose(info)
+        {
+            static uint32_t s_closeLogs = 0;
+            if (s_closeLogs < 6) {
+                ++s_closeLogs;
+                AppLog("[NAND] Close info=%08X fd=%u\n", cpu->gpr[3], nandInfoFd(cpu->gpr[3]));
+            }
+        }
         if (const uint32_t fd = nandInfoFd(cpu->gpr[3])) s_nandOpen.erase(fd);
         cpu->gpr[3] = 0;
         return true;
@@ -5515,6 +5595,12 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x8019B7A4u: { // NANDRead(info, buf, len)
         const uint32_t fd = nandInfoFd(cpu->gpr[3]);
         auto mit = s_nandOpen.find(fd);
+        static uint32_t s_nandReadLogs = 0;
+        if (s_nandReadLogs < 12) {
+            ++s_nandReadLogs;
+            AppLog("[NAND] Read info=%08X fd=%u len=%u known=%d\n",
+                cpu->gpr[3], fd, cpu->gpr[5], mit != s_nandOpen.end() ? 1 : 0);
+        }
         if (mit == s_nandOpen.end()) { cpu->gpr[3] = nandMissing; return true; }
         const std::vector<uint8_t>& data = s_nandStore[mit->second.path];
         const uint32_t buf = cpu->gpr[4];
@@ -5528,7 +5614,18 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             len = 0;
         }
         mit->second.pos = pos + len;
-        cpu->gpr[3] = len;
+        static uint32_t s_nandCopyLogs = 0;
+        if (s_nandCopyLogs < 6) {
+            ++s_nandCopyLogs;
+            uint32_t hdr = 0;
+            for (int i = 0; i < 4 && pos + i < data.size(); ++i) {
+                hdr = (hdr << 8) | data[pos + i];
+            }
+            AppLog("[NAND] Read -> %u bytes (pos=%zu size=%zu) first4=%08X\n",
+                len, pos, data.size(), hdr);
+        }
+        // The SDK returns the byte count; MKW_READ_RET0=1 tests the status-code hypothesis.
+        cpu->gpr[3] = std::getenv("MKW_READ_RET0") ? 0u : len;
         return true;
     }
     case 0x8019B884u: { // NANDWrite(info, buf, len)
@@ -5550,6 +5647,8 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return true;
     }
     case 0x8019B964u: { // NANDSeek(info, offset, whence)
+        static uint32_t s_seekLogs = 0;
+        if (s_seekLogs < 10) { ++s_seekLogs; AppLog("[NAND] Seek info=%08X off=%d whence=%u\n", cpu->gpr[3], (int32_t)cpu->gpr[4], cpu->gpr[5]); }
         const uint32_t fd = nandInfoFd(cpu->gpr[3]);
         auto mit = s_nandOpen.find(fd);
         if (mit == s_nandOpen.end()) { cpu->gpr[3] = nandMissing; return true; }
@@ -5566,6 +5665,8 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return true;
     }
     case 0x8019BF4Cu: { // NANDGetLength(info, u32* length)
+        static uint32_t s_lenLogs = 0;
+        if (s_lenLogs < 6) { ++s_lenLogs; AppLog("[NAND] GetLength info=%08X\n", cpu->gpr[3]); }
         const uint32_t fd = nandInfoFd(cpu->gpr[3]);
         auto mit = s_nandOpen.find(fd);
         if (mit == s_nandOpen.end()) { cpu->gpr[3] = nandMissing; return true; }
@@ -5898,11 +5999,76 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             cpu ? cpu->lr : 0, forceRace ? 1 : 0);
 
         if (!forceRace) {
+            // The real parser is a thunk that returns *(*(0x80386000)+152), the boot section
+            // chosen by the launch-argument handler. Report it and allow an override.
+            {
+                const uint32_t bootArg = Memory::Read32(0x80386000u);
+                const uint32_t bootSection = (bootArg && Memory::Contains(bootArg + 152, 4))
+                    ? Memory::Read32(bootArg + 152) : 0xDEADBEEFu;
+                AppLog("[BootPath] bootArg=%08X bootSection=%d (0x%X)\n",
+                    bootArg, static_cast<int32_t>(bootSection), bootSection);
+                if (const char* e = std::getenv("MKW_BOOT_ARG")) {
+                    if (bootArg && Memory::Contains(bootArg + 152, 4)) {
+                        // The parser expects a UTF-16 launch-argument string such as "-1".
+                        constexpr uint32_t kArgScratch = 0x955F8000u;
+                        const char* enc = std::getenv("MKW_ARG_ENC");
+                        const bool utf16 = enc && (enc[0] == 'u');
+                        size_t n = 0;
+                        for (; e[n] && n < 32; ++n) {
+                            if (utf16) {
+                                Memory::Write8(kArgScratch + n * 2, 0);
+                                Memory::Write8(kArgScratch + n * 2 + 1, static_cast<uint8_t>(e[n]));
+                            } else {
+                                Memory::Write8(kArgScratch + n, static_cast<uint8_t>(e[n]));
+                            }
+                        }
+                        if (utf16) {
+                            Memory::Write8(kArgScratch + n * 2, 0);
+                            Memory::Write8(kArgScratch + n * 2 + 1, 0);
+                        } else {
+                            Memory::Write8(kArgScratch + n, 0);
+                        }
+                        Memory::Write32(bootArg + 152, kArgScratch);
+                        AppLog("[BootPath] overriding launch arg -> '%s' at %08X\n", e, kArgScratch);
+                    }
+                }
+            }
+            // MKW_FORCE_SECTION: mirror the race shortcut's section switch at parse time.
+            // Default to section 16 (the game's main menu). The natural parser result is -1
+            // because the launch-argument string is NULL, which SectionMgr turns into the
+            // Mario Kart Channel (section 21). MKW_NATURAL_BOOT=1 restores that path.
+            if (!std::getenv("MKW_NATURAL_BOOT")) {
+                const char* e = std::getenv("MKW_FORCE_SECTION");
+                const uint32_t sec = e ? static_cast<uint32_t>(std::atoi(e)) : 16u;
+                if (sectionMgr) {
+                    Memory::Write32(sectionMgr + 4, sec);
+                    Memory::Write32(sectionMgr + 12, sec);
+                    CpuContext padCtx = *cpu;
+                    padCtx.gpr[3] = sectionMgr + 0x34u;
+                    padCtx.gpr[4] = 0;
+                    padCtx.gpr[5] = 0x124u;
+                    CpuContextScope scope(&padCtx);
+                    InvokeIndirectCpu(0x8061B490u, &padCtx);
+                }
+                cpu->gpr[3] = sec;
+                AppLog("[BootPath] forced section -> %u\n", sec);
+                return true;
+            }
             // Run the real parser and report what section the game itself picked.
             func_805B9344(cpu);
             AppLog("[BootPath] real parser -> section %d (sm curSec=%d)\n",
                 cpu ? static_cast<int32_t>(cpu->gpr[3]) : -1,
                 sectionMgr ? static_cast<int32_t>(Memory::Read32(sectionMgr + 4)) : -1);
+            // The real parser returns -1 when the launch arguments are not understood, and
+            // SectionMgr::init maps -1 to section 63 (0x3F) = the Mario Kart Channel app.
+            // MKW_BOOT_SECTION lets us boot a different section (the game's title/menu).
+            if (cpu) {
+                if (const char* e = std::getenv("MKW_BOOT_SECTION")) {
+                    const int forced = std::atoi(e);
+                    cpu->gpr[3] = static_cast<uint32_t>(forced);
+                    AppLog("[BootPath] overriding boot section -> %d\n", forced);
+                }
+            }
             std::fflush(stdout);
             return true;
         }
@@ -6157,9 +6323,86 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             const uint32_t prevSecId = sm ? Memory::Read32(sm + 8) : 0;
             const uint32_t nextSecId = sm ? Memory::Read32(sm + 12) : 0;
             const uint32_t transState = sm ? Memory::Read32(sm + 48) : 0;
-            AppLog("[Game Frame %u] sm=%08X curSec=%u nextSec=%u state=%u (retrace=%u)\n",
-                s_frameCount, sm, curSecId, nextSecId, transState, Memory::Read32(0x80386be4u));
+            const uint32_t sm2 = 0x908C3ED0u;
+            AppLog("[Game Frame %u] sm=%08X curSec=%u nextSec=%u state=%u (retrace=%u) sm2=%08X sec2=%d next2=%d\n",
+                s_frameCount, sm, curSecId, nextSecId, transState, Memory::Read32(0x80386be4u),
+                sm2, static_cast<int32_t>(Memory::Read32(sm2 + 4)), static_cast<int32_t>(Memory::Read32(sm2 + 12)));
             std::fflush(stdout);
+        }
+        // Diagnostic: dump UTF-16BE ASCII strings from guest RAM once the menu is up. MKWii's
+        // TextBox panes store their text as UTF-16, so this reveals the message-window text and
+        // any page labels even when glyph drawing is broken. Host-only (MKW_SCAN_TEXT=1).
+        static bool s_textScanned = false;
+        if (!s_textScanned && s_frameCount >= 130 && std::getenv("MKW_SCAN_TEXT")) {
+            s_textScanned = true;
+            std::set<std::string> seen;
+            const uint32_t ranges[2][2] = {{0x80000000u, 0x81800000u}, {0x90000000u, 0x92000000u}};
+            for (const auto& range : ranges) {
+                uint32_t addr = range[0];
+                while (addr + 2 < range[1]) {
+                    if (!Memory::Contains(addr, 2)) { addr += 0x1000; continue; }
+                    const uint32_t hi = Memory::Read8(addr);
+                    const uint32_t lo = Memory::Read8(addr + 1);
+                    if (hi == 0 && lo >= 0x20 && lo < 0x7F) {
+                        std::string text;
+                        uint32_t cursor = addr;
+                        while (cursor + 1 < range[1] && Memory::Contains(cursor, 2) &&
+                               Memory::Read8(cursor) == 0) {
+                            const uint32_t c = Memory::Read8(cursor + 1);
+                            if (c < 0x20 || c >= 0x7F) break;
+                            text.push_back(static_cast<char>(c));
+                            cursor += 2;
+                        }
+                        if (text.size() >= 8 && seen.size() < 400 && seen.insert(text).second) {
+                            AppLog("[GuestText] %08X '%s'\n", addr, text.c_str());
+                        }
+                        addr = cursor > addr ? cursor : addr + 2;
+                        continue;
+                    }
+                    addr += 2;
+                }
+            }
+            std::fflush(stdout);
+        }
+        if (s_frameCount == 120) {
+            const uint32_t sm = Memory::Read32(0x809C1E38u);
+            if (sm && Memory::Contains(sm, 128)) {
+                std::string dump;
+                for (int i = 0; i < 24; ++i) {
+                    char buf[16];
+                    std::snprintf(buf, sizeof(buf), " %08X", Memory::Read32(sm + i * 4));
+                    dump += buf;
+                }
+                AppLog("[SectionMgrDump] sm=%08X%s\n", sm, dump.c_str());
+                // Follow the first few pointers that look like MEM2 objects and show their vtable.
+                for (int i = 0; i < 24; ++i) {
+                    const uint32_t v = Memory::Read32(sm + i * 4);
+                    if (v >= 0x90000000u && v < 0x92000000u && Memory::Contains(v, 8)) {
+                        AppLog("[SectionMgrDump] +%02X -> %08X vt=%08X\n", i * 4, v, Memory::Read32(v));
+                    }
+                }
+            }
+        }
+        // MKW_FORCE_SECTION: switch the section manager to an arbitrary section id using the
+        // same path as the race shortcut, to find the game's title/menu section.
+        static bool s_forcedSection = false;
+        if (!s_forcedSection && s_frameCount >= 90) {
+            if (const char* e = std::getenv("MKW_FORCE_SECTION")) {
+                s_forcedSection = true;
+                const uint32_t sec = static_cast<uint32_t>(std::atoi(e));
+                const uint32_t sm = Memory::Read32(0x809C1E38u);
+                if (sm) {
+                    Memory::Write32(sm + 4, sec);
+                    Memory::Write32(sm + 12, sec);
+                    CpuContext padCtx = *cpu;
+                    padCtx.gpr[3] = sm + 0x34u;
+                    padCtx.gpr[4] = 0;
+                    padCtx.gpr[5] = 0x124u;
+                    CpuContextScope scope(&padCtx);
+                    InvokeIndirectCpu(0x8061B490u, &padCtx);
+                    AppLog("[SectionForce] frame=%u -> section %u (sm=%08X)\n", s_frameCount, sec, sm);
+                }
+            }
         }
         static bool s_reported600 = false;
         if (!s_reported600 && s_frameCount >= 600) {
@@ -6202,6 +6445,13 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return true;
     }
     default:
+        if (gx_bridge::g_gxFrame >= 100 && gx_bridge::g_gxFrame <= 110) {
+            static std::set<uint32_t> s_seenRangeTargets;
+            if (s_seenRangeTargets.size() < 70 && s_seenRangeTargets.insert(target).second) {
+                AppLog("[HleRange] frame=%u target=%08X r3=%08X r4=%08X r5=%08X r6=%08X lr=%08X\n",
+                    gx_bridge::g_gxFrame, target, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6], cpu->lr);
+            }
+        }
         // --- Range-based HLE for hardware/SDK subsystems ---
         // GX: Graphics subsystem (0x8016B000 - 0x80174000)
         if (target >= 0x8016B000u && target < 0x80174000u) {
