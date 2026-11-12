@@ -1439,7 +1439,11 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
     // their own camera and points the view at the sky, so only use it in the race section.
     const uint32_t dbgSecMgr = Memory::Read32(0x809C1E38u);
     const bool dbgRaceSection = dbgSecMgr && Memory::Read32(dbgSecMgr + 4) == 0x20u;
-    if (kDebugCamera && dbgRaceSection && g_gx.projType == 0) {
+    if (pnMtxIdx != 0 && std::getenv("MKW_SKIN_VIEW") && g_gx.projType == 0) {
+        // Skinned models load the view matrix into pnMtx[0] and the bone matrices into
+        // pnMtx[1..9]. The vertex transform is view * bone, not the bone alone.
+        MulAffine3x4(g_gx.pnMtx[0], g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0], mv);
+    } else if (kDebugCamera && dbgRaceSection && g_gx.projType == 0) {
         // Compose: debug view * the object's own model matrix. Replacing the matrix outright
         // discards per-object transforms, which puts every kart at the wrong place.
         float view[12];
