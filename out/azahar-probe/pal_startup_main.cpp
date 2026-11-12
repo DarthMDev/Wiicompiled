@@ -52,6 +52,7 @@ extern "C" void func_8052A954(CpuContext*);
 extern "C" void func_80540038(CpuContext*);
 extern "C" void func_805B9344(CpuContext*);
 extern "C" void func_805E889C(CpuContext*);
+extern "C" void func_80631588(CpuContext*);
 extern "C" void func_805A08F0(CpuContext*);
 extern "C" void func_805E78F0(CpuContext*);
 extern "C" void func_80577064(CpuContext*);
@@ -3942,13 +3943,16 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return true;
     }
     case 0x8061C86Cu: {
+        if (std::getenv("MKW_NATURAL_PAGES")) return false;
         cpu->gpr[3] = 0;
         return true;
     }
     case 0x8061C8E8u: {
+        if (std::getenv("MKW_NATURAL_PAGES")) return false;
         return true;
     }
     case 0x8061CA40u: { // PageRecognizePad::OnReset (slot 13)
+        if (std::getenv("MKW_NATURAL_PAGES")) return false;
         const uint32_t secMgr = ReadTraceWord(0x809C1E38);
         if (secMgr && Memory::Contains(secMgr, 4)) {
             const uint32_t sec = Memory::Read32(secMgr);
@@ -3960,6 +3964,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return true;
     }
     case 0x8061CAA8u: { // PageRecognizePad::CheckActions (slot 14)
+        if (std::getenv("MKW_NATURAL_PAGES")) return false;
         if (cpu && cpu->gpr[3]) {
             const uint32_t page = cpu->gpr[3];
             if (Memory::Contains(page, 16)) {
@@ -3970,6 +3975,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     }
     case 0x8061CB94u:   // PageRecognizePad::Slot15
     case 0x8061CBE0u: { // PageRecognizePad::Slot16
+        if (std::getenv("MKW_NATURAL_PAGES")) return false;
         if (cpu && cpu->gpr[3]) {
             const uint32_t page = cpu->gpr[3];
             if (Memory::Contains(page, 16)) {
@@ -3985,10 +3991,14 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x8061CE2Cu: // PageRecognizePad::Slot22
     case 0x8061CF00u: // PageRecognizePad::Slot23
     case 0x8061CFECu: // PageRecognizePad::Slot24
+        if (std::getenv("MKW_NATURAL_PAGES")) return false;
+        return true;
     case 0x8061C0D8u: // Pages::RecognizePad::OnInit - suppress dialog
     case 0x8061C1C0u: // Pages::RecognizePad::OnActivate
+        if (std::getenv("MKW_NATURAL_PAGES")) return false;
         return true;
     case 0x8061C518u: // Pages::RecognizePad::IsVisible
+        if (std::getenv("MKW_NATURAL_PAGES")) return false;
         if (cpu) cpu->gpr[3] = 0; // Not visible
         return true;
     case 0x805F9B50u: // BlackBackControlForMessage::Load
