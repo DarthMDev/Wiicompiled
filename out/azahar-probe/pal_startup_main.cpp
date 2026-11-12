@@ -1426,7 +1426,11 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
     const bool tracePerspective = (g_gxFrame == kGxTraceFrame) && g_gx.projType == 0;
     const float* rawMv = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
     float mv[12];
-    if (kDebugCamera && g_gx.projType == 0) {
+    // The debug chase camera is a race-path aid. Applying it to the title/menu scenes replaces
+    // their own camera and points the view at the sky, so only use it in the race section.
+    const uint32_t dbgSecMgr = Memory::Read32(0x809C1E38u);
+    const bool dbgRaceSection = dbgSecMgr && Memory::Read32(dbgSecMgr + 4) == 0x20u;
+    if (kDebugCamera && dbgRaceSection && g_gx.projType == 0) {
         // Compose: debug view * the object's own model matrix. Replacing the matrix outright
         // discards per-object transforms, which puts every kart at the wrong place.
         float view[12];
@@ -6417,6 +6421,18 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 }
             }
         }
+        if (s_frameCount == 280) {
+            const auto& P = gx_bridge::g_gx.proj;
+            AppLog("[TitleProj] type=%u P=(%g,%g,%g,%g)(%g,%g,%g,%g)(%g,%g,%g,%g)(%g,%g,%g,%g)\n",
+                gx_bridge::g_gx.projType,
+                P[0][0], P[0][1], P[0][2], P[0][3], P[1][0], P[1][1], P[1][2], P[1][3],
+                P[2][0], P[2][1], P[2][2], P[2][3], P[3][0], P[3][1], P[3][2], P[3][3]);
+            for (int m = 0; m < 10; ++m) {
+                const float* M = gx_bridge::g_gx.pnMtx[m];
+                AppLog("[TitleMtx %d] r0=(%g,%g,%g,%g) r1=(%g,%g,%g,%g) r2=(%g,%g,%g,%g)\n",
+                    m, M[0], M[1], M[2], M[3], M[4], M[5], M[6], M[7], M[8], M[9], M[10], M[11]);
+            }
+        }
         static bool s_reported600 = false;
         if (!s_reported600 && s_frameCount >= 600) {
             s_reported600 = true;
@@ -6429,7 +6445,11 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         // func_805A0A1C allocates 44 bytes and installs itself at *(0x809C1998), so create it here
         // once, then let RaceCameraMgr::Update drive it.
         static bool s_camBootTried = false;
-        if (!s_camBootTried && s_frameCount >= 88 && Memory::Read32(0x809C1998u) == 0) {
+        // Only create the race camera manager in the race section. Doing it in the title/menu
+        // path installs a race camera that overrides the scene's own camera.
+        const uint32_t camSecMgr = Memory::Read32(0x809C1E38u);
+        const bool camRaceSection = camSecMgr && Memory::Read32(camSecMgr + 4) == 0x20u;
+        if (camRaceSection && !s_camBootTried && s_frameCount >= 88 && Memory::Read32(0x809C1998u) == 0) {
             s_camBootTried = true;
             CpuContext camCtx = *cpu;
             camCtx.gpr[3] = 0;
