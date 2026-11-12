@@ -3945,11 +3945,28 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x800BD860u: // RFLiIsWorking
         cpu->gpr[3] = 0;
         return true;
+    case 0x8061F7CCu:
+    case 0x8061F828u:
+    case 0x8061F9B4u:
+    case 0x8061FBECu:
     case 0x805BB278u:
     case 0x805BB254u:
+    case 0x806025B0u: { // page init - dump the live page object once
+        static bool s_dumpedPage = false;
+        if (!s_dumpedPage && cpu->gpr[3] && Memory::Contains(cpu->gpr[3], 160)) {
+            s_dumpedPage = true;
+            std::string dump;
+            for (int i = 0; i < 40; ++i) {
+                char buf[16];
+                std::snprintf(buf, sizeof(buf), " %08X", Memory::Read32(cpu->gpr[3] + i * 4));
+                dump += buf;
+            }
+            AppLog("[PageDump] this=%08X%s\n", cpu->gpr[3], dump.c_str());
+        }
+        break;
+    }
     case 0x806024B0u:
     case 0x80602530u:
-    case 0x806025B0u:
     case 0x805c9820u:
     case 0x805c9888u:
     case 0x805c9890u:
