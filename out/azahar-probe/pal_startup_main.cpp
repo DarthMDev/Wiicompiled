@@ -712,6 +712,8 @@ struct GxState {
     uint32_t pixels3DThisFrame = 0; // pixels written by perspective draws, for menu diagnostics
     uint32_t tri3DEntered = 0;      // perspective triangles reaching the rasteriser
     uint32_t tri3DBounds = 0;       // perspective triangles with on-screen bounds
+    uint32_t tri2DAlphaZero = 0;    // ortho triangles whose vertex alpha is fully zero
+    uint32_t tri2DWritten = 0;      // ortho triangles that wrote at least one pixel
 
     float vpLeft = 0.0f, vpTop = 0.0f, vpWidth = 608.0f, vpHeight = 456.0f;
     float vpNear = 0.0f, vpFar = 1.0f;
@@ -1592,6 +1594,7 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
         return;
     }
     if (g_gx.projType == 0) ++g_gx.tri3DBounds;
+    if (g_gx.projType == 1 && cv[0].a == 0 && cv[1].a == 0 && cv[2].a == 0) ++g_gx.tri2DAlphaZero;
 
     int texSlotIdx = -1;
     if (g_gx.texStageEnabled[0] && g_gx.stageTexMap[0] < 8 && g_gx.texSlots[g_gx.stageTexMap[0]].valid) {
@@ -1680,6 +1683,7 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
         w0_row += dw0_dy;
         w1_row += dw1_dy;
     }
+    if (g_gx.projType == 1 && wrotePixel) ++g_gx.tri2DWritten;
     if (tracePerspective) {
         ++g_perspectiveTrace.rasterized;
         if (wrotePixel) ++g_perspectiveTrace.wrotePixels;
@@ -2584,8 +2588,8 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
     }
     if (frameNumber <= 20 || frameNumber % 20 == 0) {
         const float* m0 = g_gx.pnMtx[0];
-        AppLog("[GX Stats Frame %u] draws=%u tris=%u quads2D=%u dls=%u texCache=%zuKB px3D=%u entered3D=%u bounds3D=%u\n",
-            frameNumber, g_gx.drawCallsThisFrame, g_gx.trisThisFrame, g_gx.quads2DThisFrame, g_gx.dlCallsThisFrame, g_texCacheBytes / 1024, g_gx.pixels3DThisFrame, g_gx.tri3DEntered, g_gx.tri3DBounds);
+        AppLog("[GX Stats Frame %u] draws=%u tris=%u quads2D=%u dls=%u texCache=%zuKB px3D=%u entered3D=%u bounds3D=%u a0_2D=%u wrote2D=%u\n",
+            frameNumber, g_gx.drawCallsThisFrame, g_gx.trisThisFrame, g_gx.quads2DThisFrame, g_gx.dlCallsThisFrame, g_texCacheBytes / 1024, g_gx.pixels3DThisFrame, g_gx.tri3DEntered, g_gx.tri3DBounds, g_gx.tri2DAlphaZero, g_gx.tri2DWritten);
         if (gx_bridge::g_panicTotal != 0 && (frameNumber % 200 == 0)) {
             std::string sites;
             uint32_t shown = 0;
@@ -2646,6 +2650,8 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
     g_gx.pixels3DThisFrame = 0;
     g_gx.tri3DEntered = 0;
     g_gx.tri3DBounds = 0;
+    g_gx.tri2DAlphaZero = 0;
+    g_gx.tri2DWritten = 0;
     g_gx.dlCallsThisFrame = 0;
     g_gx.mtxLoadCalls = 0;
     g_gx.xfMtxWrites = 0;
