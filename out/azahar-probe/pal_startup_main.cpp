@@ -211,9 +211,13 @@ uint32_t Read32Slow(uint32_t address) {
 uint64_t Read64Slow(uint32_t address) {
     if (is_mmio_or_null(address)) return 0;
     if (auto* ptr = resolve_guest(address, 8)) {
-        uint64_t val;
-        std::memcpy(&val, ptr, 8);
-        return swap_bytes(val);
+        // Two 32-bit loads: an 8-byte memcpy becomes ldrd on ARM11, which faults on
+        // 4-byte-aligned guest addresses.
+        uint32_t first = 0;
+        uint32_t second = 0;
+        std::memcpy(&first, ptr, 4);
+        std::memcpy(&second, ptr + 4, 4);
+        return (static_cast<uint64_t>(swap_bytes(first)) << 32) | swap_bytes(second);
     }
     return 0;
 }
@@ -244,8 +248,10 @@ void Write16Slow(uint32_t address, uint16_t value) {
 void Write64Slow(uint32_t address, uint64_t value) {
     if (is_mmio_or_null(address)) return;
     if (auto* ptr = resolve_guest(address, 8)) {
-        uint64_t val = swap_bytes(value);
-        std::memcpy(ptr, &val, 8);
+        const uint32_t first = swap_bytes(static_cast<uint32_t>(value >> 32));
+        const uint32_t second = swap_bytes(static_cast<uint32_t>(value));
+        std::memcpy(ptr, &first, 4);
+        std::memcpy(ptr + 4, &second, 4);
     }
 }
 }
@@ -3299,6 +3305,12 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         const uintptr_t sp = reinterpret_cast<uintptr_t>(&probe);
         if (s_stackBase == 0 || sp > s_stackBase) s_stackBase = sp;
         const uintptr_t used = s_stackBase - sp;
+        static uintptr_t s_maxUsed = 0;
+        if (used > s_maxUsed) s_maxUsed = used;
+        if (gx_bridge::g_gxFrame >= 84 && gx_bridge::g_gxFrame <= 120 && gx_bridge::g_gxFrame % 4 == 0 && !s_reported) {
+            AppLog("[StackPeak] frame=%u used=%zuKB target=%08X\n",
+                gx_bridge::g_gxFrame, static_cast<size_t>(s_maxUsed / 1024), target);
+        }
         if (used > 5u * 1024u * 1024u && !s_reported) {
             s_reported = true;
             AppLog("[StackGuard] used=%zuKB target=%08X lr=%08X pc=%08X frame=%u\n",
@@ -6402,6 +6414,23 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         static uint32_t s_frameCount = 0;
         ++s_frameCount;
         gx_bridge::PresentFrameTo3DS(s_frameCount);
+        static bool s_profiled100 = false;
+        if (!s_profiled100 && s_frameCount >= 100) {
+            s_profiled100 = true;
+            ReportWorkingSet("Frame 100 (title/menu page creation)");
+        }
+        if (s_frameCount == 90) {
+            const uint32_t mgr = Memory::Read32(0x809BD748u);
+            if (mgr && Memory::Contains(mgr, 96)) {
+                std::string dump;
+                for (int i = 0; i < 24; ++i) {
+                    char buf[16];
+                    std::snprintf(buf, sizeof(buf), " %08X", Memory::Read32(mgr + i * 4));
+                    dump += buf;
+                }
+                AppLog("[ArcMgrDump] mgr=%08X%s\n", mgr, dump.c_str());
+            }
+        }
         if (s_frameCount >= 80 && s_frameCount <= 140 && s_frameCount % 10 == 0) {
             const uint32_t mgr = Memory::Read32(0x809BD748u);
             const uint32_t flag = (mgr && Memory::Contains(mgr + 76, 1)) ? Memory::Read8(mgr + 76) : 0xFFu;
