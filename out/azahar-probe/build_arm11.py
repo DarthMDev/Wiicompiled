@@ -95,6 +95,9 @@ def main():
     objs = [obj for _, obj in tasks]
     link_cmd = [
         str(gxx), '-specs=3dsx.specs',
+        # The title-screen model/scene code recurses deeper than the 32 KiB default stack.
+        # Give the app a 1 MiB stack so it does not die with an opaque data abort.
+        '-Wl,--defsym=__stack_size=0x100000',
         '-march=armv6k', '-mtune=mpcore', '-mfloat-abi=hard', '-mtp=soft',
         f'-L{sdk}/libctru/lib',
         *[str(o) for o in objs],

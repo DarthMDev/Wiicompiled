@@ -1423,6 +1423,15 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
     EnsureInitialized();
     g_gx.lastTrianglePixels = 0;
     if (g_gx.projType == 0) ++g_gx.tri3DEntered;
+    if (g_gx.projType == 0 && g_gxFrame >= 200u && pnMtxIdx != 0) {
+        static uint32_t s_tri3DLogs = 0;
+        if (s_tri3DLogs < 8) {
+            ++s_tri3DLogs;
+            const float* M = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
+            AppLog("[Tri3D] n=%u pn=%u pos0=(%.1f,%.1f,%.1f) mvT=(%.1f,%.1f,%.1f) projType=%u\n",
+                s_tri3DLogs, pnMtxIdx, v0.pos[0], v0.pos[1], v0.pos[2], M[3], M[7], M[11], g_gx.projType);
+        }
+    }
     const bool tracePerspective = (g_gxFrame == kGxTraceFrame) && g_gx.projType == 0;
     const float* rawMv = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
     float mv[12];
