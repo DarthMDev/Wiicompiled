@@ -276,18 +276,20 @@ inline T MaybeByteSwap(T value) {
 // ARM11 lowers an 8-byte memcpy to ldrd/strd, which faults on 4-byte-aligned guest
 // addresses. These helpers always use two 32-bit accesses.
 MKW_MEMORY_FORCE_INLINE uint64_t Read64Split(const uint8_t* ptr) {
-    uint32_t first = 0;
-    uint32_t second = 0;
-    std::memcpy(&first, ptr, sizeof(first));
-    std::memcpy(&second, ptr + 4, sizeof(second));
+    // Volatile prevents the compiler from merging the two 32-bit loads back into an
+    // 8-byte ldrd, which faults on 4-byte-aligned addresses on ARM11.
+    const volatile uint32_t* src = reinterpret_cast<const volatile uint32_t*>(ptr);
+    const uint32_t first = src[0];
+    const uint32_t second = src[1];
     return (static_cast<uint64_t>(MaybeByteSwap(first)) << 32) | MaybeByteSwap(second);
 }
 
 MKW_MEMORY_FORCE_INLINE void Write64Split(uint8_t* ptr, uint64_t value) {
     const uint32_t first = MaybeByteSwap(static_cast<uint32_t>(value >> 32));
     const uint32_t second = MaybeByteSwap(static_cast<uint32_t>(value));
-    std::memcpy(ptr, &first, sizeof(first));
-    std::memcpy(ptr + 4, &second, sizeof(second));
+    volatile uint32_t* dst = reinterpret_cast<volatile uint32_t*>(ptr);
+    dst[0] = first;
+    dst[1] = second;
 }
 
 
@@ -297,14 +299,7 @@ MKW_MEMORY_FORCE_INLINE bool ReadResolvedScalar(uint8_t* host, uint32_t rangeOff
     if constexpr (sizeof(T) == 1) {
         outValue = host[rangeOffset];
     } else if constexpr (sizeof(T) == 8) {
-        // Two 32-bit reads: an 8-byte memcpy becomes ldrd on ARM11, which faults on
-        // 4-byte-aligned guest addresses (the host tolerates it).
-        uint32_t first = 0;
-        uint32_t second = 0;
-        std::memcpy(&first, host + rangeOffset, sizeof(first));
-        std::memcpy(&second, host + rangeOffset + 4, sizeof(second));
-        const uint64_t packed = (static_cast<uint64_t>(MaybeByteSwap(first)) << 32) |
-                                MaybeByteSwap(second);
+        const uint64_t packed = Read64Split(host + rangeOffset);
         std::memcpy(&outValue, &packed, sizeof(packed));
     } else {
         T value = 0;
@@ -328,14 +323,9 @@ MKW_MEMORY_FORCE_INLINE ResolvedLoadPair ReadResolvedPair16(
 }
 
 MKW_MEMORY_FORCE_INLINE ResolvedLoadPair ReadResolvedPair32(uint8_t* host, uint32_t rangeOffset) {
-    // Two 32-bit reads instead of one 64-bit read: ARM11 lowers an 8-byte memcpy to
-    // ldrd, which faults on 4-byte-aligned guest addresses. The host tolerates it, so
-    // this only shows up on hardware/Azahar.
-    uint32_t first = 0;
-    uint32_t second = 0;
-    if (!ReadResolvedScalar(host, rangeOffset, first)) return {};
-    if (!ReadResolvedScalar(host, rangeOffset + 4, second)) return {};
-    return {first, second, true};
+    if (!host) return {};
+    const uint64_t packed = Read64Split(host + rangeOffset);
+    return {static_cast<uint32_t>(packed >> 32), static_cast<uint32_t>(packed), true};
 }
 
 template <typename Packed>
@@ -355,11 +345,7 @@ MKW_MEMORY_FORCE_INLINE bool WriteResolvedPair16(
 MKW_MEMORY_FORCE_INLINE bool WriteResolvedPair32(
     uint8_t* host, uint32_t rangeOffset, uint64_t packed) {
     if (!host) return false;
-    // Two 32-bit stores instead of one 64-bit store (see ReadResolvedPair32).
-    const uint32_t first = MaybeByteSwap(static_cast<uint32_t>(packed >> 32));
-    const uint32_t second = MaybeByteSwap(static_cast<uint32_t>(packed));
-    std::memcpy(host + rangeOffset, &first, sizeof(first));
-    std::memcpy(host + rangeOffset + 4, &second, sizeof(second));
+    Write64Split(host + rangeOffset, packed);
     return true;
 }
 
@@ -369,13 +355,9 @@ MKW_MEMORY_FORCE_INLINE bool WriteResolvedScalar(uint8_t* host, uint32_t rangeOf
     if constexpr (sizeof(T) == 1) {
         host[rangeOffset] = static_cast<uint8_t>(value);
     } else if constexpr (sizeof(T) == 8) {
-        // Two 32-bit stores (see ReadResolvedScalar).
         uint64_t packed = 0;
         std::memcpy(&packed, &value, sizeof(packed));
-        const uint32_t first = MaybeByteSwap(static_cast<uint32_t>(packed >> 32));
-        const uint32_t second = MaybeByteSwap(static_cast<uint32_t>(packed));
-        std::memcpy(host + rangeOffset, &first, sizeof(first));
-        std::memcpy(host + rangeOffset + 4, &second, sizeof(second));
+        Write64Split(host + rangeOffset, packed);
     } else {
         const T swapped = MaybeByteSwap(value);
         std::memcpy(host + rangeOffset, &swapped, sizeof(T));
@@ -546,7 +528,11 @@ MKW_MEMORY_FORCE_INLINE T ReadResolved(uint8_t* host, uint32_t rangeOffset, uint
 
 MKW_MEMORY_FORCE_INLINE uint8_t ReadResolved8(uint8_t* r, uint32_t o, uint32_t a) { return ReadResolved<uint8_t>(r, o, a, ReadResolvedFallback<uint8_t>); }
 MKW_MEMORY_FORCE_INLINE uint16_t ReadResolved16(uint8_t* r, uint32_t o, uint32_t a) { return ReadResolved<uint16_t>(r, o, a, ReadResolvedFallback<uint16_t>); }
-MKW_MEMORY_FORCE_INLINE uint32_t ReadResolved32(uint8_t* r, uint32_t o, uint32_t a) { return ReadResolved<uint32_t>(r, o, a, ReadResolvedFallback<uint32_t>); }
+MKW_MEMORY_FORCE_INLINE uint32_t ReadResolved32(uint8_t* r, uint32_t o, uint32_t a) {
+    const uint32_t value = ReadResolved<uint32_t>(r, o, a, ReadResolvedFallback<uint32_t>);
+    asm volatile("" ::: "memory");
+    return value;
+}
 // Live via isa/ppc_isa_quantized.h (the psq resolved tier packs two lanes into
 // one 64-bit access); generated code never names it directly.
 MKW_MEMORY_FORCE_INLINE uint64_t ReadResolved64(uint8_t* r, uint32_t o, uint32_t a) { return ReadResolved<uint64_t>(r, o, a, ReadResolvedFallback<uint64_t>); }
@@ -572,7 +558,10 @@ MKW_MEMORY_FORCE_INLINE void WriteResolved(uint8_t* host, uint32_t rangeOffset, 
 
 MKW_MEMORY_FORCE_INLINE void WriteResolved8(uint8_t* r, uint32_t o, uint32_t a, uint8_t v) { WriteResolved(r, o, a, v, WriteResolvedFallback<uint8_t>); }
 MKW_MEMORY_FORCE_INLINE void WriteResolved16(uint8_t* r, uint32_t o, uint32_t a, uint16_t v) { WriteResolved(r, o, a, v, WriteResolvedFallback<uint16_t>); }
-MKW_MEMORY_FORCE_INLINE void WriteResolved32(uint8_t* r, uint32_t o, uint32_t a, uint32_t v) { WriteResolved(r, o, a, v, WriteResolvedFallback<uint32_t>); }
+MKW_MEMORY_FORCE_INLINE void WriteResolved32(uint8_t* r, uint32_t o, uint32_t a, uint32_t v) {
+    WriteResolved(r, o, a, v, WriteResolvedFallback<uint32_t>);
+    asm volatile("" ::: "memory");
+}
 // Live via isa/ppc_isa_quantized.h, as ReadResolved64 above.
 MKW_MEMORY_FORCE_INLINE void WriteResolved64(uint8_t* r, uint32_t o, uint32_t a, uint64_t v) { WriteResolved(r, o, a, v, WriteResolvedFallback<uint64_t>); }
 MKW_MEMORY_FORCE_INLINE void WriteResolvedFloat32(uint8_t* r, uint32_t o, uint32_t a, double v) {
@@ -745,6 +734,9 @@ inline uint32_t Memory::Read32(uint32_t addr) {
     uint32_t value = 0;
     if (!MemoryInline::TryReadGuestScalar(addr, value)) [[unlikely]]
         return MemoryInline::Read32Slow(addr);
+    // Compiler barrier: stops two adjacent 32-bit guest accesses from being fused into an
+    // 8-byte ldrd, which faults on 4-byte-aligned addresses on ARM11.
+    asm volatile("" ::: "memory");
     return value;
 }
 
@@ -786,6 +778,9 @@ inline void Memory::Write16(uint32_t addr, uint16_t val) {
 inline void Memory::Write32(uint32_t addr, uint32_t val) {
     if (!MemoryInline::TryWriteGuestScalar(addr, val)) [[unlikely]]
         MemoryInline::Write32Slow(addr, val);
+    // Compiler barrier: stops two adjacent 32-bit guest accesses from being fused into an
+    // 8-byte strd, which faults on 4-byte-aligned addresses on ARM11.
+    asm volatile("" ::: "memory");
 }
 
 inline void Memory::Write64(uint32_t addr, uint64_t val) {
