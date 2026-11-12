@@ -273,11 +273,39 @@ inline T MaybeByteSwap(T value) {
     }
 }
 
+// ARM11 lowers an 8-byte memcpy to ldrd/strd, which faults on 4-byte-aligned guest
+// addresses. These helpers always use two 32-bit accesses.
+MKW_MEMORY_FORCE_INLINE uint64_t Read64Split(const uint8_t* ptr) {
+    uint32_t first = 0;
+    uint32_t second = 0;
+    std::memcpy(&first, ptr, sizeof(first));
+    std::memcpy(&second, ptr + 4, sizeof(second));
+    return (static_cast<uint64_t>(MaybeByteSwap(first)) << 32) | MaybeByteSwap(second);
+}
+
+MKW_MEMORY_FORCE_INLINE void Write64Split(uint8_t* ptr, uint64_t value) {
+    const uint32_t first = MaybeByteSwap(static_cast<uint32_t>(value >> 32));
+    const uint32_t second = MaybeByteSwap(static_cast<uint32_t>(value));
+    std::memcpy(ptr, &first, sizeof(first));
+    std::memcpy(ptr + 4, &second, sizeof(second));
+}
+
+
 template <typename T>
 MKW_MEMORY_FORCE_INLINE bool ReadResolvedScalar(uint8_t* host, uint32_t rangeOffset, T& outValue) {
     if (!host) return false;
     if constexpr (sizeof(T) == 1) {
         outValue = host[rangeOffset];
+    } else if constexpr (sizeof(T) == 8) {
+        // Two 32-bit reads: an 8-byte memcpy becomes ldrd on ARM11, which faults on
+        // 4-byte-aligned guest addresses (the host tolerates it).
+        uint32_t first = 0;
+        uint32_t second = 0;
+        std::memcpy(&first, host + rangeOffset, sizeof(first));
+        std::memcpy(&second, host + rangeOffset + 4, sizeof(second));
+        const uint64_t packed = (static_cast<uint64_t>(MaybeByteSwap(first)) << 32) |
+                                MaybeByteSwap(second);
+        std::memcpy(&outValue, &packed, sizeof(packed));
     } else {
         T value = 0;
         std::memcpy(&value, host + rangeOffset, sizeof(T));
@@ -300,9 +328,14 @@ MKW_MEMORY_FORCE_INLINE ResolvedLoadPair ReadResolvedPair16(
 }
 
 MKW_MEMORY_FORCE_INLINE ResolvedLoadPair ReadResolvedPair32(uint8_t* host, uint32_t rangeOffset) {
-    uint64_t packed = 0;
-    if (!ReadResolvedScalar(host, rangeOffset, packed)) return {};
-    return {static_cast<uint32_t>(packed >> 32), static_cast<uint32_t>(packed), true};
+    // Two 32-bit reads instead of one 64-bit read: ARM11 lowers an 8-byte memcpy to
+    // ldrd, which faults on 4-byte-aligned guest addresses. The host tolerates it, so
+    // this only shows up on hardware/Azahar.
+    uint32_t first = 0;
+    uint32_t second = 0;
+    if (!ReadResolvedScalar(host, rangeOffset, first)) return {};
+    if (!ReadResolvedScalar(host, rangeOffset + 4, second)) return {};
+    return {first, second, true};
 }
 
 template <typename Packed>
@@ -321,7 +354,13 @@ MKW_MEMORY_FORCE_INLINE bool WriteResolvedPair16(
 
 MKW_MEMORY_FORCE_INLINE bool WriteResolvedPair32(
     uint8_t* host, uint32_t rangeOffset, uint64_t packed) {
-    return WriteResolvedPairFast(host, rangeOffset, packed);
+    if (!host) return false;
+    // Two 32-bit stores instead of one 64-bit store (see ReadResolvedPair32).
+    const uint32_t first = MaybeByteSwap(static_cast<uint32_t>(packed >> 32));
+    const uint32_t second = MaybeByteSwap(static_cast<uint32_t>(packed));
+    std::memcpy(host + rangeOffset, &first, sizeof(first));
+    std::memcpy(host + rangeOffset + 4, &second, sizeof(second));
+    return true;
 }
 
 template <typename T>
@@ -329,6 +368,14 @@ MKW_MEMORY_FORCE_INLINE bool WriteResolvedScalar(uint8_t* host, uint32_t rangeOf
     if (!host) return false;
     if constexpr (sizeof(T) == 1) {
         host[rangeOffset] = static_cast<uint8_t>(value);
+    } else if constexpr (sizeof(T) == 8) {
+        // Two 32-bit stores (see ReadResolvedScalar).
+        uint64_t packed = 0;
+        std::memcpy(&packed, &value, sizeof(packed));
+        const uint32_t first = MaybeByteSwap(static_cast<uint32_t>(packed >> 32));
+        const uint32_t second = MaybeByteSwap(static_cast<uint32_t>(packed));
+        std::memcpy(host + rangeOffset, &first, sizeof(first));
+        std::memcpy(host + rangeOffset + 4, &second, sizeof(second));
     } else {
         const T swapped = MaybeByteSwap(value);
         std::memcpy(host + rangeOffset, &swapped, sizeof(T));
@@ -342,6 +389,9 @@ inline bool TryReadMappedScalar(uint32_t address, T& outValue) {
     if (TryGetPointerFast(address, sizeof(T), ptr)) {
         if constexpr (sizeof(T) == 1) {
             outValue = *ptr;
+        } else if constexpr (sizeof(T) == 8) {
+            const uint64_t packed = Read64Split(ptr);
+            std::memcpy(&outValue, &packed, sizeof(packed));
         } else {
             T value = 0;
             std::memcpy(&value, ptr, sizeof(T));
@@ -360,6 +410,9 @@ MKW_MEMORY_FORCE_INLINE bool TryReadGuestScalar(uint32_t address, T& outValue) {
     auto* ptr = reinterpret_cast<uint8_t*>((encodedBias - 1u) + address);
     if constexpr (sizeof(T) == 1) {
         outValue = *ptr;
+    } else if constexpr (sizeof(T) == 8) {
+        const uint64_t packed = Read64Split(ptr);
+        std::memcpy(&outValue, &packed, sizeof(packed));
     } else {
         T value = 0;
         std::memcpy(&value, ptr, sizeof(T));
@@ -390,6 +443,10 @@ MKW_MEMORY_FORCE_INLINE bool TryWriteGuestScalar(uint32_t address, T value) {
     }
     if constexpr (sizeof(T) == 1) {
         *ptr = static_cast<uint8_t>(value);
+    } else if constexpr (sizeof(T) == 8) {
+        uint64_t packed = 0;
+        std::memcpy(&packed, &value, sizeof(packed));
+        Write64Split(ptr, packed);
     } else {
         const T swapped = MaybeByteSwap(value);
         std::memcpy(ptr, &swapped, sizeof(T));
@@ -403,6 +460,10 @@ inline bool WriteStackScalarFast(uint32_t address, T value) {
     if (TryGetPointerFast(address, sizeof(T), ptr)) {
         if constexpr (sizeof(T) == 1) {
             *ptr = static_cast<uint8_t>(value);
+        } else if constexpr (sizeof(T) == 8) {
+            uint64_t packed = 0;
+            std::memcpy(&packed, &value, sizeof(packed));
+            Write64Split(ptr, packed);
         } else {
             const T swapped = MaybeByteSwap(value);
             std::memcpy(ptr, &swapped, sizeof(T));
