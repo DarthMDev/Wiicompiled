@@ -3307,9 +3307,12 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         const uintptr_t used = s_stackBase - sp;
         static uintptr_t s_maxUsed = 0;
         if (used > s_maxUsed) s_maxUsed = used;
-        if (gx_bridge::g_gxFrame >= 84 && gx_bridge::g_gxFrame <= 120 && gx_bridge::g_gxFrame % 4 == 0 && !s_reported) {
-            AppLog("[StackPeak] frame=%u used=%zuKB target=%08X\n",
-                gx_bridge::g_gxFrame, static_cast<size_t>(s_maxUsed / 1024), target);
+        static uint32_t s_stackPeakLogFrame = 0;
+        if (gx_bridge::g_gxFrame >= 84 && gx_bridge::g_gxFrame <= 120 &&
+            gx_bridge::g_gxFrame % 4 == 0 && s_stackPeakLogFrame != gx_bridge::g_gxFrame) {
+            s_stackPeakLogFrame = gx_bridge::g_gxFrame;
+            AppLog("[StackPeak] frame=%u used=%zuKB\n",
+                gx_bridge::g_gxFrame, static_cast<size_t>(s_maxUsed / 1024));
         }
         if (used > 5u * 1024u * 1024u && !s_reported) {
             s_reported = true;
@@ -6430,6 +6433,15 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 }
                 AppLog("[ArcMgrDump] mgr=%08X%s\n", mgr, dump.c_str());
             }
+        }
+        if (s_frameCount >= 82 && s_frameCount <= 92) {
+#ifdef __3DS__
+            AppLog("[FrameMarker] frame=%u appFree=%zuKB\n", s_frameCount,
+                static_cast<size_t>(osGetMemRegionFree(MEMREGION_APPLICATION) / 1024));
+#else
+            AppLog("[FrameMarker] frame=%u\n", s_frameCount);
+#endif
+            std::fflush(stdout);
         }
         if (s_frameCount >= 80 && s_frameCount <= 140 && s_frameCount % 10 == 0) {
             const uint32_t mgr = Memory::Read32(0x809BD748u);
