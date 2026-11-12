@@ -1423,15 +1423,6 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
     EnsureInitialized();
     g_gx.lastTrianglePixels = 0;
     if (g_gx.projType == 0) ++g_gx.tri3DEntered;
-    if (g_gx.projType == 0 && g_gxFrame >= 200u && pnMtxIdx != 0) {
-        static uint32_t s_tri3DLogs = 0;
-        if (s_tri3DLogs < 8) {
-            ++s_tri3DLogs;
-            const float* M = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
-            AppLog("[Tri3D] n=%u pn=%u pos0=(%.1f,%.1f,%.1f) mvT=(%.1f,%.1f,%.1f) projType=%u\n",
-                s_tri3DLogs, pnMtxIdx, v0.pos[0], v0.pos[1], v0.pos[2], M[3], M[7], M[11], g_gx.projType);
-        }
-    }
     const bool tracePerspective = (g_gxFrame == kGxTraceFrame) && g_gx.projType == 0;
     const float* rawMv = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
     float mv[12];
@@ -1454,6 +1445,17 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
         MulAffine3x4(view, model, mv);
     } else {
         std::memcpy(mv, rawMv, sizeof(mv));
+    }
+    if (g_gx.projType == 0 && g_gxFrame >= 200u && pnMtxIdx != 0) {
+        static uint32_t s_tri3DLogs = 0;
+        if (s_tri3DLogs < 8) {
+            ++s_tri3DLogs;
+            const float* M = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
+            AppLog("[Tri3D] n=%u pn=%u pos0=(%.1f,%.1f,%.1f) boneT=(%.1f,%.1f,%.1f) viewT=(%.1f,%.1f,%.1f) composedT=(%.1f,%.1f,%.1f) skin=%d\n",
+                s_tri3DLogs, pnMtxIdx, v0.pos[0], v0.pos[1], v0.pos[2], M[3], M[7], M[11],
+                g_gx.pnMtx[0][3], g_gx.pnMtx[0][7], g_gx.pnMtx[0][11],
+                mv[3], mv[7], mv[11], std::getenv("MKW_SKIN_VIEW") ? 1 : 0);
+        }
     }
     if (g_gx.projType == 1) {
         // In 2D ortho mode, enforce clean 2D identity modelview
@@ -2594,7 +2596,7 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
     }
 #endif
     if (frameNumber == kGxTraceFrame || frameNumber == 88 || frameNumber == 96 || frameNumber == 104 ||
-        frameNumber == 152 || frameNumber == 296 || frameNumber == 448 || frameNumber == 584 ||
+        frameNumber == 152 || frameNumber == 296 || frameNumber == 400 || frameNumber == 480 || frameNumber == 560 ||
         (frameNumber > 600 && frameNumber % 300 == 0)) {
         char path[64];
         std::snprintf(path, sizeof(path), "sdmc:/frame_%u.ppm", frameNumber);
@@ -3911,6 +3913,39 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x800BD860u: // RFLiIsWorking
         cpu->gpr[3] = 0;
         return true;
+    case 0x805BB278u:
+    case 0x805BB254u:
+    case 0x806024B0u:
+    case 0x80602530u:
+    case 0x806025B0u:
+    case 0x805c9820u:
+    case 0x805c9888u:
+    case 0x805c9890u:
+    case 0x805c988cu: { // page base + globe page overrides
+        static std::map<uint32_t, uint32_t> s_pageMethodCounts;
+        ++s_pageMethodCounts[target];
+        static uint32_t s_lastLogFrame = 0;
+        if (gx_bridge::g_gxFrame != s_lastLogFrame && gx_bridge::g_gxFrame >= 200) {
+            s_lastLogFrame = gx_bridge::g_gxFrame;
+            std::string out;
+            for (const auto& kv : s_pageMethodCounts) {
+                char buf[32];
+                std::snprintf(buf, sizeof(buf), " %08X=%u", kv.first, kv.second);
+                out += buf;
+            }
+            AppLog("[PageMethodCounts] frame=%u%s\n", gx_bridge::g_gxFrame, out.c_str());
+        }
+        return false;
+    }
+    case 0x806223A0u: { // PageManager entry (page switch / create)
+        static std::set<uint32_t> s_seenArgs;
+        const uint32_t key = (cpu->gpr[3] & 0xFFFF0000u) ^ (cpu->gpr[4] & 0xFFFFu) ^ (cpu->gpr[5] << 8);
+        if (s_seenArgs.size() < 24 && s_seenArgs.insert(key).second) {
+            AppLog("[PageMgr] frame=%u this=%08X r4=%08X r5=%08X r6=%08X lr=%08X\n",
+                gx_bridge::g_gxFrame, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6], cpu->lr);
+        }
+        return false;
+    }
     case 0x80601D24u: { // Page::Init(page)
         const uint32_t page = cpu->gpr[3];
         static uint32_t s_pageInitLogs = 0;
@@ -5076,6 +5111,16 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return true;
     }
     case 0x80172F64u: { // GXCallDisplayList(list, nbytes)
+        if (gx_bridge::g_gxFrame == 279u) {
+            static uint32_t s_dlLogs = 0;
+            if (s_dlLogs < 12 && gx_bridge::g_gx.currentPnMtx != 0) {
+                ++s_dlLogs;
+                const float* M = gx_bridge::g_gx.pnMtx[gx_bridge::g_gx.currentPnMtx];
+                AppLog("[DL] n=%u list=%08X len=%u lr=%08X pn=%u mvT=(%.1f,%.1f,%.1f)\n",
+                    s_dlLogs, cpu->gpr[3], cpu->gpr[4], cpu->lr,
+                    gx_bridge::g_gx.currentPnMtx, M[3], M[7], M[11]);
+            }
+        }
         gx_bridge::ParseDisplayList(cpu->gpr[3], cpu->gpr[4], 0);
         return true;
     }
