@@ -698,6 +698,8 @@ struct GxState {
     uint32_t mtxNonIdentity = 0;   // loads whose row0/row1 were not the sanitized identity
     uint32_t camUpdateCalls = 0;   // RaceCameraMgr::Update calls this frame
     uint32_t drawCallsSkipped = 0; // draws dropped by the raster frame-skip
+    uint32_t lastTrianglePixels = 0; // diagnostic result from the most recent software triangle
+    bool trackTrianglePixels = false;
 
     float vpLeft = 0.0f, vpTop = 0.0f, vpWidth = 608.0f, vpHeight = 456.0f;
     float vpNear = 0.0f, vpFar = 1.0f;
@@ -1304,6 +1306,7 @@ static inline bool BlendPixel(int x, int y, float z, uint8_t sr, uint8_t sg, uin
 
 static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVertex& v2, uint32_t pnMtxIdx) {
     EnsureInitialized();
+    g_gx.lastTrianglePixels = 0;
     const bool tracePerspective = (g_gxFrame == kGxTraceFrame) && g_gx.projType == 0;
     const float* rawMv = g_gx.pnMtx[pnMtxIdx < 10 ? pnMtxIdx : 0];
     float mv[12];
@@ -1541,6 +1544,7 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
                 const bool written = BlendPixel(px, py, z, static_cast<uint8_t>(r), static_cast<uint8_t>(g),
                     static_cast<uint8_t>(b), static_cast<uint8_t>(a), ignoreDepth);
                 wrotePixel |= written;
+                if (written && g_gx.trackTrianglePixels) ++g_gx.lastTrianglePixels;
             }
             w0 += dw0_dx;
             w1 += dw1_dx;
@@ -2171,9 +2175,12 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
         }
         v[i].hasColor0 = true;
 
-        if (texCoordCount > 0 && texCoordAddr != 0 && Memory::Contains(texCoordAddr + i * 32, 8)) {
-            v[i].uv0[0] = gx_bridge::ReadGuestFloat(texCoordAddr + i * 32);
-            v[i].uv0[1] = gx_bridge::ReadGuestFloat(texCoordAddr + i * 32 + 4);
+        // nw4r::lyt::detail::DrawQuad receives four contiguous VEC2 corner coordinates
+        // for its active texture set. The previous 32-byte stride walked past that array,
+        // yielding huge/NaN UVs for vertices 1-3 and corrupting textured menu quads.
+        if (texCoordCount > 0 && texCoordAddr != 0 && Memory::Contains(texCoordAddr + i * 8, 8)) {
+            v[i].uv0[0] = gx_bridge::ReadGuestFloat(texCoordAddr + i * 8);
+            v[i].uv0[1] = gx_bridge::ReadGuestFloat(texCoordAddr + i * 8 + 4);
             v[i].hasUv0 = true;
         }
     }
@@ -2189,6 +2196,75 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
         }
         AppLog("[GX Trace %u] layout hook=%08X lr=%08X projection=%u rect=(%f,%f %fx%f) rgba=%08X,%08X,%08X,%08X\n",
             g_traceDrawOrder, hook, caller, g_gx.projType, x0, y0, w, h, rgba[0], rgba[1], rgba[2], rgba[3]);
+    }
+
+    // Capture a small sample of the first menu's layout quads. This lets us distinguish bad
+    // guest layout coordinates from an incorrect GX orthographic transform or texture state.
+    static uint32_t s_menuQuadDiagnostics = 0;
+    if (g_gxFrame >= 80 && g_gxFrame <= 110 && s_menuQuadDiagnostics < 24) {
+        ++s_menuQuadDiagnostics;
+        const auto& p = g_gx.proj;
+        const float diagEfbW = g_gx.efbWidth > 0 ? static_cast<float>(g_gx.efbWidth) : 608.0f;
+        const float diagEfbH = g_gx.efbHeight > 0 ? static_cast<float>(g_gx.efbHeight) : 456.0f;
+        const bool fullVp = (g_gx.vpLeft <= 4.0f && g_gx.vpTop <= 4.0f &&
+            g_gx.vpWidth >= 500.0f && g_gx.vpHeight >= 400.0f);
+        float screen[4][2]{};
+        const float xs[4] = {x0, x1, x1, x0};
+        const float ys[4] = {y0, y0, y1, y1};
+        for (int i = 0; i < 4; ++i) {
+            const float cx = p[0][0] * xs[i] + p[0][1] * ys[i] + p[0][3];
+            const float cy = p[1][0] * xs[i] + p[1][1] * ys[i] + p[1][3];
+            const float cw = p[3][0] * xs[i] + p[3][1] * ys[i] + p[3][3];
+            const float invW = std::fabs(cw) > 1e-6f ? 1.0f / cw : 1.0f;
+            const float ndcX = cx * invW;
+            const float ndcY = cy * invW;
+            if (fullVp) {
+                screen[i][0] = (ndcX * 0.5f + 0.5f) * kScreenW;
+                screen[i][1] = (0.5f - ndcY * 0.5f) * kScreenH;
+            } else {
+                screen[i][0] = (g_gx.vpLeft + (ndcX * 0.5f + 0.5f) * g_gx.vpWidth) *
+                    (static_cast<float>(kScreenW) / diagEfbW);
+                screen[i][1] = (g_gx.vpTop + (0.5f - ndcY * 0.5f) * g_gx.vpHeight) *
+                    (static_cast<float>(kScreenH) / diagEfbH);
+            }
+        }
+        int diagSlot = -1;
+        if (g_gx.texStageEnabled[0] && g_gx.stageTexMap[0] < 8 && g_gx.texSlots[g_gx.stageTexMap[0]].valid)
+            diagSlot = g_gx.stageTexMap[0];
+        else if (g_gx.activeTexSlot >= 0 && g_gx.activeTexSlot < 8 && g_gx.texSlots[g_gx.activeTexSlot].valid)
+            diagSlot = g_gx.activeTexSlot;
+        else {
+            for (int slot = 0; slot < 8; ++slot) if (g_gx.texSlots[slot].valid) { diagSlot = slot; break; }
+        }
+        const TexSlot* diagTex = diagSlot >= 0 ? &g_gx.texSlots[diagSlot] : nullptr;
+        AppLog("[MenuQuad] n=%u frame=%u hook=%08X lr=%08X proj=%u rect=(%.1f,%.1f %.1fx%.1f) screen=(%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f) P=(%.5g,%.5g,%.5g,%.5g) vp=(%.1f,%.1f %.1fx%.1f) texCount=%u uv0=(%.3f,%.3f) uv2=(%.3f,%.3f) color=%02X%02X%02X%02X texOn=%u slot=%d active=%d tex=%08X %ux%u fmt=%u wrap=%u/%u valid=%u\n",
+            s_menuQuadDiagnostics, g_gxFrame, hook, caller, g_gx.projType, x0, y0, w, h,
+            screen[0][0], screen[0][1], screen[1][0], screen[1][1],
+            screen[2][0], screen[2][1], screen[3][0], screen[3][1],
+            p[0][0], p[0][3], p[1][1], p[1][3],
+            g_gx.vpLeft, g_gx.vpTop, g_gx.vpWidth, g_gx.vpHeight,
+            texCoordCount, v[0].uv0[0], v[0].uv0[1], v[2].uv0[0], v[2].uv0[1],
+            v[0].color0[0], v[0].color0[1], v[0].color0[2], v[0].color0[3],
+            g_gx.texStageEnabled[0] ? 1u : 0u, diagSlot, g_gx.activeTexSlot,
+            diagTex ? diagTex->dataAddr : 0, diagTex ? diagTex->width : 0,
+            diagTex ? diagTex->height : 0, diagTex ? diagTex->format : 0,
+            diagTex ? diagTex->wrapS : 0, diagTex ? diagTex->wrapT : 0,
+            diagTex && diagTex->valid ? 1u : 0u);
+        const DecodedTex* sampledTexture = (diagTex && diagTex->valid && v[0].hasUv0)
+            ? GetOrDecodeTexture(*diagTex) : nullptr;
+        if (sampledTexture) {
+            const float centerU = (v[0].uv0[0] + v[1].uv0[0] + v[2].uv0[0] + v[3].uv0[0]) * 0.25f;
+            const float centerV = (v[0].uv0[1] + v[1].uv0[1] + v[2].uv0[1] + v[3].uv0[1]) * 0.25f;
+            const uint32_t t0 = SampleTexture(sampledTexture, *diagTex, v[0].uv0[0], v[0].uv0[1]);
+            const uint32_t t1 = SampleTexture(sampledTexture, *diagTex, v[1].uv0[0], v[1].uv0[1]);
+            const uint32_t t2 = SampleTexture(sampledTexture, *diagTex, v[2].uv0[0], v[2].uv0[1]);
+            const uint32_t t3 = SampleTexture(sampledTexture, *diagTex, v[3].uv0[0], v[3].uv0[1]);
+            const uint32_t tc = SampleTexture(sampledTexture, *diagTex, centerU, centerV);
+            AppLog("[MenuTexSample] n=%u fmt=%u tex=%ux%u uv=(%.3f,%.3f)(%.3f,%.3f)(%.3f,%.3f)(%.3f,%.3f) rgba=%08X/%08X/%08X/%08X center=%08X\n",
+                s_menuQuadDiagnostics, sampledTexture->format, sampledTexture->width, sampledTexture->height,
+                v[0].uv0[0], v[0].uv0[1], v[1].uv0[0], v[1].uv0[1],
+                v[2].uv0[0], v[2].uv0[1], v[3].uv0[0], v[3].uv0[1], t0, t1, t2, t3, tc);
+        }
     }
 
     // PAL startup diagnostic. This picture pane covered the entire framebuffer in the race trace.
@@ -2217,8 +2293,19 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
     }
 
     ++g_gx.quads2DThisFrame;
+    static uint32_t s_menuFillDiagnostics = 0;
+    const bool traceMenuFill = g_gxFrame >= 80 && g_gxFrame <= 110 && s_menuFillDiagnostics < 24;
+    g_gx.trackTrianglePixels = traceMenuFill;
     RasterizeTriangle(v[0], v[1], v[2], g_gx.currentPnMtx);
+    const uint32_t firstTriPixels = g_gx.lastTrianglePixels;
     RasterizeTriangle(v[0], v[2], v[3], g_gx.currentPnMtx);
+    const uint32_t secondTriPixels = g_gx.lastTrianglePixels;
+    g_gx.trackTrianglePixels = false;
+    if (traceMenuFill) {
+        ++s_menuFillDiagnostics;
+        AppLog("[MenuQuadFill] n=%u pixels=%u/%u\n", s_menuFillDiagnostics,
+            firstTriPixels, secondTriPixels);
+    }
     if (trace) LogDrawSamples(g_traceDrawOrder, before);
 }
 
@@ -2644,6 +2731,14 @@ static uint32_t LoadMenuOtherResource(const char* requestedName, uint32_t* outSi
         {"option_bg_Loop.brlan", 0, 0},
     };
     static bool s_loaded = false;
+    static bool s_reportedFailure = false;
+    const auto reportFailure = [&](const char* reason) -> uint32_t {
+        if (!s_reportedFailure) {
+            s_reportedFailure = true;
+            AppLog("[MenuResource] %s\n", reason);
+        }
+        return 0;
+    };
     if (s_loaded) {
         for (const auto& resource : s_resources) {
             if (strcasecmp(requestedName, resource.name) == 0 && resource.address) {
@@ -2666,11 +2761,16 @@ static uint32_t LoadMenuOtherResource(const char* requestedName, uint32_t* outSi
         file = std::fopen(path, "rb");
         if (file) break;
     }
-    if (!file) return 0;
+    if (!file) {
+        return reportFailure("could not open MenuOther.szs from SDMC or workspace paths");
+    }
     std::fseek(file, 0, SEEK_END);
     const long fileSize = std::ftell(file);
     std::fseek(file, 0, SEEK_SET);
-    if (fileSize < 16) { std::fclose(file); return 0; }
+    if (fileSize < 16) {
+        std::fclose(file);
+        return reportFailure("MenuOther.szs is too small");
+    }
     std::vector<uint8_t> compressed;
     try {
         compressed.resize(static_cast<size_t>(fileSize));
@@ -2680,71 +2780,147 @@ static uint32_t LoadMenuOtherResource(const char* requestedName, uint32_t* outSi
     }
     if (std::fread(compressed.data(), 1, compressed.size(), file) != compressed.size()) {
         std::fclose(file);
-        return 0;
+        return reportFailure("short read from MenuOther.szs");
     }
     std::fclose(file);
 
-    if (std::memcmp(compressed.data(), "Yaz0", 4) != 0) return 0;
+    if (std::memcmp(compressed.data(), "Yaz0", 4) != 0) {
+        return reportFailure("MenuOther.szs has an invalid Yaz0 header");
+    }
     const uint32_t expandedSize = gx_bridge::ReadBE32(compressed.data() + 4);
-    if (expandedSize == 0 || expandedSize > 16u * 1024u * 1024u) return 0;
-    std::vector<uint8_t> archive;
-    try {
-        archive.resize(expandedSize);
-    } catch (...) {
-        return 0;
+    if (expandedSize == 0 || expandedSize > 16u * 1024u * 1024u) {
+        return reportFailure("MenuOther.szs expanded size is out of range");
     }
-    size_t src = 16;
-    size_t dst = 0;
-    while (dst < archive.size() && src < compressed.size()) {
-        uint8_t flags = compressed[src++];
-        for (int bit = 7; bit >= 0 && dst < archive.size(); --bit) {
-            if (flags & (1u << bit)) {
-                if (src >= compressed.size()) return 0;
-                archive[dst++] = compressed[src++];
-                continue;
-            }
-            if (src + 1 >= compressed.size()) return 0;
-            const uint8_t a = compressed[src++];
-            const uint8_t b = compressed[src++];
-            const size_t distance = (((static_cast<size_t>(a) & 0x0Fu) << 8) | b) + 1;
-            size_t count = a >> 4;
-            if (count == 0) {
-                if (src >= compressed.size()) return 0;
-                count = static_cast<size_t>(compressed[src++]) + 18;
-            } else {
-                count += 2;
-            }
-            if (distance > dst) return 0;
-            for (size_t i = 0; i < count && dst < archive.size(); ++i) {
-                archive[dst] = archive[dst - distance];
-                ++dst;
-            }
-        }
-    }
-    if (dst != archive.size()) return 0;
-
-    // PAL Race_E.szs expands to 1,195,840 bytes in a 1,310,720-byte reserved slot;
-    // this final 64 KiB of the dedicated race buffer is outside the archive's data.
+    // Only three small U8 files are needed here. Stream Yaz0 into a 4 KiB history window,
+    // retain just the U8 node/name table, then copy matching file ranges directly to guest RAM.
+    // Keeping a second ~8 MiB expanded archive exhausted Old 3DS heap after guest RAM setup.
     constexpr uint32_t kMenuResourceAddress = kRaceSzsBase + kRaceSzsSize - 0x10000u;
     constexpr uint32_t kMenuResourceCapacity = 0x10000u;
+    struct ExtractRange { uint32_t begin = 0; uint32_t end = 0; uint32_t guest = 0; };
+    std::array<ExtractRange, 3> ranges{};
+    std::array<uint8_t, 0x1000> history{};
+    std::vector<uint8_t> metadata;
+    try { metadata.reserve(0x10000); }
+    catch (...) { return reportFailure("could not allocate the small MenuOther U8 index buffer"); }
+
+    size_t src = 16;
+    uint32_t dst = 0;
     uint32_t cursor = 0;
-    for (auto& cached : s_resources) {
-        uint32_t resourceSize = 0;
-        const uint8_t* resource = FindHostU8Resource(archive, cached.name, &resourceSize);
-        if (!resource || resourceSize == 0 || resourceSize > 0x1000) continue;
-        cursor = (cursor + 31u) & ~31u;
-        if (cursor > kMenuResourceCapacity || resourceSize > kMenuResourceCapacity - cursor) return 0;
-        const uint32_t guestAddress = kMenuResourceAddress + cursor;
-        uint8_t* guest = Memory::GetPointer(guestAddress, resourceSize);
-        if (!guest) return 0;
-        std::memcpy(guest, resource, resourceSize);
-        cached.address = guestAddress;
-        cached.size = resourceSize;
-        cursor += resourceSize;
-        AppLog("[MenuResource] Extracted %s from MenuOther.szs to %08X (size=%u)\n",
-            cached.name, guestAddress, resourceSize);
+    uint32_t nextMetadataProbe = 12;
+    uint32_t metadataEnd = 0;
+    bool rangesReady = false;
+    uint8_t flags = 0;
+    int bitsLeft = 0;
+    auto acceptByte = [&](uint8_t value) {
+        history[dst & 0xFFFu] = value;
+        if (!rangesReady && metadata.size() < 0x100000u) metadata.push_back(value);
+        if (rangesReady) {
+            for (uint32_t i = 0; i < ranges.size(); ++i) {
+                const auto& range = ranges[i];
+                if (range.end <= range.begin || dst < range.begin || dst >= range.end) continue;
+                Memory::Write8(range.guest + (dst - range.begin), value);
+            }
+        }
+        ++dst;
+    };
+    auto probeMetadata = [&]() -> bool {
+        if (rangesReady || metadata.size() < nextMetadataProbe) return true;
+        nextMetadataProbe = std::min<uint32_t>(0x100000u, nextMetadataProbe * 2u);
+        if (metadata.size() < 12 || gx_bridge::ReadBE32(metadata.data()) != 0x55AA382Du) return true;
+        const uint32_t root = gx_bridge::ReadBE32(metadata.data() + 4);
+        if (root > 0x100000u || root > metadata.size() || metadata.size() - root < 12) return true;
+        const uint32_t count = gx_bridge::ReadBE32(metadata.data() + root + 8);
+        if (count > (0x100000u - root) / 12u) return false;
+        const uint32_t strings = root + count * 12u;
+        if (metadata.size() < strings) return metadata.size() < 0x100000u;
+        uint32_t tableEnd = strings;
+        for (uint32_t n = 0; n < count; ++n) {
+            const uint32_t node = root + n * 12u;
+            const uint32_t nameOff = (static_cast<uint32_t>(metadata[node + 1]) << 16) |
+                (static_cast<uint32_t>(metadata[node + 2]) << 8) | metadata[node + 3];
+            const uint32_t name = strings + nameOff;
+            if (name >= 0x100000u) return false;
+            uint32_t endName = name;
+            while (endName < metadata.size() && metadata[endName] != 0) ++endName;
+            if (endName == metadata.size()) return metadata.size() < 0x100000u;
+            tableEnd = std::max(tableEnd, endName + 1u);
+        }
+        metadataEnd = tableEnd;
+        if (metadata.size() < metadataEnd) return true;
+
+        for (uint32_t i = 0; i < ranges.size(); ++i) {
+            for (uint32_t n = 0; n < count; ++n) {
+                const uint32_t node = root + n * 12u;
+                if (metadata[node] != 0) continue;
+                const uint32_t nameOff = (static_cast<uint32_t>(metadata[node + 1]) << 16) |
+                    (static_cast<uint32_t>(metadata[node + 2]) << 8) | metadata[node + 3];
+                const char* name = reinterpret_cast<const char*>(metadata.data() + strings + nameOff);
+                if (strcasecmp(name, s_resources[i].name) != 0) continue;
+                const uint32_t begin = gx_bridge::ReadBE32(metadata.data() + node + 4);
+                const uint32_t size = gx_bridge::ReadBE32(metadata.data() + node + 8);
+                if (!size || size > 0x1000u || begin > expandedSize || size > expandedSize - begin) break;
+                cursor = (cursor + 31u) & ~31u;
+                if (cursor > kMenuResourceCapacity || size > kMenuResourceCapacity - cursor) break;
+                ranges[i] = {begin, begin + size, kMenuResourceAddress + cursor};
+                s_resources[i].address = ranges[i].guest;
+                s_resources[i].size = size;
+                cursor += size;
+                break;
+            }
+        }
+        rangesReady = true;
+        // Some archives place a tiny requested resource before the final name string.
+        for (const auto& range : ranges) {
+            if (range.end <= range.begin || range.begin >= metadata.size()) continue;
+            const uint32_t copyEnd = std::min<uint32_t>(range.end, static_cast<uint32_t>(metadata.size()));
+            for (uint32_t p = range.begin; p < copyEnd; ++p)
+                Memory::Write8(range.guest + (p - range.begin), metadata[p]);
+        }
+        return true;
+    };
+
+    while (dst < expandedSize && src < compressed.size()) {
+        if (bitsLeft == 0) {
+            flags = compressed[src++];
+            bitsLeft = 8;
+        }
+        uint32_t count = 1;
+        uint32_t distance = 0;
+        if (flags & 0x80u) {
+            if (src >= compressed.size()) return reportFailure("truncated literal in MenuOther.szs Yaz0 stream");
+        } else {
+            if (src + 1 >= compressed.size()) return reportFailure("truncated back-reference in MenuOther.szs Yaz0 stream");
+            const uint8_t a = compressed[src++];
+            const uint8_t b = compressed[src++];
+            distance = (((static_cast<uint32_t>(a) & 0x0Fu) << 8) | b) + 1u;
+            count = a >> 4;
+            if (!count) {
+                if (src >= compressed.size()) return reportFailure("truncated long back-reference in MenuOther.szs Yaz0 stream");
+                count = static_cast<uint32_t>(compressed[src++]) + 18u;
+            } else count += 2u;
+            if (distance > dst) return reportFailure("invalid back-reference in MenuOther.szs Yaz0 stream");
+        }
+        flags <<= 1;
+        --bitsLeft;
+        for (uint32_t j = 0; j < count && dst < expandedSize; ++j) {
+            uint8_t value;
+            if (!distance) value = compressed[src++];
+            else value = history[(dst - distance) & 0xFFFu];
+            acceptByte(value);
+            if (!probeMetadata()) return reportFailure("invalid or oversized MenuOther U8 node table");
+        }
+    }
+    if (dst != expandedSize) return reportFailure("MenuOther.szs decompression ended early");
+    if (!rangesReady) return reportFailure("could not read the MenuOther U8 node/name table");
+    for (const auto& resource : s_resources) {
+        if (resource.address)
+            AppLog("[MenuResource] Extracted %s from MenuOther.szs to %08X (size=%u)\n",
+                resource.name, resource.address, resource.size);
     }
     s_loaded = true;
+    if (!s_resources[0].address) {
+        reportFailure("decompressed MenuOther.szs but OptionBG.brctr was absent");
+    }
     for (const auto& resource : s_resources) {
         if (strcasecmp(requestedName, resource.name) == 0 && resource.address) {
             if (outSize) *outSize = resource.size;
@@ -4543,6 +4719,37 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         gx_bridge::ParseDisplayList(cpu->gpr[3], cpu->gpr[4], 0);
         return true;
     }
+    case 0x8016E37Cu: { // GX::SetTexCoordGen2
+        static uint32_t s_logged = 0;
+        if (gx_bridge::g_gxFrame >= 80 && gx_bridge::g_gxFrame <= 110 && s_logged < 24) {
+            ++s_logged;
+            AppLog("[MenuTexGen] frame=%u coord=%u type=%u src=%u mtx=%u normalize=%u post=%u lr=%08X\n",
+                gx_bridge::g_gxFrame, cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], cpu->gpr[6],
+                cpu->gpr[7], cpu->gpr[8], cpu->lr);
+        }
+        return true;
+    }
+    case 0x80173234u: { // GX::LoadTexMtxImm
+        static uint32_t s_logged = 0;
+        if (gx_bridge::g_gxFrame >= 80 && gx_bridge::g_gxFrame <= 110 && s_logged < 24) {
+            ++s_logged;
+            const uint32_t addr = cpu->gpr[3];
+            if (addr && Memory::Contains(addr, 48)) {
+                AppLog("[MenuTexMtx] frame=%u addr=%08X id=%u type=%u lr=%08X rows=(%.4g,%.4g,%.4g,%.4g)(%.4g,%.4g,%.4g,%.4g)(%.4g,%.4g,%.4g,%.4g)\n",
+                    gx_bridge::g_gxFrame, addr, cpu->gpr[4], cpu->gpr[5], cpu->lr,
+                    gx_bridge::ReadGuestFloat(addr), gx_bridge::ReadGuestFloat(addr + 4),
+                    gx_bridge::ReadGuestFloat(addr + 8), gx_bridge::ReadGuestFloat(addr + 12),
+                    gx_bridge::ReadGuestFloat(addr + 16), gx_bridge::ReadGuestFloat(addr + 20),
+                    gx_bridge::ReadGuestFloat(addr + 24), gx_bridge::ReadGuestFloat(addr + 28),
+                    gx_bridge::ReadGuestFloat(addr + 32), gx_bridge::ReadGuestFloat(addr + 36),
+                    gx_bridge::ReadGuestFloat(addr + 40), gx_bridge::ReadGuestFloat(addr + 44));
+            } else {
+                AppLog("[MenuTexMtx] frame=%u invalid addr=%08X id=%u type=%u lr=%08X\n",
+                    gx_bridge::g_gxFrame, addr, cpu->gpr[4], cpu->gpr[5], cpu->lr);
+            }
+        }
+        return true;
+    }
     case 0x80060AE0u: // nw4r::g3d::tmem::SetTMemLayout
     case 0x8016F4B8u: // GXSetDispCopyDst
     case 0x8016F478u: // GXSetTexCopySrc
@@ -4562,7 +4769,6 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x8016EB70u: // GX::PixModeSync
     case 0x8016E848u: // GX::AbortFrame
     case 0x8016E36Cu: // GX::InvalidateVtxCache
-    case 0x8016E37Cu: // GX::SetTexCoordGen2
     case 0x8016E5A4u: // GX::SetNumTexGens
     case 0x8016E5C8u: // GX::SetMisc
     case 0x8016EB94u: // GX::PokeAlphaMode
@@ -4578,7 +4784,6 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x8016ED94u: // GX::FinishInterruptHandler
     case 0x80173188u: // GX::LoadNrmMtxImm
     case 0x801731E0u: // GX::LoadNrmMtxIndx3x3
-    case 0x80173234u: // GX::LoadTexMtxImm
     case 0x80173400u: // GX::SetZScaleOffset
     case 0x80173430u: // GX::SetScissor
     case 0x801734E0u: // GX::SetScissorBoxOffset
