@@ -912,7 +912,7 @@ static void SanitizeModelViewMatrix(float* m) {
 // Per-draw tracing is only useful for offline debugging. Enabling it costs ~6800 console
 // lines in a SINGLE frame (3385 draws x 2 lines) which stalls the device for minutes, so it is
 // switched off by default. Set to a real frame number to debug a specific frame.
-static constexpr uint32_t kGxTraceFrame = 0xFFFFFFFFu;
+static const uint32_t kGxTraceFrame = [](){ const char* e = std::getenv("MKW_TRACE_FRAME"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0xFFFFFFFFu; }();
 static uint32_t g_gxFrame = 1;
 // --- Debug chase camera -------------------------------------------------------------
 // The guest never registers a race camera in this boot path (the camera manager stays empty),
@@ -4158,15 +4158,6 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     auto nandLoad = [](const std::string& path) -> bool {
         if (s_nandLoaded[path]) return s_nandStore.find(path) != s_nandStore.end();
         s_nandLoaded[path] = true;
-        // The Mario Kart Channel reads the Wii system state file
-        // (/title/00000001/00000002/data/state.dat) to decide whether to return to the Wii
-        // Menu. With it missing, the channel takes the "return to Wii Menu" path and never
-        // draws. Serve a zeroed file so it treats this as a plain boot and stays in-game.
-        if (path.find("state.dat") != std::string::npos) {
-            std::vector<uint8_t>& data = s_nandStore[path];
-            data.assign(8, 0);
-            return true;
-        }
         if (path.find("rksys.dat") == std::string::npos) return false;
         const char* candidates[] = {
             "sdmc:/mkwii/rksys.dat",
@@ -7686,7 +7677,9 @@ void WriteResolvedFallbackFloat32(uint32_t address, double value)
 void WriteFloat32Slow(uint32_t address, double)
 {
     if (address < 0x10000) return;
-    std::fprintf(stderr, "Unmapped float32 write: %08lX\n", static_cast<unsigned long>(address));
+    const CpuContext* cpu = TryGetCpuContext();
+    std::fprintf(stderr, "Unmapped float32 write: %08lX pc=%08X lr=%08X\n",
+        static_cast<unsigned long>(address), cpu ? cpu->pc : 0, cpu ? cpu->lr : 0);
     std::abort();
 }
 }
