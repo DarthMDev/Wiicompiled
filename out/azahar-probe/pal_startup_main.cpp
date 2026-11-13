@@ -3016,6 +3016,67 @@ static bool Gpu2dInit() {
     return true;
 }
 
+// Reads sdmc:/mkwii/gpu.cfg, one "key=value" per line (blank lines and '#' comments ignored):
+//   gpu=0           use the software rasteriser
+//   test=1          draw the two reference quads
+//   unif=3          projection uniform slot
+//   ysign=1         canvas y -> screen y sign
+//   vflip=1         flip V on textured quads
+//   scissor=1       per-quad scissor
+//   debug=0         silence the first-quad dump
+//   clear=FF00FF    forced clear colour
+//   texmb=3         VRAM texture budget
+static bool Gpu2dReadConfig() {
+    FILE* fp = std::fopen("sdmc:/mkwii/gpu.cfg", "rb");
+    if (!fp) fp = std::fopen("gpu.cfg", "rb");
+    if (!fp) return false;
+    char line[128];
+    bool any = false;
+    while (std::fgets(line, sizeof(line), fp)) {
+        char* hash = std::strchr(line, '#');
+        if (hash) *hash = 0;
+        char* eq = std::strchr(line, '=');
+        if (!eq) continue;
+        *eq = 0;
+        const char* key = line;
+        const char* value = eq + 1;
+        auto trim = [](char* t) {
+            while (*t == ' ' || *t == '\t') ++t;
+            char* e = t + std::strlen(t);
+            while (e > t && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t')) --e;
+            *e = 0;
+            return t;
+        };
+        char keyBuf[64];
+        std::snprintf(keyBuf, sizeof(keyBuf), "%s", key);
+        const char* k = trim(keyBuf);
+        char valBuf[64];
+        std::snprintf(valBuf, sizeof(valBuf), "%s", value);
+        const char* v = trim(valBuf);
+        const long n = std::atol(v);
+        const bool on = n != 0;
+        any = true;
+        if (std::strcmp(k, "gpu") == 0) g_gpu2d = on;
+        else if (std::strcmp(k, "test") == 0) g_gpuTestDraw = on;
+        else if (std::strcmp(k, "unif") == 0) g_gpuProjUnif = static_cast<int>(n) & 3;
+        else if (std::strcmp(k, "ysign") == 0) g_gpuYSpace = (n == 0) ? 0.0f : static_cast<float>(n);
+        else if (std::strcmp(k, "vflip") == 0) g_gpuVFlip = on;
+        else if (std::strcmp(k, "scissor") == 0) g_gpuScissor = on;
+        else if (std::strcmp(k, "debug") == 0) g_gpuDebugQuads = on ? 4u : 0u;
+        else if (std::strcmp(k, "clear") == 0)
+            g_gpuClearOverride = (static_cast<uint32_t>(std::strtoul(v, nullptr, 16)) << 8) | 0xFFu;
+        else if (std::strcmp(k, "texmb") == 0 && n > 0)
+            g_gpuTexCap = static_cast<size_t>(n) * 1024ull * 1024ull;
+    }
+    std::fclose(fp);
+    if (any) AppLog("[Gpu2d] config sdmc:/mkwii/gpu.cfg loaded: gpu=%d test=%d unif=%d ysign=%.1f "
+                    "vflip=%d scissor=%d debug=%u clear=%08X texmb=%zu\n",
+                    g_gpu2d ? 1 : 0, g_gpuTestDraw ? 1 : 0, g_gpuProjUnif, g_gpuYSpace,
+                    g_gpuVFlip ? 1 : 0, g_gpuScissor ? 1 : 0, g_gpuDebugQuads,
+                    g_gpuClearOverride, g_gpuTexCap / (1024 * 1024));
+    return any;
+}
+
 static void Gpu2dConfigure() {
     g_gpu2d = std::getenv("MKW_NO_GPU2D") == nullptr;
     if (const char* ys = std::getenv("MKW_GPU_YSIGN")) g_gpuYSpace = std::stof(ys);
@@ -3027,6 +3088,9 @@ static void Gpu2dConfigure() {
     g_gpuDebugQuads = std::getenv("MKW_GPU_NODEBUG") ? 0u : 4u;
     g_gpuTestDraw = std::getenv("MKW_GPU_TEST") != nullptr;
     if (const char* u = std::getenv("MKW_GPU_UNIF")) g_gpuProjUnif = std::atoi(u) & 3;
+#ifdef __3DS__
+    Gpu2dReadConfig(); // the config file wins: it is the one that is easy to edit on device
+#endif
     if (const char* mb = std::getenv("MKW_GPU_TEX_MB")) {
         const long v = std::atol(mb);
         if (v > 0) g_gpuTexCap = static_cast<size_t>(v) * 1024ull * 1024ull;
