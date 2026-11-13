@@ -2643,6 +2643,13 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
             frameNumber, g_gx.drawCallsThisFrame, g_gx.trisThisFrame, g_gx.quads2DThisFrame, g_gx.dlCallsThisFrame, g_texCacheBytes / 1024, g_gx.pixels3DThisFrame, g_gx.tri3DEntered, g_gx.tri3DBounds, g_gx.tri2DAlphaZero, g_gx.tri2DWritten);
         AppLog("[GlobeFlag] frame=%u flag=%u bits=%08X\n",
             frameNumber, Memory::Read8(0x809C19A0u), Memory::Read32(0x809C1874u));
+        {
+            const uint32_t mgr = Memory::Read32(0x809C2144u);
+            if (mgr && Memory::Contains(mgr + 30072, 4)) {
+                AppLog("[MenuState] frame=%u mgr=%08X state=%u s30076=%u\n",
+                    frameNumber, mgr, Memory::Read32(mgr + 30072), Memory::Read32(mgr + 30076));
+            }
+        }
         if (gx_bridge::g_panicTotal != 0 && (frameNumber % 200 == 0)) {
             std::string sites;
             uint32_t shown = 0;
@@ -3327,6 +3334,24 @@ extern "C" void MkwOnDirectCall(uint32_t target) {
 
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
+    // Watch the menu globe object's visibility byte (*(0x809C1988)+32). It is 0 for the whole
+    // natural boot, so the globe draw is skipped. Log the first transition and the call that
+    // caused it, to find the state-machine edge that should show the globe.
+    {
+        static uint32_t s_lastGlobeFlag = 0xFFFFFFFFu;
+        static uint32_t s_lastTarget = 0;
+        static uint32_t s_lastLr = 0;
+        const uint32_t globeObj = Memory::Read32(0x809C1988u);
+        const uint32_t flag = (globeObj && Memory::Contains(globeObj + 32, 1))
+            ? Memory::Read8(globeObj + 32) : 0xFFFFFFFFu;
+        if (flag != s_lastGlobeFlag) {
+            AppLog("[GlobeWatch] flag=%u prevTarget=%08X prevLr=%08X nowTarget=%08X nowLr=%08X obj=%08X frame=%u\n",
+                flag, s_lastTarget, s_lastLr, target, cpu ? cpu->lr : 0, globeObj, gx_bridge::g_gxFrame);
+            s_lastGlobeFlag = flag;
+        }
+        s_lastTarget = target;
+        s_lastLr = cpu ? cpu->lr : 0;
+    }
     // Stack-depth guard. Each recompiled guest frame consumes ~4 KB of host stack (0xF20 in the
     // prologue), so a guest loop that recurses a few thousand deep overflows the stack and dies
     // with an opaque SIGSEGV in ___chkstk_darwin. Track high-water usage and log the cycle that
