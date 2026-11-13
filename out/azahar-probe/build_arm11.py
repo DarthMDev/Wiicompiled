@@ -19,7 +19,10 @@ if not gxx.exists():
     sys.exit(1)
 
 common_flags = [
-    '-D__3DS__', '-std=c++20', '-Os', '-g0',
+    # -O2 instead of -Os: the guest CPU is recompiled C++, so instruction-level performance of the
+    # shards dominates menu frame times.  MKW_ARM11_OPT lets us fall back to -Os if code size (and
+    # therefore the RAM the binary takes from the app region) becomes a problem.
+    '-D__3DS__', '-std=c++20', os.environ.get('MKW_ARM11_OPT', '-Os'), '-g0',
     '-march=armv6k', '-mtune=mpcore', '-mfloat-abi=hard', '-mtp=soft',
     '-Iruntime-overlay', '-I../../generated',
     f'-I{sdk}/libctru/include'
