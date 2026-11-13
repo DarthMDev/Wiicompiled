@@ -1252,6 +1252,23 @@ static void UpdateScissorScreenRect() {
     g_gx.clipY1 = scaleClamp(g_gx.scissorY + g_gx.scissorH, efbH, kScreenH);
 }
 
+// Frame-time accounting.  The menu sat at ~55 ms per frame with the 2D layout already on the GPU,
+// so the remaining cost has to be attributed before optimising anything: software-raster pixels,
+// the GPU pass (including the base-layer upload) or the guest CPU in between.
+#ifdef __3DS__
+static uint64_t g_profRasterTicks = 0;   // software rasteriser
+static uint64_t g_profGpuTicks = 0;      // citro3d frame (upload + submit + sync)
+static uint32_t g_profRasterTris = 0;
+static inline uint64_t ProfNow() { return osGetTime(); }
+static inline uint64_t ProfTicksToUs(uint64_t ticks) { return ticks * 1000ull / 268123ull; }
+#else
+static uint64_t g_profRasterTicks = 0;
+static uint64_t g_profGpuTicks = 0;
+static uint32_t g_profRasterTris = 0;
+static inline uint64_t ProfNow() { return 0; }
+static inline uint64_t ProfTicksToUs(uint64_t ticks) { return 0; }
+#endif
+
 // PICA200 2D backend.  Implemented further down for the 3DS build only; the host harness keeps
 // the software rasteriser so frames can still be dumped to PPM.
 static bool g_gpu2d = false;
@@ -1272,6 +1289,15 @@ static void Gpu2dConfigure() {}
 static bool Gpu2dInit() { return false; }
 static void Gpu2dRecordQuad(const GxVertex[4]) {}
 static void Gpu2dRender() {}
+#endif
+
+// Audio: one BRSTM played by the DSP (see the NDSP block below).  Off with audio=0 in gpu.cfg.
+static char g_audioPathBuf[160] = "sdmc:/mkwii/sound/strm/o_Option_32.brstm";
+static bool g_audioEnabled = true;
+#ifdef __3DS__
+static bool AudioStart(const char* path);
+#else
+static bool AudioStart(const char*) { return false; }
 #endif
 
 static void EnsureInitialized() {
@@ -1933,6 +1959,12 @@ static inline bool AlphaTestPass(float alpha) {
 
 static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVertex& v2, uint32_t pnMtxIdx) {
     EnsureInitialized();
+    const uint64_t profStart = ProfNow();
+    ++g_profRasterTris;
+    struct ProfGuard {
+        uint64_t start;
+        ~ProfGuard() { g_profRasterTicks += ProfNow() - start; }
+    } profGuard{profStart};
     g_gx.lastTrianglePixels = 0;
     if (g_gx.projType == 0) ++g_gx.tri3DEntered;
     const bool tracePerspective = (g_gxFrame == kGxTraceFrame) && g_gx.projType == 0;
@@ -2921,6 +2953,159 @@ static void AppendFifoBytes(const uint8_t* data, size_t len) {
 
 #ifdef __3DS__
 // ===========================================================================
+// NDSP audio: play a retail BRSTM stream straight from the disc assets
+// ===========================================================================
+// Mario Kart Wii's BGM is either an RSEQ sequence inside revo_kart.brsar or a BRSTM stream in
+// sound/strm/.  A BRSTM's payload is DSP-ADPCM, i.e. exactly what the 3DS DSP decodes in hardware,
+// so no transcoding is needed: parse the header and hand the bytes to NDSP.
+//
+// The whole stream is loaded into FCRAM and played as one looping wave buffer.  That is simpler
+// than a streaming ring and good enough for the ~0.5-1 MB menu tracks; the DSP loops it without
+// help from us.  (MKWii's BRSTMs put their loop point mid-file, so a whole-buffer loop repeats the
+// intro -- acceptable for now, and the correct fix is to start the buffer at the loop point.)
+static bool g_audioReady = false;
+static bool g_audioStarted = false;
+static bool g_audioFailed = false;
+static int  g_audioChannel = 0;
+static std::vector<uint8_t> g_audioFile;      // whole BRSTM
+static std::vector<uint8_t> g_audioPcm;       // interleaved / mono ADPCM payload
+static ndspWaveBuf g_audioWave{};
+static uint32_t g_audioRate = 32000;
+static uint32_t g_audioSamples = 0;
+static uint32_t g_audioBytes = 0;
+static uint8_t  g_audioChannels = 2;
+
+static uint32_t RdU32(const uint8_t* d, size_t o) {
+    return (static_cast<uint32_t>(d[o]) << 24) | (static_cast<uint32_t>(d[o + 1]) << 16) |
+           (static_cast<uint32_t>(d[o + 2]) << 8) | d[o + 3];
+}
+static uint16_t RdU16(const uint8_t* d, size_t o) {
+    return static_cast<uint16_t>((d[o] << 8) | d[o + 1]);
+}
+// Util::DataRef: {u8 refType, u8 dataType, u16 pad, u32 value}; refType 1 = offset from the section base.
+static bool RdDataRef(const uint8_t* d, size_t size, size_t o, size_t base, size_t* out) {
+    if (o + 8 > size) return false;
+    if (d[o] != 1 || RdU32(d, o + 4) == 0) return false;
+    const size_t at = base + RdU32(d, o + 4);
+    if (at >= size) return false;
+    *out = at;
+    return true;
+}
+
+static bool AudioParseBrstm(const uint8_t* d, size_t size) {
+    if (size < 0x40 || std::memcmp(d, "RSTM", 4) != 0) return false;
+    const size_t head = RdU32(d, 0x10);
+    if (head + 0x20 > size) return false;
+    const size_t base = head + 8;
+    size_t info = 0;
+    if (!RdDataRef(d, size, head + 8, base, &info)) return false;
+
+    const uint8_t format = d[info];
+    const uint8_t channels = d[info + 2];
+    g_audioChannels = channels;
+    g_audioRate = (static_cast<uint32_t>(d[info + 3]) << 16) | RdU16(d, info + 4);
+    const uint32_t loopEnd = RdU32(d, info + 12);
+    const uint32_t blocks = RdU32(d, info + 0x14);
+    const uint32_t blockSize = RdU32(d, info + 0x18);
+    const uint32_t blockSamples = RdU32(d, info + 0x1C);
+    const uint32_t lastPadded = RdU32(d, info + 0x28);
+    if (format != 2) { // 0/1 = PCM16/PCM8, not what the DSP wants
+        AppLog("[Audio] unsupported BRSTM codec %u\n", format);
+        return false;
+    }
+    if (channels != 1 && channels != 2) return false;
+    if (blockSize == 0 || blocks == 0) return false;
+
+    // DATA section: 8-byte header, then the per-channel offsets; the first channel's audio starts
+    // at data_block+8+its offset.  Channel 1 (if present) follows channel 0's padded block run.
+    const size_t dataBlock = RdU32(d, 0x20);
+    if (dataBlock + 0x10 > size) return false;
+    size_t audio = 0;
+    if (!RdDataRef(d, size, dataBlock + 8, dataBlock + 8, &audio)) return false;
+    const size_t chanBytes = static_cast<size_t>(blocks) * blockSize + lastPadded;
+    const size_t need = (channels == 2 ? chanBytes * 2 : chanBytes);
+    if (audio + need > size) {
+        AppLog("[Audio] BRSTM data truncated (%zu+%zu > %zu)\n", audio, need, size);
+        return false;
+    }
+
+    g_audioSamples = loopEnd;
+    if (channels == 1) {
+        g_audioPcm.assign(d + audio, d + audio + chanBytes);
+        g_audioBytes = static_cast<uint32_t>(chanBytes);
+    } else {
+        // STEREO_DSPADPCM wants the two channels' 8-byte frames adjacent.
+        const size_t frames = chanBytes / 8;
+        g_audioPcm.resize(frames * 16);
+        for (size_t f = 0; f < frames; ++f) {
+            std::memcpy(&g_audioPcm[f * 16], d + audio + f * 8, 8);
+            std::memcpy(&g_audioPcm[f * 16 + 8], d + audio + chanBytes + f * 8, 8);
+        }
+        g_audioBytes = static_cast<uint32_t>(frames * 16);
+    }
+    return true;
+}
+
+static bool AudioStart(const char* path) {
+    if (g_audioStarted) return true;
+    g_audioStarted = true;
+
+    FILE* fp = std::fopen(path, "rb");
+    if (!fp) {
+        AppLog("[Audio] %s missing\n", path);
+        g_audioFailed = true;
+        return false;
+    }
+    std::fseek(fp, 0, SEEK_END);
+    const long size = std::ftell(fp);
+    std::fseek(fp, 0, SEEK_SET);
+    if (size <= 0) { std::fclose(fp); g_audioFailed = true; return false; }
+    g_audioFile.resize(static_cast<size_t>(size));
+    const size_t got = std::fread(g_audioFile.data(), 1, g_audioFile.size(), fp);
+    std::fclose(fp);
+    if (got != g_audioFile.size()) { g_audioFailed = true; return false; }
+
+    if (!AudioParseBrstm(g_audioFile.data(), g_audioFile.size())) {
+        AppLog("[Audio] %s is not a playable BRSTM\n", path);
+        g_audioFailed = true;
+        return false;
+    }
+    g_audioFile.clear();
+    g_audioFile.shrink_to_fit();
+
+    if (!g_audioReady) {
+        if (R_FAILED(ndspInit())) {
+            AppLog("[Audio] ndspInit failed (no dspfirm.cdc?)\n");
+            g_audioFailed = true;
+            return false;
+        }
+        ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+        ndspSetMasterVol(1.0f);
+        g_audioReady = true;
+    }
+    const int ch = g_audioChannel;
+    ndspChnReset(ch);
+    ndspChnSetInterp(ch, NDSP_INTERP_LINEAR);
+    ndspChnSetRate(ch, static_cast<float>(g_audioRate));
+    // libctru spells the DSP-ADPCM formats NDSP_FORMAT_ADPCM (stereo, interleaved 8-byte frames)
+    // and NDSP_FORMAT_MONO_ADPCM.
+    ndspChnSetFormat(ch, g_audioChannels == 2 ? NDSP_FORMAT_ADPCM : NDSP_FORMAT_MONO_ADPCM);
+    static const float kMix[12] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f,
+                                   1.0f, 1.0f, 1.0f, 0.0f};
+    ndspChnSetMix(ch, const_cast<float*>(kMix));
+
+    std::memset(&g_audioWave, 0, sizeof(g_audioWave));
+    g_audioWave.data_vaddr = g_audioPcm.data();
+    g_audioWave.nsamples = g_audioSamples;
+    g_audioWave.looping = true;
+    DSP_FlushDataCache(g_audioPcm.data(), g_audioBytes);
+    ndspChnWaveBufAdd(ch, &g_audioWave);
+    AppLog("[Audio] playing %s rate=%u samples=%u bytes=%u\n", path, g_audioRate,
+           g_audioSamples, g_audioBytes);
+    return true;
+}
+
+// ===========================================================================
 // PICA200 (citro3d) 2D path
 // ===========================================================================
 // The software rasteriser samples every pixel of every layout quad in C++.  The menu issues ~24
@@ -3133,6 +3318,9 @@ static bool Gpu2dReadConfig() {
         else if (std::strcmp(k, "debug") == 0) g_gpuDebugQuads = on ? 4u : 0u;
         else if (std::strcmp(k, "clear") == 0)
             g_gpuClearOverride = (static_cast<uint32_t>(std::strtoul(v, nullptr, 16)) << 8) | 0xFFu;
+        else if (std::strcmp(k, "audio") == 0) g_audioEnabled = on;
+        else if (std::strcmp(k, "audiopath") == 0)
+            std::snprintf(g_audioPathBuf, sizeof(g_audioPathBuf), "%s", v);
         else if (std::strcmp(k, "texmb") == 0 && n > 0)
             g_gpuTexCap = static_cast<size_t>(n) * 1024ull * 1024ull;
     }
@@ -3432,6 +3620,11 @@ static inline void TransformToClip(const C3D_Mtx& m, float x, float y, float* ou
 
 static void Gpu2dRender() {
     if (!g_gpuReady) return;
+    const uint64_t profStart = ProfNow();
+    struct ProfGuard {
+        uint64_t start;
+        ~ProfGuard() { g_profGpuTicks += ProfNow() - start; }
+    } profGuard{profStart};
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
     const uint32_t guestClear = (g_gx.clearColor[0] << 24) | (g_gx.clearColor[1] << 16) |
                                 (g_gx.clearColor[2] << 8) | 0xFFu;
@@ -8582,6 +8775,11 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
 #ifdef __3DS__
         if (s_frameCount % 30 == 0) AppLogFlush();
+#endif
+#ifdef __3DS__
+        if (gx_bridge::g_audioEnabled && s_frameCount == 70u) {
+            gx_bridge::AudioStart(gx_bridge::g_audioPathBuf);
+        }
 #endif
         if (s_frameCount % 20 == 0) {
 #ifdef __3DS__
