@@ -1561,6 +1561,44 @@ static const DecodedTex* GetOrDecodeTexture(const TexSlot& slot) {
     default:
         break;
     }
+    // Textures are authored for the Wii's 608x456 canvas but are never displayed larger than the
+    // 400x240 top screen, so halve anything bigger than the screen (once per decode, bilinear-
+    // equivalent box filter).  UVs stay 0..1 so nothing else changes; this cuts the texture cache
+    // roughly in half and makes every software sample cheaper (two texel fetches instead of four
+    // in the common case).  tools/optimize_menu_textures.py in MKW-3DS does the same offline, with
+    // a measured per-sprite scale, and reports the same win.
+    if (tex.width > 512 || tex.height > 448) {
+        const int nw = (tex.width + 1) / 2;
+        const int nh = (tex.height + 1) / 2;
+        std::vector<uint32_t> small(static_cast<size_t>(nw) * static_cast<size_t>(nh));
+        const int sw = tex.width;
+        const int sh = tex.height;
+        for (int y = 0; y < nh; ++y) {
+            const int sy0 = std::min(sh - 1, y * 2);
+            const int sy1 = std::min(sh - 1, y * 2 + 1);
+            for (int x = 0; x < nw; ++x) {
+                const int sx0 = std::min(sw - 1, x * 2);
+                const int sx1 = std::min(sw - 1, x * 2 + 1);
+                const uint32_t c0 = tex.rgba[static_cast<size_t>(sy0) * sw + sx0];
+                const uint32_t c1 = tex.rgba[static_cast<size_t>(sy0) * sw + sx1];
+                const uint32_t c2 = tex.rgba[static_cast<size_t>(sy1) * sw + sx0];
+                const uint32_t c3 = tex.rgba[static_cast<size_t>(sy1) * sw + sx1];
+                uint32_t out = 0;
+                for (int shift = 24; shift >= 0; shift -= 8) {
+                    const uint32_t sum = ((c0 >> shift) & 0xFFu) + ((c1 >> shift) & 0xFFu) +
+                                         ((c2 >> shift) & 0xFFu) + ((c3 >> shift) & 0xFFu);
+                    out |= ((sum + 2u) / 4u) << shift;
+                }
+                small[static_cast<size_t>(y) * nw + x] = out;
+            }
+        }
+        tex.rgba.swap(small);
+        const size_t oldBytes = static_cast<size_t>(tex.width) * tex.height * sizeof(uint32_t);
+        const size_t newBytes = static_cast<size_t>(nw) * static_cast<size_t>(nh) * sizeof(uint32_t);
+        if (target != &g_texScratch && g_texCacheBytes >= oldBytes) g_texCacheBytes -= oldBytes - newBytes;
+        tex.width = static_cast<uint16_t>(nw);
+        tex.height = static_cast<uint16_t>(nh);
+    }
     return &tex;
 }
 
