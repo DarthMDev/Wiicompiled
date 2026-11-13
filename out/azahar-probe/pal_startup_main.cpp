@@ -3132,6 +3132,7 @@ static int      g_gpuProjUnif = 0;        // MKW_GPU_UNIF=n picks the projection
 static bool     g_gpuPnMtx = true;        // apply the pane matrix (GXLoadPosMtxImm) to layout quads
 
 struct GpuQuadVtx { float x, y, u, v, r, g, b, a; };
+struct GpuDrawVertex { float position[4], texcoord[4], color[4]; };
 struct GpuQuad {
     GpuQuadVtx v[4] = {};
     C3D_Tex* tex = nullptr;
@@ -3168,6 +3169,8 @@ static shaderProgram_s g_gpuProgram{};
 static bool      g_gpuProgramReady = false;
 static C3D_Tex   g_gpuBase{};
 static bool      g_gpuBaseValid = false;
+static GpuDrawVertex* g_gpuDrawVertices = nullptr;
+static size_t g_gpuDrawVertexCapacity = 0;
 
 // PICA200 textures are not row-major: texels are grouped in 8x8 tiles (tiles in row-major
 // order), and inside a tile they follow a Morton/Z order.  C3D_TexUpload (C3D_TexLoadImage in
@@ -3699,17 +3702,56 @@ static void Gpu2dRender() {
         g_gpuQuads.clear();
         return;
     }
-    for (const GpuQuad& q : g_gpuQuads) {
+    // Submit layout geometry from one explicit linear-memory vertex buffer.  Immediate mode
+    // works for the diagnostic pattern, but the menu path needs a persistent vertex stream with
+    // per-draw offsets so each texture/state change is represented by a normal PICA draw call.
+    const size_t vertexCount = g_gpuQuads.size() * 6;
+    if (vertexCount > g_gpuDrawVertexCapacity) {
+        size_t newCapacity = 256;
+        while (newCapacity < vertexCount) newCapacity *= 2;
+        GpuDrawVertex* replacement = static_cast<GpuDrawVertex*>(linearAlloc(newCapacity * sizeof(GpuDrawVertex)));
+        if (!replacement) {
+            AppLog("[Gpu2d] vertex buffer alloc failed count=%zu\n", vertexCount);
+            C3D_SetScissor(static_cast<GPU_SCISSORMODE>(0), 0, 0, 0, 0);
+            C3D_FrameEnd(0);
+            g_gpuQuads.clear();
+            return;
+        }
+        if (g_gpuDrawVertices) linearFree(g_gpuDrawVertices);
+        g_gpuDrawVertices = replacement;
+        g_gpuDrawVertexCapacity = newCapacity;
+    }
+    constexpr int kTriangleCorners[6] = {0, 1, 2, 0, 2, 3};
+    for (size_t qi = 0; qi < g_gpuQuads.size(); ++qi) {
+        const GpuQuad& q = g_gpuQuads[qi];
+        for (int vi = 0; vi < 6; ++vi) {
+            const GpuQuadVtx& src = q.v[kTriangleCorners[vi]];
+            GpuDrawVertex& dst = g_gpuDrawVertices[qi * 6 + vi];
+            TransformToClip(g_gpuProj, src.x, src.y, &dst.position[0], &dst.position[1]);
+            dst.position[2] = 0.0f;
+            dst.position[3] = 1.0f;
+            dst.texcoord[0] = src.u * q.uScale;
+            dst.texcoord[1] = src.v * q.vScale;
+            dst.texcoord[2] = dst.texcoord[3] = 0.0f;
+            dst.color[0] = src.r;
+            dst.color[1] = src.g;
+            dst.color[2] = src.b;
+            dst.color[3] = src.a;
+        }
+    }
+    if (vertexCount != 0) {
+        const u32 vertexBytes = static_cast<u32>(vertexCount * sizeof(GpuDrawVertex));
+        GSPGPU_FlushDataCache(g_gpuDrawVertices, vertexBytes);
+        C3D_BufInfo* buf = C3D_GetBufInfo();
+        BufInfo_Init(buf);
+        BufInfo_Add(buf, g_gpuDrawVertices, sizeof(GpuDrawVertex), 3, 0x210);
+    }
+    g_gpuQuadsDrawn = 0;
+    for (size_t qi = 0; qi < g_gpuQuads.size(); ++qi) {
+        const GpuQuad& q = g_gpuQuads[qi];
         C3D_Tex* tex = q.tex;
-        // UVs address the logical texture; the VRAM copy is padded up to power-of-two, so the
-        // quad's UVs are scaled into that padded square.
-        const float uScale = q.uScale;
-        const float vScale = q.vScale;
         if (!tex && g_gpuWhiteValid) tex = &g_gpuWhite;
         if (!tex) continue;
-        // GPU_SCISSOR_DISABLE is 0 and the AND test mode is 1; naming them through the enum
-        // keeps this compiling across citro3d versions whose enumerator names differ.  Off by
-        // default: an unexpected value here silently discards every quad.
         if (g_gpuScissor) {
             C3D_SetScissor(static_cast<GPU_SCISSORMODE>(1), static_cast<uint32_t>(std::max(0, q.clip[0])),
                            static_cast<uint32_t>(std::max(0, q.clip[1])),
@@ -3717,19 +3759,9 @@ static void Gpu2dRender() {
                            static_cast<uint32_t>(std::min(kScreenH, q.clip[3])));
         }
         if (!q.blend) C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
-        // Wrap is part of the texture's param word, which citro3d reads when the draw is
-        // emitted, so set it right before binding (one texture can be drawn both ways).
         if (tex != &g_gpuWhite) C3D_TexSetWrap(tex, q.wrapS, q.wrapT);
         C3D_TexBind(0, tex);
-        C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
-        for (int i = 0; i < 4; ++i) {
-            float cx = 0.0f, cy = 0.0f;
-            TransformToClip(g_gpuProj, q.v[i].x, q.v[i].y, &cx, &cy);
-            C3D_ImmSendAttrib(cx, cy, 0.0f, 1.0f);
-            C3D_ImmSendAttrib(q.v[i].u * uScale, q.v[i].v * vScale, 0.0f, 0.0f);
-            C3D_ImmSendAttrib(q.v[i].r, q.v[i].g, q.v[i].b, q.v[i].a);
-        }
-        C3D_ImmDrawEnd();
+        C3D_DrawArrays(GPU_TRIANGLES, static_cast<u32>(qi * 6), 6);
         if (!q.blend) {
             C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
                            GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
