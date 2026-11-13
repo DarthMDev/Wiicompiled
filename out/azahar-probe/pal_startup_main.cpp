@@ -318,16 +318,25 @@ static bool prepare_memory()
     guestRam = ram;
 
 #ifdef __3DS__
-    // The guest only touches ~8 MiB of MEM2 on the menu/race paths, so allocating the full
-    // 32 MiB leaves the app heap at 0 - every later host allocation (texture cache, NAND)
-    // then fails. Start lower so there is headroom for the host-side caches.
-    for (size_t trySize : {20u * 1024 * 1024, 18u * 1024 * 1024, 16u * 1024 * 1024, 14u * 1024 * 1024}) {
+    // The title/single/multi UI path needs ~35 MiB of MEM2: Title.szs expands to 10.29 MiB and
+    // the compressed copy (1.7 MiB) lives in the same UI-archive heap, which the game sizes
+    // from the free space left in MEM2.  Try the largest arena that still leaves the app heap
+    // room for the host-side caches (texture cache, NAND, framebuffers).
+    size_t wantMem2 = 36u * 1024 * 1024;
+    if (const char* mb = std::getenv("MKW_MEM2_MB")) {
+        const long v = std::strtol(mb, nullptr, 10);
+        if (v >= 16 && v <= 64) wantMem2 = static_cast<size_t>(v) * 1024 * 1024;
+    }
+    for (size_t trySize : {wantMem2, 32u * 1024 * 1024, 28u * 1024 * 1024,
+                           24u * 1024 * 1024, 20u * 1024 * 1024}) {
+        if (trySize > wantMem2) continue;
         mem2Ram = static_cast<uint8_t*>(std::calloc(1, trySize));
         if (mem2Ram) {
             mem2Size = trySize;
             break;
         }
     }
+    AppLog("[Mem] guest MEM2 arena = %zu MiB\n", mem2Size / 1024 / 1024);
 #else
     if (const char* mb = std::getenv("MKW_MEM2_MB")) {
         const long v = std::strtol(mb, nullptr, 10);
@@ -3640,6 +3649,42 @@ extern "C" void MkwOnDirectCall(uint32_t target) {
     }
 }
 
+// Scripted pad state.
+//
+// Historically the port auto-pulsed GameCube A+START from frame 20 to skip the race intro
+// flyover.  That pulse also runs on the menu/title path, where it makes scripted navigation
+// experiments impossible, so MKW_NO_AUTOPULSE=1 turns it off and MKW_PRESS_A=<frame> /
+// MKW_PRESS_START=<frame> press a single button for a 3-frame window instead.
+// Set by ArgumentParser::parse: true when the race shortcut forces section 0x20.  The menu path
+// (false) lets the real PageManipulatorManager / ControlButtonInfo code run so pages react to
+// the pad; the shortcut keeps the historical HLE stubs that the race boot needed.
+static bool g_raceShortcut = false;
+
+enum class ScriptPadKind { kGcPad, kClassic };
+
+static uint32_t ScriptedPadButtons(ScriptPadKind kind)
+{
+    const uint32_t frame = gx_bridge::g_gxFrame;
+    const bool gc = (kind == ScriptPadKind::kGcPad);
+    const uint32_t kA = gc ? 0x0100u : 0x0010u;
+    const uint32_t kStart = gc ? 0x1000u : 0x0400u;
+
+    if (std::getenv("MKW_NO_AUTOPULSE") == nullptr) {
+        if (frame >= 20 && frame <= 100000 && (frame % 4) < 2) return kA | kStart;
+        return 0;
+    }
+    uint32_t out = 0;
+    if (const char* s = std::getenv("MKW_PRESS_A")) {
+        const long at = std::strtol(s, nullptr, 10);
+        if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + 3) out |= kA;
+    }
+    if (const char* s = std::getenv("MKW_PRESS_START")) {
+        const long at = std::strtol(s, nullptr, 10);
+        if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + 3) out |= kStart;
+    }
+    return out;
+}
+
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
     // Watch the menu globe object's visibility byte (*(0x809C1988)+32). It is 0 for the whole
@@ -4094,7 +4139,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 static std::set<uint64_t> s_seenLife;
                 const uint32_t th = cpu ? cpu->gpr[3] : 0;
                 const uint64_t lk = (static_cast<uint64_t>(target) << 32) | th;
-                if (s_seenLife.size() < 48 && s_seenLife.insert(lk).second) {
+                if (s_seenLife.size() < 400 && s_seenLife.insert(lk).second) {
                     AppLog("[Lifecycle] tgt=%08X this=%08X r4=%08X r5=%08X p152=%08X lr=%08X frame=%u\n",
                         target, th, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0,
                         (th && Memory::Contains(th + 152, 4)) ? Memory::Read32(th + 152) : 0,
@@ -4162,6 +4207,38 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 AppLog("[AnimGrp] g=%08X tbl=%08X cnt=%u idx=%u tr=%08X lr=%08X frame=%u\n",
                     g, tbl, cnt, idx, tr, cpu->lr, gx_bridge::g_gxFrame);
             }
+        }
+    }
+    if (target == 0x80622D08u || target == 0x80622DA0u || target == 0x80623228u ||
+        target == 0x80623288u || target == 0x80623390u) {
+        static std::set<uint64_t> s_seenSecPage;
+        const uint32_t key = (static_cast<uint64_t>(target) << 32) ^
+            (static_cast<uint64_t>(cpu ? cpu->gpr[3] : 0) << 8) ^ (cpu ? cpu->gpr[4] : 0);
+        if (s_seenSecPage.size() < 40 && s_seenSecPage.insert(key).second) {
+            AppLog("[SecPage] tgt=%08X this=%08X r4=%08X r5=%08X lr=%08X frame=%u\n",
+                target, cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0,
+                cpu ? cpu->lr : 0, gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x8085151Cu || target == 0x808515A0u || target == 0x808516ACu ||
+        target == 0x805EFE40u || target == 0x805EEF20u || target == 0x805EEC58u ||
+        target == 0x8062B240u || target == 0x80626078u || target == 0x806261E8u) {
+        static std::set<uint32_t> s_seenAction;
+        if (s_seenAction.size() < 24 && s_seenAction.insert(target).second) {
+            AppLog("[MenuAction] target=%08X this=%08X r4=%08X r5=%08X lr=%08X frame=%u\n",
+                target, cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0,
+                cpu ? cpu->lr : 0, gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x80623390u || target == 0x80601A60u) { // Section::CreatePageById / Page::Init
+        static std::set<uint64_t> s_seenPage;
+        const uint32_t key = (static_cast<uint64_t>(target) << 32) |
+            (target == 0x80623390u ? (cpu ? cpu->gpr[3] : 0) : (cpu ? cpu->gpr[3] : 0));
+        if (s_seenPage.size() < 60 && s_seenPage.insert(key).second) {
+            AppLog("[PageFlow] %s id=%u this=%08X lr=%08X frame=%u\n",
+                target == 0x80623390u ? "CreatePageById" : "Page::Init",
+                target == 0x80623390u ? (cpu ? cpu->gpr[3] : 0) : (cpu ? cpu->gpr[4] : 0),
+                cpu ? cpu->gpr[3] : 0, cpu ? cpu->lr : 0, gx_bridge::g_gxFrame);
         }
     }
     if (target == 0x80198CA8u || target == 0x80198D88u) {
@@ -4469,12 +4546,8 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 gx_bridge::WriteGuestFloat(statusPtr + 0x3C, lx);
                 gx_bridge::WriteGuestFloat(statusPtr + 0x40, ly);
 #endif
-                if (gx_bridge::g_gxFrame >= 20 && gx_bridge::g_gxFrame <= 100000) {
-                    if ((gx_bridge::g_gxFrame % 4) < 2) {
-                        hold |= 0x0010; // Auto-pulse Classic A to skip intro
-                    }
-                    Memory::Write32(statusPtr + 0x30, hold);
-                }
+                hold |= ScriptedPadButtons(ScriptPadKind::kClassic);
+                Memory::Write32(statusPtr + 0x30, hold);
             }
         }
         cpu->gpr[3] = 1;
@@ -4533,12 +4606,8 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             }
 #endif
 
-            // Auto-pulse A + START between frame 20 and 900 to guarantee skipping intro flyover
-            if (gx_bridge::g_gxFrame >= 20 && gx_bridge::g_gxFrame <= 100000) {
-                if ((gx_bridge::g_gxFrame % 4) < 2) {
-                    buttons |= 0x1100; // PAD_BUTTON_A (0x0100) | PAD_BUTTON_START (0x1000)
-                }
-            }
+            // Auto-pulse A + START (race intro skip) or the scripted button window.
+            buttons |= static_cast<uint16_t>(ScriptedPadButtons(ScriptPadKind::kGcPad));
 
             // Write Port 0 PADStatus (12 bytes)
             Memory::Write16(statusPtr + 0, buttons);
@@ -4684,6 +4753,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return false; // let the real Page::Init run
     }
     case 0x805EF688u: { // PageManipulatorManager::OnReset
+        if (!g_raceShortcut) return false; // menu path: run the real manipulator code
         if (cpu && cpu->gpr[3]) {
             const uint32_t manipMgr = cpu->gpr[3];
             if (Memory::Contains(manipMgr, 64)) {
@@ -4692,7 +4762,8 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
         return true;
     }
-    case 0x805EF5A8u: { // PageManipulatorManager::CheckActions
+    case 0x805EF5A8u: { // PageManipulatorManager::Activate
+        if (!g_raceShortcut) return false; // menu path: run the real manipulator code
         if (cpu && cpu->gpr[3]) {
             const uint32_t manipMgr = cpu->gpr[3];
             if (Memory::Contains(manipMgr, 64)) {
@@ -4704,6 +4775,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return true;
     }
     case 0x805EF768u: { // PageManipulatorManager::SetGlobalHandler
+        if (!g_raceShortcut) return false; // menu path: run the real manipulator code
         if (cpu && cpu->gpr[3]) {
             const uint32_t manipMgr = cpu->gpr[3];
             const uint32_t r4 = cpu->gpr[4];
@@ -4716,8 +4788,10 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
         return true;
     }
-    case 0x805EF888u:
-    case 0x805EF898u: { // ControlButtonInfo::Reset
+    case 0x805EF888u: // ControlButtonInfo::Reset
+    case 0x805EF898u: // ControlButtonInfo::Update
+    {
+        if (!g_raceShortcut) return false; // menu path: run the real manipulator code
         return true;
     }
     case 0x8061C86Cu: {
@@ -6948,6 +7022,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         constexpr bool kForceRaceSection = false;
         bool forceRace = kForceRaceSection;
         if (const char* e = std::getenv("MKW_FORCE_RACE")) forceRace = (e[0] == '1');
+        g_raceShortcut = forceRace;
 
         const uint32_t sectionMgr = Memory::Read32(0x809C1E38u);
         AppLog("[BootPath] ArgumentParser::parse frame=%u sm=%08X curSec=%d lr=%08X forceRace=%d\n",
