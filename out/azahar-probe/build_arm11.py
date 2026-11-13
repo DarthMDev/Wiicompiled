@@ -37,28 +37,9 @@ def compile_src(src, obj):
         return False, src.name, dt, res.stderr
     return True, src.name, dt, ''
 
-def build_gpu2d_shader():
-    """Compile the pass-through 2D vertex shader with picasso into a header."""
-    src = work_dir / 'gpu2d.v.pica'
-    hdr = work_dir / 'gpu2d_shader.hpp'
-    if not src.exists():
-        return
-    picasso = Path('/opt/devkitpro/tools/bin/picasso')
-    shbin = work_dir / 'gpu2d.shbin'
-    res = subprocess.run([str(picasso), '-o', str(shbin), str(src)], capture_output=True, text=True)
-    if res.returncode != 0:
-        print(f"picasso failed:\n{res.stderr}", file=sys.stderr)
-        sys.exit(1)
-    data = shbin.read_bytes()
-    hdr.write_text('#pragma once\n#include <cstdint>\n'
-                   'alignas(4) static const uint8_t gpu2d_shader[]={'
-                   + ','.join(map(str, data)) + '};\n')
-
-
 def main():
     print(f"Using devkitARM at {sdk}")
     t_start = time.time()
-    build_gpu2d_shader()
 
     # Base sources
     tasks = [
