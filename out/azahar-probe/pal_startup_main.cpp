@@ -4158,6 +4158,15 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     auto nandLoad = [](const std::string& path) -> bool {
         if (s_nandLoaded[path]) return s_nandStore.find(path) != s_nandStore.end();
         s_nandLoaded[path] = true;
+        // The Mario Kart Channel reads the Wii system state file
+        // (/title/00000001/00000002/data/state.dat) to decide whether to return to the Wii
+        // Menu. With it missing, the channel takes the "return to Wii Menu" path and never
+        // draws. Serve a zeroed file so it treats this as a plain boot and stays in-game.
+        if (path.find("state.dat") != std::string::npos) {
+            std::vector<uint8_t>& data = s_nandStore[path];
+            data.assign(8, 0);
+            return true;
+        }
         if (path.find("rksys.dat") == std::string::npos) return false;
         const char* candidates[] = {
             "sdmc:/mkwii/rksys.dat",
