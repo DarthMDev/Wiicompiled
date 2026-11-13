@@ -1555,7 +1555,7 @@ static void EvaluateTevPixel(const float ras[4], const float texColor[4], const 
                              float out[4]) {
     float prevColor[4] = {ras[0], ras[1], ras[2], ras[3]};
     float prevAlpha = ras[3];
-    const uint32_t stages = std::max(1u, std::min<uint32_t>(g_gx.tevNumStages, 16u));
+    const uint32_t stages = std::max<uint32_t>(1u, std::min<uint32_t>(g_gx.tevNumStages, 16u));
     for (uint32_t s = 0; s < stages; ++s) {
         float a[4], b[4], c[4], d[4];
         TevColorArg(g_gx.tevColorIn[s][0], prevColor, prevAlpha, texColor, ras, kColor, a);
@@ -5759,7 +5759,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x80171BA0u: // GX::SetTevIndWarp
         return true;
     case 0x801722A8u: { // GX::SetNumTevStages(n)
-        gx_bridge::g_gx.tevNumStages = std::max(1u, std::min<uint32_t>(cpu->gpr[3], 16u));
+        gx_bridge::g_gx.tevNumStages = std::max<uint32_t>(1u, std::min<uint32_t>(cpu->gpr[3], 16u));
         return true;
     }
     case 0x80171C4Cu: { // GX::SetTevOp(stage, mode) - expand into explicit color/alpha in/op
