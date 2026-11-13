@@ -106,7 +106,33 @@ static size_t HostHeapFreeKb() {
 static size_t HostHeapFreeKb() { return 0; }
 #endif
 
+#ifdef __3DS__
+// Logging on hardware used to do two fflush()es per line (one per stream), i.e. two SD-card round
+// trips per line at ~13 lines per frame.  That alone cost hundreds of milliseconds per frame.
+// Buffer in RAM and push to the log file when the buffer fills or once a second.
+static char g_appLogBuf[48 * 1024];
+static size_t g_appLogLen = 0;
+static void AppLogFlush() {
+    if (g_appLogLen == 0) return;
+    std::fwrite(g_appLogBuf, 1, g_appLogLen, stderr);
+    std::fflush(stderr);
+    g_appLogLen = 0;
+}
+#endif
+
 static void AppLog(const char* fmt, ...) {
+#ifdef __3DS__
+    va_list args;
+    va_start(args, fmt);
+    const size_t space = sizeof(g_appLogBuf) - g_appLogLen;
+    const int n = std::vsnprintf(g_appLogBuf + g_appLogLen, space, fmt, args);
+    va_end(args);
+    if (n > 0) {
+        const size_t wrote = static_cast<size_t>(n) < space ? static_cast<size_t>(n) : space - 1;
+        g_appLogLen += wrote;
+        if (g_appLogLen > sizeof(g_appLogBuf) - 512) AppLogFlush();
+    }
+#else
     va_list args;
     va_start(args, fmt);
     std::vprintf(fmt, args);
@@ -117,6 +143,7 @@ static void AppLog(const char* fmt, ...) {
     std::vfprintf(stderr, fmt, args);
     std::fflush(stderr);
     va_end(args);
+#endif
 }
 
 static uint8_t* resolve_region(uint8_t* ram, uint32_t base, size_t size,
@@ -7777,6 +7804,9 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 gx_bridge::g_texCache.size(), baseBytes / 1024, mipBytes / 1024,
                 gx_bridge::g_texCacheBytes / 1024, gx_bridge::kMaxTexCacheBytes / 1024);
         }
+#ifdef __3DS__
+        if (s_frameCount % 30 == 0) AppLogFlush();
+#endif
         if (s_frameCount % 20 == 0) {
 #ifdef __3DS__
             static u64 s_lastTick = 0;
