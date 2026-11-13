@@ -3705,7 +3705,8 @@ static void Gpu2dRender() {
     // Submit layout geometry from one explicit linear-memory vertex buffer.  Immediate mode
     // works for the diagnostic pattern, but the menu path needs a persistent vertex stream with
     // per-draw offsets so each texture/state change is represented by a normal PICA draw call.
-    const size_t vertexCount = g_gpuQuads.size() * 6;
+    const size_t layoutVertexCount = g_gpuQuads.size() * 6;
+    const size_t vertexCount = std::max(layoutVertexCount, g_gpuTestMode == 3 ? size_t{6} : size_t{0});
     if (vertexCount > g_gpuDrawVertexCapacity) {
         size_t newCapacity = 256;
         while (newCapacity < vertexCount) newCapacity *= 2;
@@ -3739,6 +3740,24 @@ static void Gpu2dRender() {
             dst.color[3] = src.a;
         }
     }
+    if (g_gpuTestMode == 3) {
+        const float xs[6] = {0.0f, 400.0f, 400.0f, 0.0f, 400.0f, 0.0f};
+        const float ys[6] = {0.0f, 0.0f, 240.0f, 0.0f, 240.0f, 240.0f};
+        for (int i = 0; i < 6; ++i) {
+            GpuDrawVertex& dst = g_gpuDrawVertices[i];
+            TransformToClip(g_gpuProj, xs[i], ys[i], &dst.position[0], &dst.position[1]);
+            dst.position[2] = 0.0f;
+            dst.position[3] = 1.0f;
+            dst.texcoord[0] = dst.texcoord[1] = 0.5f;
+            dst.texcoord[2] = dst.texcoord[3] = 0.0f;
+            dst.color[0] = 0.0f;
+            dst.color[1] = 0.45f;
+            dst.color[2] = 0.9f;
+            dst.color[3] = 1.0f;
+        }
+        AppLog("[Gpu2d] drawing VBO reference pattern vertices=%zu stride=%zu\n",
+               vertexCount, sizeof(GpuDrawVertex));
+    }
     if (vertexCount != 0) {
         const u32 vertexBytes = static_cast<u32>(vertexCount * sizeof(GpuDrawVertex));
         GSPGPU_FlushDataCache(g_gpuDrawVertices, vertexBytes);
@@ -3747,6 +3766,14 @@ static void Gpu2dRender() {
         BufInfo_Add(buf, g_gpuDrawVertices, sizeof(GpuDrawVertex), 3, 0x210);
     }
     g_gpuQuadsDrawn = 0;
+    if (g_gpuTestMode == 3) {
+        C3D_TexBind(0, g_gpuWhiteValid ? &g_gpuWhite : nullptr);
+        C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+        ++g_gpuQuadsDrawn;
+        C3D_FrameEnd(0);
+        g_gpuQuads.clear();
+        return;
+    }
     for (size_t qi = 0; qi < g_gpuQuads.size(); ++qi) {
         const GpuQuad& q = g_gpuQuads[qi];
         C3D_Tex* tex = q.tex;
