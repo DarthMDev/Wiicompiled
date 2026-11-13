@@ -127,6 +127,29 @@ static uint8_t* resolve_region(uint8_t* ram, uint32_t base, size_t size,
     return ram + (address - base);
 }
 
+// Lazily back the race SZS staging buffer: only the force-race shortcut touches this 6 MiB region,
+// so the menu path never pays for it.
+static bool ensure_race_szs_ram()
+{
+    if (g_raceSzsRam) return true;
+    g_raceSzsRam = static_cast<uint8_t*>(std::calloc(1, kRaceSzsSize));
+    if (!g_raceSzsRam) {
+        AppLog("[Mem] race SZS buffer (%u MiB) allocation failed, host heap free %zuKB\n",
+            (unsigned)(kRaceSzsSize / (1024 * 1024)), HostHeapFreeKb());
+        return false;
+    }
+    const uintptr_t raceBias = reinterpret_cast<uintptr_t>(g_raceSzsRam) - kRaceSzsBase + 1;
+    for (size_t offset = 0; offset < kRaceSzsSize; offset += MemoryInline::kPageSize) {
+        const auto page = (kRaceSzsBase + offset) >> MemoryInline::kPageShift;
+        MemoryInline::g_fullPageBias[page] = raceBias;
+        MemoryInline::g_fullReadablePageBias[page] = raceBias;
+        MemoryInline::g_fullWritablePageBias[page] = raceBias;
+    }
+    AppLog("[Mem] race SZS buffer committed on first use (%u MiB, host heap free %zuM)\n",
+        (unsigned)(kRaceSzsSize / (1024 * 1024)), HostHeapFreeKb() / 1024);
+    return true;
+}
+
 static uint8_t* resolve_guest(uint32_t address, size_t length)
 {
     // Physical MEM1 (0x00000000 - 0x01800000)
@@ -155,11 +178,18 @@ static uint8_t* resolve_guest(uint32_t address, size_t length)
     if (address >= kLockedCacheBase && address < kLockedCacheBase + sizeof(g_lockedCache))
         return resolve_region(g_lockedCache, kLockedCacheBase, sizeof(g_lockedCache), address, length);
 
-    // Race SZS buffer (0x95000000 - 0x95600000) and physical alias (0x15000000 - 0x15600000)
-    if (address >= kRaceSzsBase && address < kRaceSzsBase + kRaceSzsSize)
+    // Race SZS buffer (0x95000000 - 0x95600000) and physical alias (0x15000000 - 0x15600000).
+    // The 6 MiB backing store is only needed by the force-race shortcut; the menu path never touches
+    // it, so it is allocated on first access instead of at boot (an Old 3DS has no host heap to
+    // spare once MEM1 + MEM2 are mapped).
+    if (address >= kRaceSzsBase && address < kRaceSzsBase + kRaceSzsSize) {
+        if (!ensure_race_szs_ram()) return nullptr;
         return resolve_region(g_raceSzsRam, kRaceSzsBase, kRaceSzsSize, address, length);
-    if (address >= 0x15000000u && address < 0x15000000u + kRaceSzsSize)
+    }
+    if (address >= 0x15000000u && address < 0x15000000u + kRaceSzsSize) {
+        if (!ensure_race_szs_ram()) return nullptr;
         return resolve_region(g_raceSzsRam, 0x15000000u, kRaceSzsSize, address, length);
+    }
 
     return nullptr;
 }
@@ -281,6 +311,43 @@ void Write64Slow(uint32_t address, uint64_t value) {
 #include <csignal>
 #include <unistd.h>
 
+#ifndef __3DS__
+#include <execinfo.h>
+#endif
+static uint32_t g_hleRing[8] = {};
+static unsigned g_hleRingPos = 0;
+
+#ifndef __3DS__
+static void fault_handler(int sig, siginfo_t* info, void* /*ctx*/) {
+    char buf[512];
+    const unsigned long addr = info ? reinterpret_cast<unsigned long>(info->si_addr) : 0;
+    const CpuContext* cpu = g_currentCpuContext;
+    int n = std::snprintf(buf, sizeof(buf),
+        "\n[HOST FAULT] sig=%d addr=%08lX guestPC=%08lX guestLR=%08lX r3=%08lX r4=%08lX\n",
+        sig, addr, cpu ? static_cast<unsigned long>(cpu->pc) : 0,
+        cpu ? static_cast<unsigned long>(cpu->lr) : 0,
+        cpu ? static_cast<unsigned long>(cpu->gpr[3]) : 0,
+        cpu ? static_cast<unsigned long>(cpu->gpr[4]) : 0);
+    if (n > 0) { ssize_t ignored = write(2, buf, static_cast<size_t>(n)); (void)ignored; }
+    {
+        char rbuf[256];
+        int m = std::snprintf(rbuf, sizeof(rbuf), "[HOST FAULT] last HLE targets:");
+        for (int i = 0; i < 8; ++i) {
+            const uint32_t t = g_hleRing[(g_hleRingPos + i) % 8];
+            if (t) m += std::snprintf(rbuf + m, sizeof(rbuf) - static_cast<size_t>(m), " %08X", t);
+        }
+        m += std::snprintf(rbuf + m, sizeof(rbuf) - static_cast<size_t>(m), "\n");
+        ssize_t ignored = write(2, rbuf, static_cast<size_t>(m)); (void)ignored;
+    }
+#ifndef __3DS__
+    void* frames[24];
+    const int count = backtrace(frames, 24);
+    backtrace_symbols_fd(frames, count, 2);
+#endif
+    std::_Exit(3);
+}
+#endif
+
 static void alarm_handler(int) {
     if (g_currentCpuContext) {
         std::fprintf(stderr, "\n[HANG TRACE] pc=%08lX lr=%08lX r3=%08lX r4=%08lX r31=%08lX\n",
@@ -295,6 +362,11 @@ static void alarm_handler(int) {
 
 static bool prepare_memory()
 {
+    // MEM1 and MEM2 stay single contiguous arenas: guest heap code passes whole sections to
+    // memcpy-style accessors (Memory::GetPointer over multi-megabyte ranges), so the backing store
+    // cannot be split into separately allocated pages.  What the menu path saves instead is the
+    // 6 MiB race staging buffer (force-race shortcut only), the eager NAND save copy, and half of
+    // the texture-cache budget.
     constexpr uint32_t base = 0x80000000u;
     const size_t size = guestSize;
     auto* ram = static_cast<uint8_t*>(std::calloc(1, size));
@@ -333,10 +405,6 @@ static bool prepare_memory()
     guestRam = ram;
 
 #ifdef __3DS__
-    // The title/single/multi UI path needs ~35 MiB of MEM2: Title.szs expands to 10.29 MiB and
-    // the compressed copy (1.7 MiB) lives in the same UI-archive heap, which the game sizes
-    // from the free space left in MEM2.  Try the largest arena that still leaves the app heap
-    // room for the host-side caches (texture cache, NAND, framebuffers).
     size_t wantMem2 = 36u * 1024 * 1024;
     if (const char* mb = std::getenv("MKW_MEM2_MB")) {
         const long v = std::strtol(mb, nullptr, 10);
@@ -351,7 +419,8 @@ static bool prepare_memory()
             break;
         }
     }
-    AppLog("[Mem] guest MEM2 arena = %zu MiB\n", mem2Size / 1024 / 1024);
+    AppLog("[Mem] guest MEM2 arena = %zu MiB (host heap free %zuM after guest RAM)\n",
+        mem2Size / 1024 / 1024, HostHeapFreeKb() / 1024);
 #else
     if (const char* mb = std::getenv("MKW_MEM2_MB")) {
         const long v = std::strtol(mb, nullptr, 10);
@@ -367,24 +436,13 @@ static bool prepare_memory()
         return false;
     }
 
-    for (uint32_t base : {0x90000000u, 0xD0000000u, 0x10000000u, 0xA0000000u}) {
-        const uintptr_t mem2Bias = reinterpret_cast<uintptr_t>(mem2Ram) - base + 1;
+    for (uint32_t alias : {0x90000000u, 0xD0000000u, 0x10000000u, 0xA0000000u}) {
+        const uintptr_t mem2Bias = reinterpret_cast<uintptr_t>(mem2Ram) - alias + 1;
         for (size_t offset = 0; offset < mem2Size; offset += MemoryInline::kPageSize) {
-            const auto page = (base + offset) >> MemoryInline::kPageShift;
+            const auto page = (alias + offset) >> MemoryInline::kPageShift;
             MemoryInline::g_fullPageBias[page] = mem2Bias;
             MemoryInline::g_fullReadablePageBias[page] = mem2Bias;
             MemoryInline::g_fullWritablePageBias[page] = mem2Bias;
-        }
-    }
-
-    g_raceSzsRam = static_cast<uint8_t*>(std::calloc(1, kRaceSzsSize));
-    if (g_raceSzsRam) {
-        const uintptr_t raceBias = reinterpret_cast<uintptr_t>(g_raceSzsRam) - kRaceSzsBase + 1;
-        for (size_t offset = 0; offset < kRaceSzsSize; offset += MemoryInline::kPageSize) {
-            const auto page = (kRaceSzsBase + offset) >> MemoryInline::kPageShift;
-            MemoryInline::g_fullPageBias[page] = raceBias;
-            MemoryInline::g_fullReadablePageBias[page] = raceBias;
-            MemoryInline::g_fullWritablePageBias[page] = raceBias;
         }
     }
     return true;
@@ -393,7 +451,7 @@ static bool prepare_memory()
 static void ReportWorkingSet(const char* checkpoint) {
     size_t mem1ActivePages = 0;
     const size_t mem1TotalPages = guestSize / 4096;
-    for (size_t p = 0; p < mem1TotalPages; ++p) {
+    for (size_t p = 0; p < mem1TotalPages && guestRam; ++p) {
         const uint64_t* words = reinterpret_cast<const uint64_t*>(guestRam + p * 4096);
         bool active = false;
         for (size_t w = 0; w < 4096 / sizeof(uint64_t); ++w) {
@@ -404,7 +462,7 @@ static void ReportWorkingSet(const char* checkpoint) {
 
     size_t mem2ActivePages = 0;
     const size_t mem2TotalPages = mem2Size / 4096;
-    for (size_t p = 0; p < mem2TotalPages; ++p) {
+    for (size_t p = 0; p < mem2TotalPages && mem2Ram; ++p) {
         const uint64_t* words = reinterpret_cast<const uint64_t*>(mem2Ram + p * 4096);
         bool active = false;
         for (size_t w = 0; w < 4096 / sizeof(uint64_t); ++w) {
@@ -418,13 +476,25 @@ static void ReportWorkingSet(const char* checkpoint) {
     AppLog("[WorkingSet Profile @ %s]\n", checkpoint);
     AppLog("  MEM1: %.2f / %.2f MiB active (%zu / %zu pages)\n", mem1Mb, guestSize / (1024.0 * 1024.0), mem1ActivePages, mem1TotalPages);
     AppLog("  MEM2: %.2f / %.2f MiB active (%zu / %zu pages)\n", mem2Mb, mem2Size / (1024.0 * 1024.0), mem2ActivePages, mem2TotalPages);
-    AppLog("  Combined Guest Active RAM: %.2f MiB\n", mem1Mb + mem2Mb);
+    AppLog("  Combined Guest Active RAM: %.2f MiB (host heap free %zuM)\n", mem1Mb + mem2Mb,
+        HostHeapFreeKb() / 1024);
 }
 
 int main()
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
+#ifndef __3DS__
+    // Crash diagnostics for the headless harness: report the guest PC/LR and the faulting host
+    // address instead of dying silently (the 3DS keeps libctru's own handler).
+    {
+        struct sigaction sa {};
+        sa.sa_sigaction = fault_handler;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGBUS, &sa, nullptr);
+        sigaction(SIGSEGV, &sa, nullptr);
+    }
+#endif
 #ifdef __3DS__
     osSetSpeedupEnable(true);
     gfxInitDefault();
@@ -3719,6 +3789,8 @@ static uint32_t ScriptedPadButtons(ScriptPadKind kind)
 
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
+    g_hleRing[g_hleRingPos] = target;
+    g_hleRingPos = (g_hleRingPos + 1) % 8;
     // Watch the menu globe object's visibility byte (*(0x809C1988)+32). It is 0 for the whole
     // natural boot, so the globe draw is skipped. Log the first transition and the call that
     // caused it, to find the state-machine edge that should show the globe.
