@@ -1,7 +1,11 @@
 #ifdef __3DS__
 #include <3ds.h>
+#include <citro3d.h>
 extern "C" {
-    u32 __ctru_linear_heap_size = 2 * 1024 * 1024;
+    // The PICA200 backend keeps the decoded UI textures in VRAM (the linear heap).  The menu set
+    // is ~1.8 MiB once packed as RGB565/RGBA4 with power-of-two padding, so give it headroom over
+    // the old 2 MiB; the framebuffers and the command buffer come out of the same heap.
+    u32 __ctru_linear_heap_size = 4 * 1024 * 1024;
 }
 #endif
 #include <cstdio>
@@ -1213,9 +1217,33 @@ static void UpdateScissorScreenRect() {
     g_gx.clipY1 = scaleClamp(g_gx.scissorY + g_gx.scissorH, efbH, kScreenH);
 }
 
+// PICA200 2D backend.  Implemented further down for the 3DS build only; the host harness keeps
+// the software rasteriser so frames can still be dumped to PPM.
+static bool g_gpu2d = false;
+static uint32_t g_gpuQuadsRecorded = 0;
+static uint32_t g_gpuQuadsDrawn = 0;
+static size_t   g_gpuTexBytes = 0;
+static uint32_t g_gpuTexUploads = 0;
+static uint32_t g_gpuTexEvictions = 0;
+static inline bool Gpu2dActive() { return g_gpu2d; }
+#ifdef __3DS__
+static void Gpu2dConfigure();
+static bool Gpu2dInit();
+static void Gpu2dRecordQuad(const GxVertex v[4]);
+static void Gpu2dRender();
+#else
+static void Gpu2dConfigure() {}
+static bool Gpu2dInit() { return false; }
+static void Gpu2dRecordQuad(const GxVertex[4]) {}
+static void Gpu2dRender() {}
+#endif
+
 static void EnsureInitialized() {
     if (g_gxInitialized) return;
     g_gxInitialized = true;
+#ifdef __3DS__
+    Gpu2dConfigure();
+#endif
     for (int m = 0; m < 10; ++m) {
         std::memset(g_gx.pnMtx[m], 0, sizeof(g_gx.pnMtx[m]));
         g_gx.pnMtx[m][0] = 1.0f;
@@ -2855,6 +2883,382 @@ static void AppendFifoBytes(const uint8_t* data, size_t len) {
     }
 }
 
+#ifdef __3DS__
+// ===========================================================================
+// PICA200 (citro3d) 2D path
+// ===========================================================================
+// The software rasteriser samples every pixel of every layout quad in C++.  The menu issues ~24
+// quads covering ~215k pixels per frame, which on a 268 MHz ARM11 costs ~2.3 s per frame, while the
+// guest CPU itself only needs ~35 ms.  The 2D layout pass is exactly what the PICA200 is for, so
+// these quads are handed to citro3d instead: the guest still produces the same draw calls and the
+// same geometry, we just stop touching pixels.  The 3D pass stays on the software rasteriser for
+// now (the menus never draw 3D; the title's kart models are a later step).
+//
+// MKW_NO_GPU2D=1 keeps the old software path; MKW_GPU_YSIGN / MKW_GPU_VFLIP let the 2D orientation
+// be A/B tested on hardware without a rebuild (see the mirrored-layout note on Project2DPoint).
+static bool  g_gpuReady = false;
+static bool  g_gpuTried = false;
+static C3D_RenderTarget* g_gpuTop = nullptr;
+static C3D_Mtx g_gpuProj;
+static float g_gpuYSpace = -1.0f;   // canvas y -> screen y sign (the software path uses -1)
+static bool  g_gpuVFlip = false;    // flip V on textured quads (A/B for the layout mirror)
+static bool  g_gpuScissor = false;  // per-quad scissor (MKW_GPU_SCISSOR=1)
+
+struct GpuQuadVtx { float x, y, u, v, r, g, b, a; };
+struct GpuQuad {
+    GpuQuadVtx v[4] = {};
+    C3D_Tex* tex = nullptr;
+    float uScale = 1.0f;
+    float vScale = 1.0f;
+    bool blend = true;
+    int clip[4] = {0, 0, kScreenW, kScreenH};
+};
+struct GpuTexEntry {
+    C3D_Tex tex{};
+    bool valid = false;
+    size_t bytes = 0;
+    uint64_t lastUse = 0;
+    float uScale = 1.0f;  // logical width  / padded width
+    float vScale = 1.0f;
+};
+
+static std::vector<GpuQuad> g_gpuQuads;
+static std::map<uint64_t, GpuTexEntry> g_gpuTextures;
+static size_t   g_gpuTexCap = 3ull * 1024 * 1024;
+static uint64_t g_gpuTexTick = 0;
+static C3D_Tex   g_gpuWhite{};
+static bool      g_gpuWhiteValid = false;
+static C3D_Tex   g_gpuBase{};
+static bool      g_gpuBaseValid = false;
+
+static void Gpu2dReleaseEntry(std::map<uint64_t, GpuTexEntry>::iterator it) {
+    if (it->second.valid) {
+        C3D_TexDelete(&it->second.tex);
+        it->second.valid = false;
+    }
+    if (g_gpuTexBytes >= it->second.bytes) g_gpuTexBytes -= it->second.bytes;
+    else g_gpuTexBytes = 0;
+    g_gpuTextures.erase(it);
+}
+
+static bool Gpu2dInit() {
+    if (g_gpuReady) return true;
+    if (g_gpuTried) return g_gpuReady;
+    g_gpuTried = true;
+
+    if (!C3D_Init(C3D_DEFAULT_CMDBUF_SIZE)) {
+        AppLog("[Gpu2d] C3D_Init failed\n");
+        return false;
+    }
+    g_gpuTop = C3D_RenderTargetCreate(kScreenW, kScreenH, GPU_RB_RGBA8, -1);
+    if (!g_gpuTop) {
+        AppLog("[Gpu2d] C3D_RenderTargetCreate failed\n");
+        return false;
+    }
+    C3D_RenderTargetSetOutput(g_gpuTop, GFX_TOP, GFX_LEFT,
+        GX_TRANSFER_FLIP_VERT(0) | GX_TRANSFER_OUT_TILED(0) | GX_TRANSFER_RAW_COPY(0) |
+        GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) |
+        GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
+
+    C3D_AttrInfo* ai = C3D_GetAttrInfo();
+    AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 3); // position (pixels)
+    AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 2); // texcoord
+    AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 4); // vertex colour (tint)
+
+    // Layout quads are vertex * texture, straight through the first TEV stage.
+    C3D_TexEnv* env = C3D_GetTexEnv(0);
+    C3D_TexEnvSrc(env, C3D_RGB, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
+    C3D_TexEnvOpRgb(env, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR);
+    C3D_TexEnvFunc(env, C3D_RGB, GPU_MODULATE);
+    C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
+    C3D_TexEnvOpAlpha(env, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA);
+    C3D_TexEnvFunc(env, C3D_Alpha, GPU_MODULATE);
+
+    C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
+                   GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
+                   GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+    C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_ALL);
+    C3D_CullFace(GPU_CULL_NONE);
+
+    // A 1x1 white texel stands in for untextured quads so every draw uses one pipeline.
+    static const uint16_t kWhite = 0xFFFFu;
+    if (C3D_TexInit(&g_gpuWhite, 8, 8, GPU_RGBA5551)) {
+        uint16_t white8x8[64];
+        for (int i = 0; i < 64; ++i) white8x8[i] = kWhite;
+        C3D_TexUpload(&g_gpuWhite, white8x8);
+        C3D_TexSetFilter(&g_gpuWhite, GPU_NEAREST, GPU_NEAREST);
+        C3D_TexSetWrap(&g_gpuWhite, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        g_gpuWhiteValid = true;
+    }
+
+    Mtx_Ortho(&g_gpuProj, 0.0f, static_cast<float>(kScreenW),
+              static_cast<float>(kScreenH), 0.0f, -1.0f, 1.0f, false);
+
+    g_gpuReady = true;
+    AppLog("[Gpu2d] citro3d ready %dx%d texBudget=%zuKB\n",
+        kScreenW, kScreenH, g_gpuTexCap / 1024);
+    return true;
+}
+
+static void Gpu2dConfigure() {
+    g_gpu2d = std::getenv("MKW_NO_GPU2D") == nullptr;
+    if (const char* ys = std::getenv("MKW_GPU_YSIGN")) g_gpuYSpace = std::stof(ys);
+    g_gpuVFlip = std::getenv("MKW_GPU_VFLIP") != nullptr;
+    g_gpuScissor = std::getenv("MKW_GPU_SCISSOR") != nullptr;
+    if (const char* mb = std::getenv("MKW_GPU_TEX_MB")) {
+        const long v = std::atol(mb);
+        if (v > 0) g_gpuTexCap = static_cast<size_t>(v) * 1024ull * 1024ull;
+    }
+}
+
+// Same transform the software rasteriser applies for ortho draws (modelview is forced to identity
+// there), so the GPU layout matches the pixels the software path produced.
+static bool Project2DPoint(const float pos[3], float* outX, float* outY) {
+    const auto& P = g_gx.proj;
+    const float ex = pos[0], ey = pos[1], ez = pos[2];
+    float cx = P[0][0] * ex + P[0][1] * ey + P[0][2] * ez + P[0][3];
+    float cy = P[1][0] * ex + P[1][1] * ey + P[1][2] * ez + P[1][3];
+    float cw = P[3][0] * ex + P[3][1] * ey + P[3][2] * ez + P[3][3];
+    if (!std::isfinite(cx) || !std::isfinite(cy) || !std::isfinite(cw)) return false;
+    if (std::fabs(cw) < 1e-6f) cw = 1.0f;
+    const float invW = 1.0f / cw;
+    const float ndcX = cx * invW;
+    const float ndcY = cy * invW;
+
+    const float efbW = (g_gx.efbWidth > 0) ? static_cast<float>(g_gx.efbWidth) : 608.0f;
+    const float efbH = (g_gx.efbHeight > 0) ? static_cast<float>(g_gx.efbHeight) : 456.0f;
+    const bool fullVp = (g_gx.vpLeft <= 4.0f && g_gx.vpTop <= 4.0f &&
+                         g_gx.vpWidth >= 500.0f && g_gx.vpHeight >= 400.0f);
+    if (fullVp) {
+        *outX = (ndcX * 0.5f + 0.5f) * static_cast<float>(kScreenW);
+        *outY = (0.5f + g_gpuYSpace * ndcY * 0.5f) * static_cast<float>(kScreenH);
+    } else {
+        const float efbX = g_gx.vpLeft + (ndcX * 0.5f + 0.5f) * g_gx.vpWidth;
+        const float efbY = g_gx.vpTop + (0.5f + g_gpuYSpace * ndcY * 0.5f) * g_gx.vpHeight;
+        *outX = efbX * (static_cast<float>(kScreenW) / efbW);
+        *outY = efbY * (static_cast<float>(kScreenH) / efbH);
+    }
+    return true;
+}
+
+static uint64_t TexSlotKey(const TexSlot& slot) {
+    return (static_cast<uint64_t>(slot.dataAddr) << 32) ^
+           (static_cast<uint64_t>(slot.width) << 20) ^
+           (static_cast<uint64_t>(slot.height) << 8) ^
+           static_cast<uint64_t>(slot.format);
+}
+
+// Upload a decoded texture to VRAM, packed to power-of-two size with RGB565 when it is fully opaque
+// and RGBA4 otherwise (half the bytes of RGBA8, which is what lets the whole menu set fit).
+static C3D_Tex* Gpu2dAcquireTexture(uint64_t key, const DecodedTex& dt,
+                                    float* outUScale = nullptr, float* outVScale = nullptr) {
+    auto it = g_gpuTextures.find(key);
+    if (it != g_gpuTextures.end() && it->second.valid) {
+        it->second.lastUse = ++g_gpuTexTick;
+        if (outUScale) *outUScale = it->second.uScale;
+        if (outVScale) *outVScale = it->second.vScale;
+        return &it->second.tex;
+    }
+    if (dt.width == 0 || dt.height == 0) return nullptr;
+
+    int potW = 8, potH = 8;
+    while (potW < dt.width) potW <<= 1;
+    while (potH < dt.height) potH <<= 1;
+    if (potW > 1024 || potH > 1024) return nullptr;
+
+    bool opaque = true;
+    for (size_t i = 0; i < dt.rgba.size(); ++i) {
+        if ((dt.rgba[i] & 0xFFu) != 0xFFu) { opaque = false; break; }
+    }
+    const size_t bytes = static_cast<size_t>(potW) * potH * 2u; // RGB565 / RGBA4 are both 16bpp
+    while (g_gpuTexBytes + bytes > g_gpuTexCap && !g_gpuTextures.empty()) {
+        auto victim = g_gpuTextures.end();
+        for (auto scan = g_gpuTextures.begin(); scan != g_gpuTextures.end(); ++scan) {
+            if (victim == g_gpuTextures.end() || scan->second.lastUse < victim->second.lastUse)
+                victim = scan;
+        }
+        if (victim == g_gpuTextures.end()) break;
+        ++g_gpuTexEvictions;
+        Gpu2dReleaseEntry(victim);
+    }
+
+    std::vector<uint16_t> packed(static_cast<size_t>(potW) * potH, 0u);
+    for (int y = 0; y < dt.height; ++y) {
+        for (int x = 0; x < dt.width; ++x) {
+            const uint32_t c = dt.rgba[static_cast<size_t>(y) * dt.width + x];
+            const uint32_t r = (c >> 24) & 0xFFu;
+            const uint32_t g = (c >> 16) & 0xFFu;
+            const uint32_t b = (c >> 8)  & 0xFFu;
+            const uint32_t a = c & 0xFFu;
+            uint16_t v;
+            if (opaque) {
+                v = static_cast<uint16_t>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+            } else {
+                v = static_cast<uint16_t>(((r >> 4) << 12) | ((g >> 4) << 8) | ((b >> 4) << 4) | (a >> 4));
+            }
+            packed[static_cast<size_t>(y) * potW + x] = v;
+        }
+    }
+
+    GpuTexEntry entry;
+    const GPU_TEXCOLOR fmt = opaque ? GPU_RGB565 : GPU_RGBA4;
+    if (!C3D_TexInit(&entry.tex, potW, potH, fmt)) {
+        AppLog("[Gpu2d] C3D_TexInit failed %dx%d (have %zuKB)\n", potW, potH, g_gpuTexBytes / 1024);
+        return nullptr;
+    }
+    C3D_TexUpload(&entry.tex, packed.data());
+    C3D_TexSetFilter(&entry.tex, GPU_LINEAR, GPU_LINEAR);
+    C3D_TexSetWrap(&entry.tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+    entry.valid = true;
+    entry.bytes = bytes;
+    entry.lastUse = ++g_gpuTexTick;
+    entry.uScale = static_cast<float>(dt.width) / static_cast<float>(potW);
+    entry.vScale = static_cast<float>(dt.height) / static_cast<float>(potH);
+    g_gpuTexBytes += bytes;
+    ++g_gpuTexUploads;
+    auto inserted = g_gpuTextures.emplace(key, entry);
+    if (outUScale) *outUScale = inserted.first->second.uScale;
+    if (outVScale) *outVScale = inserted.first->second.vScale;
+    return &inserted.first->second.tex;
+}
+
+// Same slot choice the software path makes for ortho draws.
+static int SelectTexSlotFor2D() {
+    if (g_gx.texStageEnabled[0] && g_gx.stageTexMap[0] < 8 && g_gx.texSlots[g_gx.stageTexMap[0]].valid)
+        return g_gx.stageTexMap[0];
+    if (g_gx.activeTexSlot >= 0 && g_gx.activeTexSlot < 8 && g_gx.texSlots[g_gx.activeTexSlot].valid)
+        return g_gx.activeTexSlot;
+    for (int s = 0; s < 8; ++s)
+        if (g_gx.texSlots[s].valid) return s;
+    return -1;
+}
+
+static void Gpu2dRecordQuad(const GxVertex v[4]) {
+    if (g_gpuQuads.size() >= 8192) return;
+    GpuQuad q;
+    for (int i = 0; i < 4; ++i) {
+        float sx = 0.0f, sy = 0.0f;
+        if (!Project2DPoint(v[i].pos, &sx, &sy)) return;
+        q.v[i].x = sx;
+        q.v[i].y = sy;
+        q.v[i].u = v[i].hasUv0 ? v[i].uv0[0] : 0.0f;
+        q.v[i].v = v[i].hasUv0 ? (g_gpuVFlip ? 1.0f - v[i].uv0[1] : v[i].uv0[1]) : 0.0f;
+        q.v[i].r = v[i].color0[0] / 255.0f;
+        q.v[i].g = v[i].color0[1] / 255.0f;
+        q.v[i].b = v[i].color0[2] / 255.0f;
+        q.v[i].a = v[i].color0[3] / 255.0f;
+    }
+
+    const int slotIdx = SelectTexSlotFor2D();
+    const DecodedTex* dt = nullptr;
+    C3D_Tex* tex = nullptr;
+    if (slotIdx >= 0 && v[0].hasUv0) {
+        const TexSlot& slot = g_gx.texSlots[slotIdx];
+        dt = GetOrDecodeTexture(slot);
+        if (dt) tex = Gpu2dAcquireTexture(TexSlotKey(slot), *dt, &q.uScale, &q.vScale);
+    }
+    q.tex = tex;
+    q.blend = (g_gx.blendMode != 0);
+    q.clip[0] = g_gx.clipX0;
+    q.clip[1] = g_gx.clipY0;
+    q.clip[2] = g_gx.clipX1;
+    q.clip[3] = g_gx.clipY1;
+    g_gpuQuads.push_back(q);
+    ++g_gpuQuadsRecorded;
+}
+
+// Copy the software framebuffer (clear colour + any software-rendered 3D) into a texture so the GPU
+// pass can composite the layout on top of it.
+static bool Gpu2dUploadBase() {
+    static const int kPotW = 512, kPotH = 256;
+    if (!g_gpuBaseValid) {
+        if (!C3D_TexInit(&g_gpuBase, kPotW, kPotH, GPU_RGB565)) return false;
+        C3D_TexSetFilter(&g_gpuBase, GPU_NEAREST, GPU_NEAREST);
+        C3D_TexSetWrap(&g_gpuBase, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
+        g_gpuBaseValid = true;
+    }
+    static std::vector<uint16_t> packed(static_cast<size_t>(kPotW) * kPotH);
+    for (int y = 0; y < kScreenH; ++y) {
+        for (int x = 0; x < kScreenW; ++x) {
+            const uint32_t c = g_fbColor[static_cast<size_t>(y) * kScreenW + x];
+            const uint32_t r = (c >> 24) & 0xFFu, g = (c >> 16) & 0xFFu, b = (c >> 8) & 0xFFu;
+            packed[static_cast<size_t>(y) * kPotW + x] =
+                static_cast<uint16_t>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
+        }
+    }
+    C3D_TexUpload(&g_gpuBase, packed.data());
+    return true;
+}
+
+static void Gpu2dRender() {
+    if (!g_gpuReady) return;
+    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    const uint32_t clear = (g_gx.clearColor[0] << 24) | (g_gx.clearColor[1] << 16) |
+                           (g_gx.clearColor[2] << 8) | 0xFFu;
+    C3D_RenderTargetClear(g_gpuTop, C3D_CLEAR_ALL, clear, 0);
+    C3D_FrameDrawOn(g_gpuTop);
+    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, 0, &g_gpuProj);
+
+    // Anything the software path drew (3D) is composited underneath the layout.
+    // Any pixel the software path produced (3D, or a 2D draw that did not come through the
+    // layout hook) has to be composited underneath the GPU drawn layout.
+    if ((g_gx.pixels3DThisFrame > 0 || g_gx.tri2DWritten > 0) && Gpu2dUploadBase()) {
+        C3D_TexBind(0, &g_gpuBase);
+        const float su = static_cast<float>(kScreenW) / 512.0f;
+        const float sv = static_cast<float>(kScreenH) / 256.0f;
+        C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
+        const float xs[4] = {0.0f, static_cast<float>(kScreenW), 0.0f, static_cast<float>(kScreenW)};
+        const float ys[4] = {0.0f, 0.0f, static_cast<float>(kScreenH), static_cast<float>(kScreenH)};
+        const float us[4] = {0.0f, su, 0.0f, su};
+        const float vs[4] = {0.0f, 0.0f, sv, sv};
+        for (int i = 0; i < 4; ++i) {
+            C3D_ImmSendAttrib(xs[i], ys[i], 0.0f, 0.0f);
+            C3D_ImmSendAttrib(us[i], vs[i], 0.0f, 0.0f);
+            C3D_ImmSendAttrib(1.0f, 1.0f, 1.0f, 1.0f);
+        }
+        C3D_ImmDrawEnd();
+    }
+
+    g_gpuQuadsDrawn = 0;
+    for (const GpuQuad& q : g_gpuQuads) {
+        C3D_Tex* tex = q.tex;
+        // UVs address the logical texture; the VRAM copy is padded up to power-of-two, so the
+        // quad's UVs are scaled into that padded square.
+        const float uScale = q.uScale;
+        const float vScale = q.vScale;
+        if (!tex && g_gpuWhiteValid) tex = &g_gpuWhite;
+        if (!tex) continue;
+        // GPU_SCISSOR_DISABLE is 0 and the AND test mode is 1; naming them through the enum
+        // keeps this compiling across citro3d versions whose enumerator names differ.  Off by
+        // default: an unexpected value here silently discards every quad.
+        if (g_gpuScissor) {
+            C3D_SetScissor(static_cast<GPU_SCISSORMODE>(1), static_cast<uint32_t>(std::max(0, q.clip[0])),
+                           static_cast<uint32_t>(std::max(0, q.clip[1])),
+                           static_cast<uint32_t>(std::min(kScreenW, q.clip[2])),
+                           static_cast<uint32_t>(std::min(kScreenH, q.clip[3])));
+        }
+        if (!q.blend) C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+        C3D_TexBind(0, tex);
+        C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
+        for (int i = 0; i < 4; ++i) {
+            C3D_ImmSendAttrib(q.v[i].x, q.v[i].y, 0.0f, 0.0f);
+            C3D_ImmSendAttrib(q.v[i].u * uScale, q.v[i].v * vScale, 0.0f, 0.0f);
+            C3D_ImmSendAttrib(q.v[i].r, q.v[i].g, q.v[i].b, q.v[i].a);
+        }
+        C3D_ImmDrawEnd();
+        if (!q.blend) {
+            C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
+                           GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
+        }
+        ++g_gpuQuadsDrawn;
+    }
+    if (g_gpuScissor) C3D_SetScissor(static_cast<GPU_SCISSORMODE>(0), 0, 0, 0, 0);
+    C3D_FrameEnd(0);
+    g_gpuQuads.clear();
+}
+
+#endif // __3DS__
+
 static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoordCount, uint32_t texCoordAddr, uint32_t colorAddr, uint8_t extraAlpha, uint32_t hook, uint32_t caller) {
     EnsureInitialized();
     if (!Memory::Contains(posAddr, 8) || !Memory::Contains(sizeAddr, 8)) return;
@@ -3051,6 +3455,11 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
     }
 
     ++g_gx.quads2DThisFrame;
+    if (g_gpu2d && Gpu2dInit()) {
+        Gpu2dRecordQuad(v);
+        if (trace) LogDrawSamples(g_traceDrawOrder, before);
+        return;
+    }
     static uint32_t s_menuFillDiagnostics = 0;
     const bool traceMenuFill = g_gxFrame >= 80 && g_gxFrame <= 110 && s_menuFillDiagnostics < 24;
     g_gx.trackTrianglePixels = traceMenuFill;
@@ -3122,6 +3531,9 @@ static void SetEggVtxState(uint32_t type) {
 static void PresentFrameTo3DS(uint32_t frameNumber) {
     EnsureInitialized();
 #ifdef __3DS__
+    if (g_gpu2d && Gpu2dInit()) {
+        Gpu2dRender();
+    } else {
     uint8_t* fb = gfxGetFramebuffer(GFX_TOP, GFX_LEFT, nullptr, nullptr);
     if (fb) {
         for (int x = 0; x < kScreenW; ++x) {
@@ -3137,6 +3549,7 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
         gfxFlushBuffers();
         gfxSwapBuffers();
         gspWaitForVBlank();
+    }
     }
 #endif
     if (frameNumber == kGxTraceFrame || frameNumber == 88 || frameNumber == 96 || frameNumber == 104 ||
@@ -7867,10 +8280,15 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             const uint32_t sceneState = (scene && Memory::Contains(scene + 8, 4))
                 ? Memory::Read32(scene + 4) : 0u;
             AppLog(" nextSec=%u sceneState=%u hostHeapFree=%zuKB texCache=%zuKB"
-                   " texDecode=%u texHit=%u texEvict=%u texTexels=%u\n",
+                   " texDecode=%u texHit=%u texEvict=%u texTexels=%u gpu2d=%u quads=%u drawn=%u"
+                   " vram=%zuKB up=%u gev=%u\n",
                 nextSec, sceneState, HostHeapFreeKb(), gx_bridge::g_texCacheBytes / 1024,
                 gx_bridge::g_texStatDecodes, gx_bridge::g_texStatHits,
-                gx_bridge::g_texStatEvictions, static_cast<uint32_t>(gx_bridge::g_texStatTexels));
+                gx_bridge::g_texStatEvictions, static_cast<uint32_t>(gx_bridge::g_texStatTexels),
+                gx_bridge::Gpu2dActive() ? 1u : 0u, gx_bridge::g_gpuQuadsRecorded,
+                gx_bridge::g_gpuQuadsDrawn, gx_bridge::g_gpuTexBytes / 1024,
+                gx_bridge::g_gpuTexUploads, gx_bridge::g_gpuTexEvictions);
+            gx_bridge::g_gpuQuadsRecorded = 0;
             gx_bridge::g_texStatDecodes = 0;
             gx_bridge::g_texStatHits = 0;
             gx_bridge::g_texStatEvictions = 0;

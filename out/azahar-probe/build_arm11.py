@@ -104,7 +104,8 @@ def main():
         '-march=armv6k', '-mtune=mpcore', '-mfloat-abi=hard', '-mtp=soft',
         f'-L{sdk}/libctru/lib',
         *[str(o) for o in objs],
-        '-lctru', '-lm',
+        # citro3d is the PICA200 wrapper used by the 2D UI backend (gx_bridge).
+        '-lcitro3d', '-lctru', '-lm',
         '-o', str(elf)
     ]
 
