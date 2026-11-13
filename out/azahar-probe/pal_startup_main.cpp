@@ -760,6 +760,40 @@ struct GxState {
     bool     lightEnabled = false;
     uint8_t tevColor[4][4] = {{255,255,255,255}, {255,255,255,255}, {255,255,255,255}, {255,255,255,255}};
     uint8_t tevKColor[4][4] = {{255,255,255,255}, {255,255,255,255}, {255,255,255,255}, {255,255,255,255}};
+
+    // TEV combiner state. Mario Kart Wii drives almost every material through the TEV, so the old
+    // "vertex * texture" shortcut is only correct for the default MODULATE setup. These mirror the
+    // BP registers the guest writes via GXSetTev*.
+    uint32_t tevNumStages = 1;
+    // Per stage: texCoordId, texMapId (0xFF = no texture), colorChan (0/1/0xFF = no colour).
+    uint8_t  tevOrderCoord[16] = {};
+    uint8_t  tevOrderMap[16] = {};
+    uint8_t  tevOrderChan[16] = {};
+    bool     tevOrderEnabled[16] = {};
+    // Colour/alpha input selectors (a,b,c,d) and output ops.
+    uint8_t  tevColorIn[16][4] = {};
+    uint8_t  tevAlphaIn[16][4] = {};
+    uint8_t  tevColorOp[16] = {};     // 0=ADD 1=SUB 2=COMP_RGB8 3=COMP_RGBA8
+    uint8_t  tevColorBias[16] = {};   // 0=none 1=+0.5 2=-0.5
+    uint8_t  tevColorScale[16] = {};  // 0=1 1=2 2=4 3=0.5
+    bool     tevColorClamp[16] = {true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true};
+    uint8_t  tevColorOut[16] = {};    // output register id
+    uint8_t  tevAlphaOp[16] = {};
+    uint8_t  tevAlphaBias[16] = {};
+    uint8_t  tevAlphaScale[16] = {};
+    bool     tevAlphaClamp[16] = {true,true,true,true,true,true,true,true,true,true,true,true,true,true,true,true};
+    uint8_t  tevAlphaOut[16] = {};
+    uint8_t  tevKColorSel[16] = {};
+    uint8_t  tevKAlphaSel[16] = {};
+    uint8_t  tevSwapRas[16] = {};
+    uint8_t  tevSwapTex[16] = {};
+    uint8_t  tevSwapTable[4][4] = {{0,1,2,3},{0,1,2,3},{0,1,2,3},{0,1,2,3}};
+    // GXSetAlphaCompare: func0/ref0, func1/ref1, op (0=AND 1=OR 2=XOR 3=XNOR).
+    uint32_t alphaComp0 = 7;  // GX_ALWAYS
+    uint32_t alphaRef0 = 0;
+    uint32_t alphaComp1 = 7;
+    uint32_t alphaRef1 = 0;
+    uint32_t alphaCompOp = 0;
     uint8_t clearColor[4] = {105, 165, 235, 255}; // Default sky blue
 
     bool depthCompare = true;
@@ -785,6 +819,10 @@ struct GxState {
 };
 
 static GxState g_gx;
+// nw4r layout quads are drawn through the 3DS DrawLytQuad2D shortcut, which bypasses the guest
+// display list (and therefore the TEV setup). Their contract is the fixed "vertex * texture"
+// modulate that nw4r uses for layout panes, so they must not consume the last TEV state.
+static bool g_layoutQuad = false;
 static bool g_gxInitialized = false;
 
 static inline uint16_t ReadBE16(const uint8_t* p) {
@@ -1040,6 +1078,19 @@ static void EnsureInitialized() {
     g_gx.vtxFmt[0][9]  = {0, 4, 0}; // POS_XY, F32
     g_gx.vtxFmt[0][11] = {1, 5, 0}; // CLR_RGBA, RGBA8
     g_gx.vtxFmt[0][13] = {1, 4, 0}; // TEX_ST, F32
+    // Default TEV: one stage doing MODULATE (TEXC * RASC) for colour and TEXA * RASA for alpha,
+    // which is exactly the old "vertex * texture" behaviour when the guest never configures TEV.
+    g_gx.tevNumStages = 1;
+    g_gx.tevColorIn[0][0] = 15; g_gx.tevColorIn[0][1] = 8;  g_gx.tevColorIn[0][2] = 10; g_gx.tevColorIn[0][3] = 15;
+    g_gx.tevAlphaIn[0][0] = 7;  g_gx.tevAlphaIn[0][1] = 4;  g_gx.tevAlphaIn[0][2] = 5;  g_gx.tevAlphaIn[0][3] = 7;
+    g_gx.tevColorOp[0] = 0;
+    g_gx.tevAlphaOp[0] = 0;
+    g_gx.tevColorClamp[0] = true;
+    g_gx.tevAlphaClamp[0] = true;
+    for (int i = 0; i < 4; ++i) {
+        g_gx.tevSwapTable[i][0] = 0; g_gx.tevSwapTable[i][1] = 1;
+        g_gx.tevSwapTable[i][2] = 2; g_gx.tevSwapTable[i][3] = 3;
+    }
     ClearFramebuffer();
 }
 
@@ -1433,6 +1484,128 @@ static inline bool BlendPixel(int x, int y, float z, uint8_t sr, uint8_t sg, uin
     return true;
 }
 
+// --- TEV combiner -----------------------------------------------------------------
+// Mario Kart Wii drives almost every material through the TEV. The original bridge shaded every
+// pixel as "vertex * texture", which is only the default MODULATE setup; REPLACE, PASS, ADD, SUB
+// and the konst/tev-register inputs all came out wrong. These helpers evaluate the per-stage
+// combiner against the sampled texture and the interpolated rasterised colour.
+
+static inline void TevColorArg(uint32_t sel, const float prevColor[4], float prevAlpha,
+                               const float texColor[4], const float ras[4],
+                               const uint8_t kColor[4], float out[4]) {
+    switch (sel) {
+    case 0:  std::memcpy(out, prevColor, sizeof(float) * 4); return;                     // CPREV
+    case 1:  out[0]=out[1]=out[2]=prevAlpha; out[3]=prevAlpha; return;                   // APREV
+    case 2:  for (int i=0;i<4;++i) out[i] = g_gx.tevColor[0][i] / 255.0f; return;        // C0
+    case 3:  for (int i=0;i<4;++i) out[i] = g_gx.tevColor[1][i] / 255.0f; return;        // C1
+    case 4:  for (int i=0;i<4;++i) out[i] = g_gx.tevColor[2][i] / 255.0f; return;        // C2
+    case 5:  out[0]=out[1]=out[2]=g_gx.tevColor[0][3]/255.0f; out[3]=out[2]; return;     // A0
+    case 6:  out[0]=out[1]=out[2]=g_gx.tevColor[1][3]/255.0f; out[3]=out[2]; return;     // A1
+    case 7:  out[0]=out[1]=out[2]=g_gx.tevColor[2][3]/255.0f; out[3]=out[2]; return;     // A2
+    case 8:  std::memcpy(out, texColor, sizeof(float) * 4); return;                      // TEXC
+    case 9:  out[0]=out[1]=out[2]=texColor[3]; out[3]=texColor[3]; return;               // TEXA
+    case 10: std::memcpy(out, ras, sizeof(float) * 4); return;                           // RASC
+    case 11: out[0]=out[1]=out[2]=ras[3]; out[3]=ras[3]; return;                         // RASA
+    case 12: out[0]=out[1]=out[2]=out[3]=1.0f; return;                                   // ONE
+    case 13: out[0]=out[1]=out[2]=out[3]=0.5f; return;                                   // HALF
+    case 14: for (int i=0;i<4;++i) out[i] = kColor[i] / 255.0f; return;                  // KONST
+    default: out[0]=out[1]=out[2]=out[3]=0.0f; return;                                   // ZERO
+    }
+}
+
+static inline float TevAlphaArg(uint32_t sel, const float prevColor[4], float prevAlpha,
+                                const float texColor[4], const float ras[4],
+                                const uint8_t kColor[4]) {
+    switch (sel) {
+    case 0: return prevAlpha;                       // APREV
+    case 1: return g_gx.tevColor[0][3] / 255.0f;   // A0
+    case 2: return g_gx.tevColor[1][3] / 255.0f;   // A1
+    case 3: return g_gx.tevColor[2][3] / 255.0f;   // A2
+    case 4: return texColor[3];                    // TEXA
+    case 5: return ras[3];                         // RASA
+    case 6: return kColor[3] / 255.0f;             // KONST
+    default: return 0.0f;                          // ZERO
+    }
+}
+
+static inline float TevApplyOp(float a, float b, float c, float d, uint32_t op,
+                               uint32_t bias, uint32_t scale, bool clamp) {
+    // Matches aurora's reference: out = (mix(a,b,c) + d + bias) * scale, negated for SUB.
+    // mix(a,b,c) is a*(1-c) + b*c, i.e. the TEV "lerp" of the two colour args.
+    float mix = a + (b - a) * c;
+    float r = mix + d;
+    if (bias == 1u) r += 0.5f;
+    else if (bias == 2u) r -= 0.5f;
+    if (op == 1u) r = -r;                       // GX_TEV_SUB
+    static const float kScale[4] = {1.0f, 2.0f, 4.0f, 0.5f};
+    r *= kScale[scale & 3u];
+    if (clamp) r = std::max(0.0f, std::min(1.0f, r));
+    return r;
+}
+
+static inline void TevSwapChannel(uint32_t swapSel, const float in[4], float out[4]) {
+    const uint8_t* t = g_gx.tevSwapTable[swapSel & 3u];
+    out[0] = in[t[0] & 3u];
+    out[1] = in[t[1] & 3u];
+    out[2] = in[t[2] & 3u];
+    out[3] = in[t[3] & 3u];
+}
+
+static void EvaluateTevPixel(const float ras[4], const float texColor[4], const uint8_t kColor[4],
+                             float out[4]) {
+    float prevColor[4] = {ras[0], ras[1], ras[2], ras[3]};
+    float prevAlpha = ras[3];
+    const uint32_t stages = std::max(1u, std::min<uint32_t>(g_gx.tevNumStages, 16u));
+    for (uint32_t s = 0; s < stages; ++s) {
+        float a[4], b[4], c[4], d[4];
+        TevColorArg(g_gx.tevColorIn[s][0], prevColor, prevAlpha, texColor, ras, kColor, a);
+        TevColorArg(g_gx.tevColorIn[s][1], prevColor, prevAlpha, texColor, ras, kColor, b);
+        TevColorArg(g_gx.tevColorIn[s][2], prevColor, prevAlpha, texColor, ras, kColor, c);
+        TevColorArg(g_gx.tevColorIn[s][3], prevColor, prevAlpha, texColor, ras, kColor, d);
+        float col[4];
+        for (int i = 0; i < 3; ++i) {
+            col[i] = TevApplyOp(a[i], b[i], c[i], d[i], g_gx.tevColorOp[s],
+                                g_gx.tevColorBias[s], g_gx.tevColorScale[s], g_gx.tevColorClamp[s]);
+        }
+        float aa = TevAlphaArg(g_gx.tevAlphaIn[s][0], prevColor, prevAlpha, texColor, ras, kColor);
+        float ab = TevAlphaArg(g_gx.tevAlphaIn[s][1], prevColor, prevAlpha, texColor, ras, kColor);
+        float ac = TevAlphaArg(g_gx.tevAlphaIn[s][2], prevColor, prevAlpha, texColor, ras, kColor);
+        float ad = TevAlphaArg(g_gx.tevAlphaIn[s][3], prevColor, prevAlpha, texColor, ras, kColor);
+        col[3] = TevApplyOp(aa, ab, ac, ad, g_gx.tevAlphaOp[s],
+                            g_gx.tevAlphaBias[s], g_gx.tevAlphaScale[s], g_gx.tevAlphaClamp[s]);
+        float sw[4];
+        TevSwapChannel(g_gx.tevSwapRas[s], col, sw);
+        std::memcpy(prevColor, sw, sizeof(prevColor));
+        prevAlpha = sw[3];
+    }
+    std::memcpy(out, prevColor, sizeof(prevColor));
+}
+
+static inline bool AlphaTestPass(float alpha) {
+    if (g_gx.alphaComp0 == 7u && g_gx.alphaComp1 == 7u) return true; // both ALWAYS
+    auto test = [](uint32_t fn, float ref, float a) -> bool {
+        const float r = ref / 255.0f;
+        switch (fn) {
+        case 0: return a <  r; // NEVER? GX_NEVER=0
+        case 1: return a <  r; // LESS
+        case 2: return a == r; // EQUAL
+        case 3: return a <= r; // LEQUAL
+        case 4: return a >  r; // GREATER
+        case 5: return a != r; // NEQUAL
+        case 6: return a >= r; // GEQUAL
+        default: return true;  // ALWAYS
+        }
+    };
+    const bool t0 = test(g_gx.alphaComp0, static_cast<float>(g_gx.alphaRef0), alpha);
+    const bool t1 = test(g_gx.alphaComp1, static_cast<float>(g_gx.alphaRef1), alpha);
+    switch (g_gx.alphaCompOp) {
+    case 0: return t0 && t1; // AND
+    case 1: return t0 || t1; // OR
+    case 2: return t0 != t1; // XOR
+    default: return t0 == t1; // XNOR
+    }
+}
+
 static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVertex& v2, uint32_t pnMtxIdx) {
     EnsureInitialized();
     g_gx.lastTrianglePixels = 0;
@@ -1689,11 +1862,13 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
             float w2 = 1.0f - w0 - w1;
             if (w0 >= -1e-4f && w1 >= -1e-4f && w2 >= -1e-4f) {
                 float z = w0 * cv[0].sz + w1 * cv[1].sz + w2 * cv[2].sz;
-                uint32_t r = static_cast<uint32_t>(std::max(0.0f, std::min(255.0f, w0 * cv[0].r + w1 * cv[1].r + w2 * cv[2].r)));
-                uint32_t g = static_cast<uint32_t>(std::max(0.0f, std::min(255.0f, w0 * cv[0].g + w1 * cv[1].g + w2 * cv[2].g)));
-                uint32_t b = static_cast<uint32_t>(std::max(0.0f, std::min(255.0f, w0 * cv[0].b + w1 * cv[1].b + w2 * cv[2].b)));
-                uint32_t a = static_cast<uint32_t>(std::max(0.0f, std::min(255.0f, w0 * cv[0].a + w1 * cv[1].a + w2 * cv[2].a)));
-
+                float ras[4] = {
+                    (w0 * cv[0].r + w1 * cv[1].r + w2 * cv[2].r) / 255.0f,
+                    (w0 * cv[0].g + w1 * cv[1].g + w2 * cv[2].g) / 255.0f,
+                    (w0 * cv[0].b + w1 * cv[1].b + w2 * cv[2].b) / 255.0f,
+                    (w0 * cv[0].a + w1 * cv[1].a + w2 * cv[2].a) / 255.0f,
+                };
+                float texColor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
                 if (tex) {
                     float pw0 = w0 * cv[0].invW;
                     float pw1 = w1 * cv[1].invW;
@@ -1704,11 +1879,32 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
                     float v = (std::fabs(sumInvW) > 1e-8f) ? ((pw0 * cv[0].v + pw1 * cv[1].v + pw2 * cv[2].v) / sumInvW)
                                                            : (w0 * cv[0].v + w1 * cv[1].v + w2 * cv[2].v);
                     uint32_t tc = SampleTexture(tex, slot, u, v, texLod);
-                    r = (r * ((tc >> 24) & 0xFFu)) >> 8;
-                    g = (g * ((tc >> 16) & 0xFFu)) >> 8;
-                    b = (b * ((tc >> 8)  & 0xFFu)) >> 8;
-                    a = (a * (tc         & 0xFFu)) >> 8;
+                    texColor[0] = ((tc >> 24) & 0xFFu) / 255.0f;
+                    texColor[1] = ((tc >> 16) & 0xFFu) / 255.0f;
+                    texColor[2] = ((tc >> 8)  & 0xFFu) / 255.0f;
+                    texColor[3] = (tc         & 0xFFu) / 255.0f;
                 }
+                // The TEV constant colour is selected per stage by GXSetTevKColorSel.
+                const uint8_t* kColor = g_gx.tevKColor[g_gx.tevKColorSel[0] & 3u];
+                float tevOut[4];
+                if (g_layoutQuad) {
+                    // Fixed modulate: layout panes always use vertex * texture.
+                    tevOut[0] = ras[0] * texColor[0];
+                    tevOut[1] = ras[1] * texColor[1];
+                    tevOut[2] = ras[2] * texColor[2];
+                    tevOut[3] = ras[3] * texColor[3];
+                } else {
+                    EvaluateTevPixel(ras, texColor, kColor, tevOut);
+                }
+                if (!g_layoutQuad && !AlphaTestPass(tevOut[3])) {
+                    w0 += dw0_dx;
+                    w1 += dw1_dx;
+                    continue;
+                }
+                uint32_t r = static_cast<uint32_t>(std::max(0.0f, std::min(255.0f, tevOut[0] * 255.0f + 0.5f)));
+                uint32_t g = static_cast<uint32_t>(std::max(0.0f, std::min(255.0f, tevOut[1] * 255.0f + 0.5f)));
+                uint32_t b = static_cast<uint32_t>(std::max(0.0f, std::min(255.0f, tevOut[2] * 255.0f + 0.5f)));
+                uint32_t a = static_cast<uint32_t>(std::max(0.0f, std::min(255.0f, tevOut[3] * 255.0f + 0.5f)));
                 const bool written = BlendPixel(px, py, z, static_cast<uint8_t>(r), static_cast<uint8_t>(g),
                     static_cast<uint8_t>(b), static_cast<uint8_t>(a), ignoreDepth);
                 wrotePixel |= written;
@@ -1915,17 +2111,82 @@ static void HandleLoadBpReg(uint32_t val) {
 
     if (reg == 0x00) { // GEN_MODE
         g_gx.cullMode = (payload >> 14) & 3u;
-    } else if (reg >= 0x28 && reg <= 0x2F) { // bp_tref
+    } else if (reg >= 0x28 && reg <= 0x2F) { // bp_tref (TEV order)
         uint32_t pair = reg - 0x28;
-        uint32_t s0 = pair * 2;
-        uint32_t s1 = pair * 2 + 1;
+        for (uint32_t half = 0; half < 2; ++half) {
+            uint32_t s = pair * 2 + half;
+            if (s >= 16) continue;
+            const uint32_t shift = half * 12;
+            const uint32_t map = (payload >> shift) & 7u;
+            const uint32_t coord = (payload >> (shift + 3)) & 7u;
+            const bool enabled = ((payload >> (shift + 6)) & 1u) != 0;
+            const uint32_t chan = (payload >> (shift + 7)) & 7u;
+            g_gx.tevOrderMap[s] = static_cast<uint8_t>(map);
+            g_gx.tevOrderCoord[s] = static_cast<uint8_t>(coord);
+            g_gx.tevOrderEnabled[s] = enabled;
+            g_gx.tevOrderChan[s] = static_cast<uint8_t>(chan);
+            g_gx.stageTexMap[s] = static_cast<uint8_t>(map);
+            g_gx.texStageEnabled[s] = enabled && map < 8;
+        }
+    } else if (reg >= 0xC0 && reg <= 0xDF) { // TEV colour/alpha combiner stages
+        if ((reg & 1u) == 0) { // colour env
+            const uint32_t s = (reg - 0xC0) / 2;
+            if (s < 16) {
+                g_gx.tevColorIn[s][3] = static_cast<uint8_t>(payload & 0xFu);
+                g_gx.tevColorIn[s][2] = static_cast<uint8_t>((payload >> 4) & 0xFu);
+                g_gx.tevColorIn[s][1] = static_cast<uint8_t>((payload >> 8) & 0xFu);
+                g_gx.tevColorIn[s][0] = static_cast<uint8_t>((payload >> 12) & 0xFu);
+                if (((payload >> 16) & 3u) == 3u) {
+                    g_gx.tevColorOp[s] = 0; g_gx.tevColorBias[s] = 0; g_gx.tevColorScale[s] = 0;
+                } else {
+                    g_gx.tevColorBias[s] = static_cast<uint8_t>((payload >> 16) & 3u);
+                    g_gx.tevColorOp[s] = static_cast<uint8_t>((payload >> 18) & 1u);
+                    g_gx.tevColorScale[s] = static_cast<uint8_t>((payload >> 20) & 3u);
+                }
+                g_gx.tevColorClamp[s] = ((payload >> 19) & 1u) != 0;
+                g_gx.tevColorOut[s] = static_cast<uint8_t>((payload >> 22) & 3u);
+            }
+        } else { // alpha env (+ swap mode)
+            const uint32_t s = (reg - 0xC1) / 2;
+            if (s < 16) {
+                g_gx.tevSwapRas[s] = static_cast<uint8_t>(payload & 3u);
+                g_gx.tevSwapTex[s] = static_cast<uint8_t>((payload >> 2) & 3u);
+                g_gx.tevAlphaIn[s][3] = static_cast<uint8_t>((payload >> 4) & 7u);
+                g_gx.tevAlphaIn[s][2] = static_cast<uint8_t>((payload >> 7) & 7u);
+                g_gx.tevAlphaIn[s][1] = static_cast<uint8_t>((payload >> 10) & 7u);
+                g_gx.tevAlphaIn[s][0] = static_cast<uint8_t>((payload >> 13) & 7u);
+                if (((payload >> 16) & 3u) == 3u) {
+                    g_gx.tevAlphaOp[s] = 0; g_gx.tevAlphaBias[s] = 0; g_gx.tevAlphaScale[s] = 0;
+                } else {
+                    g_gx.tevAlphaBias[s] = static_cast<uint8_t>((payload >> 16) & 3u);
+                    g_gx.tevAlphaOp[s] = static_cast<uint8_t>((payload >> 18) & 1u);
+                    g_gx.tevAlphaScale[s] = static_cast<uint8_t>((payload >> 20) & 3u);
+                }
+                g_gx.tevAlphaClamp[s] = ((payload >> 19) & 1u) != 0;
+                g_gx.tevAlphaOut[s] = static_cast<uint8_t>((payload >> 22) & 3u);
+            }
+        }
+    } else if (reg >= 0xF6 && reg <= 0xFD) { // TEV K select + swap table
+        const uint32_t kselIdx = reg - 0xF6;
+        const uint32_t swapIdx = kselIdx / 2;
+        if (swapIdx < 4) {
+            if (kselIdx & 1u) {
+                g_gx.tevSwapTable[swapIdx][2] = static_cast<uint8_t>(payload & 3u);
+                g_gx.tevSwapTable[swapIdx][3] = static_cast<uint8_t>((payload >> 2) & 3u);
+            } else {
+                g_gx.tevSwapTable[swapIdx][0] = static_cast<uint8_t>(payload & 3u);
+                g_gx.tevSwapTable[swapIdx][1] = static_cast<uint8_t>((payload >> 2) & 3u);
+            }
+        }
+        const uint32_t s0 = kselIdx * 2;
+        const uint32_t s1 = kselIdx * 2 + 1;
         if (s0 < 16) {
-            g_gx.stageTexMap[s0] = static_cast<uint8_t>(payload & 7u);
-            g_gx.texStageEnabled[s0] = ((payload >> 6) & 1u) != 0;
+            g_gx.tevKColorSel[s0] = static_cast<uint8_t>((payload >> 4) & 0x1Fu);
+            g_gx.tevKAlphaSel[s0] = static_cast<uint8_t>((payload >> 9) & 0x1Fu);
         }
         if (s1 < 16) {
-            g_gx.stageTexMap[s1] = static_cast<uint8_t>((payload >> 12) & 7u);
-            g_gx.texStageEnabled[s1] = ((payload >> 18) & 1u) != 0;
+            g_gx.tevKColorSel[s1] = static_cast<uint8_t>((payload >> 14) & 0x1Fu);
+            g_gx.tevKAlphaSel[s1] = static_cast<uint8_t>((payload >> 19) & 0x1Fu);
         }
     } else if (reg == 0x40) { // Z_MODE
         g_gx.depthCompare = (payload & 1u) != 0;
@@ -2526,10 +2787,12 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
     static uint32_t s_menuFillDiagnostics = 0;
     const bool traceMenuFill = g_gxFrame >= 80 && g_gxFrame <= 110 && s_menuFillDiagnostics < 24;
     g_gx.trackTrianglePixels = traceMenuFill;
+    g_layoutQuad = true;
     RasterizeTriangle(v[0], v[1], v[2], g_gx.currentPnMtx);
     const uint32_t firstTriPixels = g_gx.lastTrianglePixels;
     RasterizeTriangle(v[0], v[2], v[3], g_gx.currentPnMtx);
     const uint32_t secondTriPixels = g_gx.lastTrianglePixels;
+    g_layoutQuad = false;
     g_gx.trackTrianglePixels = false;
     if (traceMenuFill) {
         ++s_menuFillDiagnostics;
@@ -2643,6 +2906,15 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
             frameNumber, g_gx.drawCallsThisFrame, g_gx.trisThisFrame, g_gx.quads2DThisFrame, g_gx.dlCallsThisFrame, g_texCacheBytes / 1024, g_gx.pixels3DThisFrame, g_gx.tri3DEntered, g_gx.tri3DBounds, g_gx.tri2DAlphaZero, g_gx.tri2DWritten);
         AppLog("[GlobeFlag] frame=%u flag=%u bits=%08X\n",
             frameNumber, Memory::Read8(0x809C19A0u), Memory::Read32(0x809C1874u));
+        AppLog("[TevState] frame=%u stages=%u cin0=(%u,%u,%u,%u) ain0=(%u,%u,%u,%u) cop=%u aop=%u acomp0=%u ref0=%u op=%u acomp1=%u ref1=%u c0=%u,%u,%u,%u c2=%u,%u,%u,%u\n",
+            frameNumber, gx_bridge::g_gx.tevNumStages,
+            gx_bridge::g_gx.tevColorIn[0][0], gx_bridge::g_gx.tevColorIn[0][1], gx_bridge::g_gx.tevColorIn[0][2], gx_bridge::g_gx.tevColorIn[0][3],
+            gx_bridge::g_gx.tevAlphaIn[0][0], gx_bridge::g_gx.tevAlphaIn[0][1], gx_bridge::g_gx.tevAlphaIn[0][2], gx_bridge::g_gx.tevAlphaIn[0][3],
+            gx_bridge::g_gx.tevColorOp[0], gx_bridge::g_gx.tevAlphaOp[0],
+            gx_bridge::g_gx.alphaComp0, gx_bridge::g_gx.alphaRef0, gx_bridge::g_gx.alphaCompOp,
+            gx_bridge::g_gx.alphaComp1, gx_bridge::g_gx.alphaRef1,
+            gx_bridge::g_gx.tevColor[0][0], gx_bridge::g_gx.tevColor[0][1], gx_bridge::g_gx.tevColor[0][2], gx_bridge::g_gx.tevColor[0][3],
+            gx_bridge::g_gx.tevColor[2][0], gx_bridge::g_gx.tevColor[2][1], gx_bridge::g_gx.tevColor[2][2], gx_bridge::g_gx.tevColor[2][3]);
         {
             const uint32_t mgr = Memory::Read32(0x809C2144u);
             if (mgr && Memory::Contains(mgr + 30072, 4)) {
@@ -5485,21 +5757,129 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x80171B38u: // GX::SetNumIndStages
     case 0x80171B58u: // GX::SetTevDirect
     case 0x80171BA0u: // GX::SetTevIndWarp
-    case 0x80171C4Cu: // GX::SetTevOp
-    case 0x80171CE0u: // GX::SetTevColorIn
-    case 0x80171D20u: // GX::SetTevAlphaIn
-    case 0x80171D60u: // GX::SetTevColorOp
-    case 0x80171DB8u: // GX::SetTevAlphaOp
-    case 0x80171F30u: // GX::SetTevKColorSel
-    case 0x80171F80u: // GX::SetTevKAlphaSel
-    case 0x80171FD0u: // GX::SetTevSwapMode
-    case 0x8017200Cu: // GX::SetTevSwapModeTable
+        return true;
+    case 0x801722A8u: { // GX::SetNumTevStages(n)
+        gx_bridge::g_gx.tevNumStages = std::max(1u, std::min<uint32_t>(cpu->gpr[3], 16u));
+        return true;
+    }
+    case 0x80171C4Cu: { // GX::SetTevOp(stage, mode) - expand into explicit color/alpha in/op
+        uint32_t s = cpu->gpr[3] & 15u;
+        uint32_t mode = cpu->gpr[4];
+        // GXTevMode: MODULATE=0, DECAL=1, BLEND=2, REPLACE=3, PASSCLR=4. Mirrors aurora's
+        // GXSetTevOp expansion exactly (stage 0 reads RASC/RASA, later stages read CPREV/APREV).
+        const uint32_t inColor = (s == 0) ? 10u : 0u;  // RASC or CPREV
+        const uint32_t inAlpha = (s == 0) ? 5u : 0u;   // RASA or APREV
+        auto setIn = [&](uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+            gx_bridge::g_gx.tevColorIn[s][0] = static_cast<uint8_t>(a);
+            gx_bridge::g_gx.tevColorIn[s][1] = static_cast<uint8_t>(b);
+            gx_bridge::g_gx.tevColorIn[s][2] = static_cast<uint8_t>(c);
+            gx_bridge::g_gx.tevColorIn[s][3] = static_cast<uint8_t>(d);
+        };
+        auto setAIn = [&](uint32_t a, uint32_t b, uint32_t c, uint32_t d) {
+            gx_bridge::g_gx.tevAlphaIn[s][0] = static_cast<uint8_t>(a);
+            gx_bridge::g_gx.tevAlphaIn[s][1] = static_cast<uint8_t>(b);
+            gx_bridge::g_gx.tevAlphaIn[s][2] = static_cast<uint8_t>(c);
+            gx_bridge::g_gx.tevAlphaIn[s][3] = static_cast<uint8_t>(d);
+        };
+        switch (mode) {
+        case 1: // DECAL
+            setIn(inColor, 8, 9, 15);
+            setAIn(7, 7, 7, inAlpha);
+            break;
+        case 2: // BLEND
+            setIn(inColor, 12, 8, 15);
+            setAIn(7, 4, inAlpha, 7);
+            break;
+        case 3: // REPLACE
+            setIn(15, 15, 15, 8);
+            setAIn(7, 7, 7, 4);
+            break;
+        case 4: // PASSCLR
+            setIn(15, 15, 15, inColor);
+            setAIn(7, 7, 7, inAlpha);
+            break;
+        default: // MODULATE
+            setIn(15, 8, inColor, 15);
+            setAIn(7, 4, inAlpha, 7);
+            break;
+        }
+        gx_bridge::g_gx.tevColorOp[s] = 0;
+        gx_bridge::g_gx.tevAlphaOp[s] = 0;
+        return true;
+    }
+    case 0x80171CE0u: { // GX::SetTevColorIn(stage,a,b,c,d)
+        uint32_t s = cpu->gpr[3] & 15u;
+        gx_bridge::g_gx.tevColorIn[s][0] = static_cast<uint8_t>(cpu->gpr[4] & 15u);
+        gx_bridge::g_gx.tevColorIn[s][1] = static_cast<uint8_t>(cpu->gpr[5] & 15u);
+        gx_bridge::g_gx.tevColorIn[s][2] = static_cast<uint8_t>(cpu->gpr[6] & 15u);
+        gx_bridge::g_gx.tevColorIn[s][3] = static_cast<uint8_t>(cpu->gpr[7] & 15u);
+        return true;
+    }
+    case 0x80171D20u: { // GX::SetTevAlphaIn(stage,a,b,c,d)
+        uint32_t s = cpu->gpr[3] & 15u;
+        gx_bridge::g_gx.tevAlphaIn[s][0] = static_cast<uint8_t>(cpu->gpr[4] & 7u);
+        gx_bridge::g_gx.tevAlphaIn[s][1] = static_cast<uint8_t>(cpu->gpr[5] & 7u);
+        gx_bridge::g_gx.tevAlphaIn[s][2] = static_cast<uint8_t>(cpu->gpr[6] & 7u);
+        gx_bridge::g_gx.tevAlphaIn[s][3] = static_cast<uint8_t>(cpu->gpr[7] & 7u);
+        return true;
+    }
+    case 0x80171D60u: { // GX::SetTevColorOp(stage,op,bias,scale,clamp,outReg)
+        uint32_t s = cpu->gpr[3] & 15u;
+        gx_bridge::g_gx.tevColorOp[s] = static_cast<uint8_t>(cpu->gpr[4] == 1u ? 1u : 0u);
+        gx_bridge::g_gx.tevColorBias[s] = static_cast<uint8_t>(cpu->gpr[5] & 3u);
+        gx_bridge::g_gx.tevColorScale[s] = static_cast<uint8_t>(cpu->gpr[6] & 3u);
+        gx_bridge::g_gx.tevColorClamp[s] = cpu->gpr[7] != 0;
+        gx_bridge::g_gx.tevColorOut[s] = static_cast<uint8_t>(cpu->gpr[8] & 3u);
+        return true;
+    }
+    case 0x80171DB8u: { // GX::SetTevAlphaOp(stage,op,bias,scale,clamp,outReg)
+        uint32_t s = cpu->gpr[3] & 15u;
+        gx_bridge::g_gx.tevAlphaOp[s] = static_cast<uint8_t>(cpu->gpr[4] == 1u ? 1u : 0u);
+        gx_bridge::g_gx.tevAlphaBias[s] = static_cast<uint8_t>(cpu->gpr[5] & 3u);
+        gx_bridge::g_gx.tevAlphaScale[s] = static_cast<uint8_t>(cpu->gpr[6] & 3u);
+        gx_bridge::g_gx.tevAlphaClamp[s] = cpu->gpr[7] != 0;
+        gx_bridge::g_gx.tevAlphaOut[s] = static_cast<uint8_t>(cpu->gpr[8] & 3u);
+        return true;
+    }
+    case 0x80171F30u: { // GX::SetTevKColorSel(stage,sel)
+        uint32_t s = cpu->gpr[3] & 15u;
+        uint32_t sel = cpu->gpr[4];
+        // 0x1F = none; otherwise the low bits select one of the 4 konst colours.
+        gx_bridge::g_gx.tevKColorSel[s] = static_cast<uint8_t>((sel == 0x1Fu) ? 0u : (sel & 3u));
+        return true;
+    }
+    case 0x80171F80u: { // GX::SetTevKAlphaSel(stage,sel)
+        uint32_t s = cpu->gpr[3] & 15u;
+        uint32_t sel = cpu->gpr[4];
+        gx_bridge::g_gx.tevKAlphaSel[s] = static_cast<uint8_t>((sel == 0x1Fu) ? 0u : (sel & 3u));
+        return true;
+    }
+    case 0x80171FD0u: { // GX::SetTevSwapMode(stage,rasSel,texSel)
+        uint32_t s = cpu->gpr[3] & 15u;
+        gx_bridge::g_gx.tevSwapRas[s] = static_cast<uint8_t>(cpu->gpr[4] & 3u);
+        gx_bridge::g_gx.tevSwapTex[s] = static_cast<uint8_t>(cpu->gpr[5] & 3u);
+        return true;
+    }
+    case 0x8017200Cu: { // GX::SetTevSwapModeTable(id,r,g,b,a)
+        uint32_t id = cpu->gpr[3] & 3u;
+        gx_bridge::g_gx.tevSwapTable[id][0] = static_cast<uint8_t>(cpu->gpr[4] & 3u);
+        gx_bridge::g_gx.tevSwapTable[id][1] = static_cast<uint8_t>(cpu->gpr[5] & 3u);
+        gx_bridge::g_gx.tevSwapTable[id][2] = static_cast<uint8_t>(cpu->gpr[6] & 3u);
+        gx_bridge::g_gx.tevSwapTable[id][3] = static_cast<uint8_t>(cpu->gpr[7] & 3u);
+        return true;
+    }
+    case 0x80172088u: { // GX::SetAlphaCompare(comp0,ref0,op,comp1,ref1)
+        gx_bridge::g_gx.alphaComp0 = cpu->gpr[3] & 7u;
+        gx_bridge::g_gx.alphaRef0  = cpu->gpr[4] & 0xFFu;
+        gx_bridge::g_gx.alphaCompOp = cpu->gpr[5] & 3u;
+        gx_bridge::g_gx.alphaComp1 = cpu->gpr[6] & 7u;
+        gx_bridge::g_gx.alphaRef1  = cpu->gpr[7] & 0xFFu;
+        return true;
+    }
     case 0x801720C0u: // GX::SetZTexture
     case 0x801722CCu: // GX::SetFog
     case 0x801724F8u: // GX::InitFogAdjTable
     case 0x80172658u: // GX::SetFogRangeAdj
-    case 0x80172088u: // GX::SetAlphaCompare
-    case 0x801722A8u: // GX::SetNumTevStages
     case 0x8017054Cu: // GX::SetNumChans
     case 0x80170570u: // GX::SetChanCtrl
     case 0x80171110u: // GX::InvalidateTexAll
