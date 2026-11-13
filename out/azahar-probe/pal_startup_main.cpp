@@ -3769,7 +3769,11 @@ static uint32_t ScriptedPadButtons(ScriptPadKind kind)
     const uint32_t kA = gc ? 0x0100u : 0x0010u;
     const uint32_t kStart = gc ? 0x1000u : 0x0400u;
 
-    if (std::getenv("MKW_NO_AUTOPULSE") == nullptr) {
+    // The A+START autopulse exists to skip the race intro on the forced race shortcut.  It must
+    // never run on the menu path: a synthesised A every other frame walks the title -> main menu
+    // -> options -> "Return to Wii Menu" dialog by itself, and looks like the port is stuck on a
+    // white box.  MKW_NO_AUTOPULSE=1 still disables it for the race path.
+    if (g_raceShortcut && std::getenv("MKW_NO_AUTOPULSE") == nullptr) {
         if (frame >= 20 && frame <= 100000 && (frame % 4) < 2) return kA | kStart;
         return 0;
     }
@@ -7382,6 +7386,29 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                     const int forced = std::atoi(e);
                     cpu->gpr[3] = static_cast<uint32_t>(forced);
                     AppLog("[BootPath] overriding boot section -> %d\n", forced);
+                } else if (static_cast<int32_t>(cpu->gpr[3]) < 0 && std::getenv("MKW_NATURAL_BOOT") == nullptr) {
+                    // The port boots without launch arguments, so the real parser returns -1 and
+                    // SectionMgr falls back to the Mario Kart Channel (section 21) - which is why a
+                    // bare boot lands on the channel page instead of the title screen.  The retail
+                    // game starts on the title section (63) when the disc is launched from the Wii
+                    // Menu, so boot that instead and let the game run its own title -> licence ->
+                    // main-menu flow.  MKW_BOOT_SECTION / MKW_NATURAL_BOOT still override this.
+                    cpu->gpr[3] = 63u;
+                    if (sectionMgr) {
+                        // Same recipe as the MKW_FORCE_SECTION path below/above: setting only the
+                        // parser result leaves SectionMgr with a half-built page set (2 layers, no
+                        // title page), while writing the manager fields and the pad ID gives the
+                        // full title section (4 layers with Pages::Title on top).
+                        Memory::Write32(sectionMgr + 4, 63u);
+                        Memory::Write32(sectionMgr + 12, 63u);
+                        CpuContext padCtx = *cpu;
+                        padCtx.gpr[3] = sectionMgr + 0x34u;
+                        padCtx.gpr[4] = 0;
+                        padCtx.gpr[5] = 0x124u;
+                        CpuContextScope scope(&padCtx);
+                        InvokeIndirectCpu(0x8061B490u, &padCtx);
+                    }
+                    AppLog("[BootPath] no launch arguments -> booting section 63 (title)\n");
                 }
             }
             std::fflush(stdout);
@@ -7659,7 +7686,11 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 const uint32_t id = Memory::Read32(pad + 4);
                 const uint32_t pending = Memory::Read32(pad + 8);
                 const uint32_t state = Memory::Read32(pad + 12);
-                const bool bound = (state != 0u || id != 0u) && id == pending;
+                // A pad counts as registered only once it has a real ID that matches the pending
+                // one.  (The guest's own HasAController also accepts state=1 with id=pending=0,
+                // which is the "requested but nothing bound yet" state - that must keep nudging.)
+                const bool bound = id != 0u && id == pending;
+                (void)state;
                 if (sceneState == 1u && !bound) {
                     s_lastPadNudge = s_frameCount;
                     // If A is already held when the registration window opens, mask it for one frame
