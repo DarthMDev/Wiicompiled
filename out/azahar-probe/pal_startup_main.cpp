@@ -1260,6 +1260,7 @@ static uint32_t g_gpuQuadsDrawn = 0;
 static size_t   g_gpuTexBytes = 0;
 static uint32_t g_gpuTexUploads = 0;
 static uint32_t g_gpuTexEvictions = 0;
+static uint32_t g_gpuBaseUploads = 0;   // frames that composited the software framebuffer (CPU cost)
 static inline bool Gpu2dActive() { return g_gpu2d; }
 #ifdef __3DS__
 static void Gpu2dConfigure();
@@ -2943,6 +2944,7 @@ static uint32_t g_gpuClearOverride = 0;   // MKW_GPU_CLEAR=RRGGBB, 0 = use the g
 static uint32_t g_gpuDebugQuads = 0;      // dumps the first few quads' geometry
 static int      g_gpuTestMode = 0;        // 1 = reference pattern, 2 = layout with white texture
 static int      g_gpuProjUnif = 0;        // MKW_GPU_UNIF=n picks the projection uniform slot
+static bool     g_gpuPnMtx = true;        // apply the pane matrix (GXLoadPosMtxImm) to layout quads
 
 struct GpuQuadVtx { float x, y, u, v, r, g, b, a; };
 struct GpuQuad {
@@ -2953,6 +2955,8 @@ struct GpuQuad {
     int potW = 0;
     int potH = 0;
     bool blend = true;
+    GPU_TEXTURE_WRAP_PARAM wrapS = GPU_CLAMP_TO_EDGE;
+    GPU_TEXTURE_WRAP_PARAM wrapT = GPU_CLAMP_TO_EDGE;
     int clip[4] = {0, 0, kScreenW, kScreenH};
 };
 struct GpuTexEntry {
@@ -2970,6 +2974,8 @@ static std::vector<GpuQuad> g_gpuQuads;
 static std::map<uint64_t, GpuTexEntry> g_gpuTextures;
 static size_t   g_gpuTexCap = 3ull * 1024 * 1024;
 static uint64_t g_gpuTexTick = 0;
+static uint64_t g_gpuEvictFloor = 0;     // textures used at/after this tick are in flight
+static uint64_t g_gpuFrameStartTick = 0; // first tick of the frame being recorded
 static C3D_Tex   g_gpuWhite{};
 static bool      g_gpuWhiteValid = false;
 static DVLB_s*   g_gpuDvlb = nullptr;
@@ -2977,6 +2983,23 @@ static shaderProgram_s g_gpuProgram{};
 static bool      g_gpuProgramReady = false;
 static C3D_Tex   g_gpuBase{};
 static bool      g_gpuBaseValid = false;
+
+// PICA200 textures are not row-major: texels are grouped in 8x8 tiles (tiles in row-major
+// order), and inside a tile they follow a Morton/Z order.  C3D_TexUpload (C3D_TexLoadImage in
+// citro3d 1.7.1) is a plain memcpy into the texture's LINEAR buffer -- it neither swizzles nor
+// flushes the data cache -- so the caller must write the tiled layout and C3D_TexFlush it.
+// (Same as MKW-3DS, whose tex3ds/.t3x assets are pre-tiled and which flushes after every load.)
+// Memory row 0 is sampled at t=0; we store the image top row there so the guest's GX texcoords
+// (v=0 = top) are used unchanged.
+static inline uint32_t PicaMorton8(uint32_t x, uint32_t y) {
+    return (x & 1u) | ((y & 1u) << 1) | ((x & 2u) << 1) | ((y & 2u) << 2) |
+           ((x & 4u) << 2) | ((y & 4u) << 3);
+}
+static inline size_t PicaTiledIndex(int x, int y, int potW) {
+    const size_t tile = static_cast<size_t>(y >> 3) * static_cast<size_t>(potW >> 3) +
+                        static_cast<size_t>(x >> 3);
+    return (tile << 6) + PicaMorton8(static_cast<uint32_t>(x & 7), static_cast<uint32_t>(y & 7));
+}
 
 static void Gpu2dReleaseEntry(std::map<uint64_t, GpuTexEntry>::iterator it) {
     if (it->second.valid) {
@@ -3039,9 +3062,9 @@ static bool Gpu2dInit() {
     // A 1x1 white texel stands in for untextured quads so every draw uses one pipeline.
     static const uint16_t kWhite = 0xFFFFu;
     if (C3D_TexInit(&g_gpuWhite, 8, 8, GPU_RGBA5551)) {
-        uint16_t white8x8[64];
-        for (int i = 0; i < 64; ++i) white8x8[i] = kWhite;
-        C3D_TexUpload(&g_gpuWhite, white8x8);
+        uint16_t* dst = static_cast<uint16_t*>(g_gpuWhite.data);
+        for (int i = 0; i < 64; ++i) dst[i] = kWhite;
+        C3D_TexFlush(&g_gpuWhite);
         C3D_TexSetFilter(&g_gpuWhite, GPU_NEAREST, GPU_NEAREST);
         C3D_TexSetWrap(&g_gpuWhite, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
         g_gpuWhiteValid = true;
@@ -3065,6 +3088,7 @@ static bool Gpu2dInit() {
 //   unif=3          projection uniform slot
 //   ysign=1         canvas y -> screen y sign
 //   vflip=1         flip V on textured quads
+//   pnmtx=0         ignore the pane matrix (old, untranslated layout)
 //   scissor=1       per-quad scissor
 //   debug=0         silence the first-quad dump
 //   clear=FF00FF    forced clear colour
@@ -3104,6 +3128,7 @@ static bool Gpu2dReadConfig() {
         else if (std::strcmp(k, "unif") == 0) g_gpuProjUnif = static_cast<int>(n) & 3;
         else if (std::strcmp(k, "ysign") == 0) g_gpuYSpace = (n == 0) ? 0.0f : static_cast<float>(n);
         else if (std::strcmp(k, "vflip") == 0) g_gpuVFlip = on;
+        else if (std::strcmp(k, "pnmtx") == 0) g_gpuPnMtx = on;
         else if (std::strcmp(k, "scissor") == 0) g_gpuScissor = on;
         else if (std::strcmp(k, "debug") == 0) g_gpuDebugQuads = on ? 4u : 0u;
         else if (std::strcmp(k, "clear") == 0)
@@ -3113,9 +3138,9 @@ static bool Gpu2dReadConfig() {
     }
     std::fclose(fp);
     if (any) AppLog("[Gpu2d] config sdmc:/mkwii/gpu.cfg loaded: gpu=%d test=%d unif=%d ysign=%.1f "
-                    "vflip=%d scissor=%d debug=%u clear=%08X texmb=%zu\n",
+                    "vflip=%d pnmtx=%d scissor=%d debug=%u clear=%08X texmb=%zu\n",
                     g_gpu2d ? 1 : 0, g_gpuTestMode, g_gpuProjUnif, g_gpuYSpace,
-                    g_gpuVFlip ? 1 : 0, g_gpuScissor ? 1 : 0, g_gpuDebugQuads,
+                    g_gpuVFlip ? 1 : 0, g_gpuPnMtx ? 1 : 0, g_gpuScissor ? 1 : 0, g_gpuDebugQuads,
                     g_gpuClearOverride, g_gpuTexCap / (1024 * 1024));
     return any;
 }
@@ -3124,6 +3149,7 @@ static void Gpu2dConfigure() {
     g_gpu2d = std::getenv("MKW_NO_GPU2D") == nullptr;
     if (const char* ys = std::getenv("MKW_GPU_YSIGN")) g_gpuYSpace = std::stof(ys);
     g_gpuVFlip = std::getenv("MKW_GPU_VFLIP") != nullptr;
+    g_gpuPnMtx = std::getenv("MKW_GPU_NOPNMTX") == nullptr;
     g_gpuScissor = std::getenv("MKW_GPU_SCISSOR") != nullptr;
     if (const char* clr = std::getenv("MKW_GPU_CLEAR")) {
         g_gpuClearOverride = static_cast<uint32_t>(std::strtoul(clr, nullptr, 16)) << 8 | 0xFFu;
@@ -3201,8 +3227,11 @@ static C3D_Tex* Gpu2dAcquireTexture(uint64_t key, const DecodedTex& dt,
     }
     const size_t bytes = static_cast<size_t>(potW) * potH * 2u; // RGB565 / RGBA4 are both 16bpp
     while (g_gpuTexBytes + bytes > g_gpuTexCap && !g_gpuTextures.empty()) {
+        // Quads recorded this frame hold raw C3D_Tex pointers, and the previous frame's
+        // command list may still be sampling its textures, so neither may be deleted.
         auto victim = g_gpuTextures.end();
         for (auto scan = g_gpuTextures.begin(); scan != g_gpuTextures.end(); ++scan) {
+            if (scan->second.lastUse >= g_gpuEvictFloor) continue;
             if (victim == g_gpuTextures.end() || scan->second.lastUse < victim->second.lastUse)
                 victim = scan;
         }
@@ -3211,10 +3240,22 @@ static C3D_Tex* Gpu2dAcquireTexture(uint64_t key, const DecodedTex& dt,
         Gpu2dReleaseEntry(victim);
     }
 
-    std::vector<uint16_t> packed(static_cast<size_t>(potW) * potH, 0u);
+    GpuTexEntry entry;
+    const GPU_TEXCOLOR fmt = opaque ? GPU_RGB565 : GPU_RGBA4;
+    if (!C3D_TexInit(&entry.tex, potW, potH, fmt)) {
+        AppLog("[Gpu2d] C3D_TexInit failed %dx%d (have %zuKB)\n", potW, potH, g_gpuTexBytes / 1024);
+        return nullptr;
+    }
+    // Write the tiled texels straight into the texture's LINEAR buffer (see PicaTiledIndex),
+    // padding included, then flush so the GPU does not sample stale cache lines.  Writing
+    // row-major data through C3D_TexUpload without a flush is what produced the "empty"
+    // (all-zero) textures earlier: the bytes were still sitting in the ARM11 data cache.
+    uint16_t* dst = static_cast<uint16_t*>(entry.tex.data);
+    std::memset(dst, 0, bytes);
     for (int y = 0; y < dt.height; ++y) {
+        const uint32_t* src = dt.rgba.data() + static_cast<size_t>(y) * dt.width;
         for (int x = 0; x < dt.width; ++x) {
-            const uint32_t c = dt.rgba[static_cast<size_t>(y) * dt.width + x];
+            const uint32_t c = src[x];
             const uint32_t r = (c >> 24) & 0xFFu;
             const uint32_t g = (c >> 16) & 0xFFu;
             const uint32_t b = (c >> 8)  & 0xFFu;
@@ -3225,34 +3266,20 @@ static C3D_Tex* Gpu2dAcquireTexture(uint64_t key, const DecodedTex& dt,
             } else {
                 v = static_cast<uint16_t>(((r >> 4) << 12) | ((g >> 4) << 8) | ((b >> 4) << 4) | (a >> 4));
             }
-            packed[static_cast<size_t>(y) * potW + x] = v;
+            dst[PicaTiledIndex(x, y, potW)] = v;
         }
     }
-
-    GpuTexEntry entry;
-    const GPU_TEXCOLOR fmt = opaque ? GPU_RGB565 : GPU_RGBA4;
-    if (!C3D_TexInit(&entry.tex, potW, potH, fmt)) {
-        AppLog("[Gpu2d] C3D_TexInit failed %dx%d (have %zuKB)\n", potW, potH, g_gpuTexBytes / 1024);
-        return nullptr;
-    }
-    // C3D_TexUpload converts the image with a GPU transfer, so the source must be LINEAR memory.
-    // A plain heap buffer silently produced an EMPTY texture: the layout quads then modulated
-    // texture(0,0,0,0) into the framebuffer and vanished under alpha blending, while the white
-    // reference texture (uploaded the same way, but 8x8 of 0xFFFF) still worked.
-    void* staging = linearAlloc(bytes);
-    if (staging) {
-        std::memcpy(staging, packed.data(), bytes);
-        // linearAlloc memory is cache-coherent for CPU writes on the 3DS;
-        C3D_TexUpload(&entry.tex, staging);
-        linearFree(staging);
-    } else {
-        AppLog("[Gpu2d] linearAlloc(%zu) failed, uploading from the heap\n", bytes);
-        C3D_TexUpload(&entry.tex, packed.data());
-    }
-    AppLog("[Gpu2d] upload pot=%dx%d %s texel0=%04X texel1=%04X region=%dx%d",
-        potW, potH, opaque ? "RGB565" : "RGBA4", packed.empty() ? 0u : packed[0],
-        packed.size() < 2 ? 0u : packed[1], dt.width, dt.height);
-    AppLog("\n");
+    // Clamp-to-edge samples the padding at the image border; replicate the last row/column
+    // into it so bilinear filtering at the right/bottom edge does not fade to transparent black.
+    for (int y = 0; y < dt.height; ++y)
+        for (int x = dt.width; x < potW; ++x)
+            dst[PicaTiledIndex(x, y, potW)] = dst[PicaTiledIndex(dt.width - 1, y, potW)];
+    for (int y = dt.height; y < potH; ++y)
+        for (int x = 0; x < potW; ++x)
+            dst[PicaTiledIndex(x, y, potW)] = dst[PicaTiledIndex(x, dt.height - 1, potW)];
+    C3D_TexFlush(&entry.tex);
+    AppLog("[Gpu2d] upload pot=%dx%d %s texel0=%04X region=%dx%d\n",
+        potW, potH, opaque ? "RGB565" : "RGBA4", dst[0], dt.width, dt.height);
     C3D_TexSetFilter(&entry.tex, GPU_LINEAR, GPU_LINEAR);
     C3D_TexSetWrap(&entry.tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
     entry.valid = true;
@@ -3284,9 +3311,23 @@ static int SelectTexSlotFor2D() {
 static void Gpu2dRecordQuad(const GxVertex v[4]) {
     if (g_gpuQuads.size() >= 8192) return;
     GpuQuad q;
+    // nw4r::lyt hands DrawQuad the pane's *local* rectangle (anchored at its base position) and
+    // loads the pane's global matrix (view * parents * local SRT) with GXLoadPosMtxImm just
+    // before.  Dropping that matrix is what made the title look "vertically mirrored": the
+    // two halves of the background and the logo pieces all sat at their local origins (e.g. the
+    // logo at y 0..-140, i.e. below centre), and the mirrored logo halves -- drawn with a
+    // negative-scale matrix -- lost their flip, which is why they appeared to carry pre-flipped
+    // UVs.  The software rasteriser still forces identity for ortho draws (pnmtx=0 = same).
+    const float* M = g_gx.pnMtx[g_gx.currentPnMtx < 10 ? g_gx.currentPnMtx : 0];
     for (int i = 0; i < 4; ++i) {
+        float pos[3] = {v[i].pos[0], v[i].pos[1], v[i].pos[2]};
+        if (g_gpuPnMtx) {
+            pos[0] = M[0] * v[i].pos[0] + M[1] * v[i].pos[1] + M[2]  * v[i].pos[2] + M[3];
+            pos[1] = M[4] * v[i].pos[0] + M[5] * v[i].pos[1] + M[6]  * v[i].pos[2] + M[7];
+            pos[2] = M[8] * v[i].pos[0] + M[9] * v[i].pos[1] + M[10] * v[i].pos[2] + M[11];
+        }
         float sx = 0.0f, sy = 0.0f;
-        if (!Project2DPoint(v[i].pos, &sx, &sy)) return;
+        if (!Project2DPoint(pos, &sx, &sy)) return;
         q.v[i].x = sx;
         q.v[i].y = sy;
         q.v[i].u = v[i].hasUv0 ? v[i].uv0[0] : 0.0f;
@@ -3308,6 +3349,14 @@ static void Gpu2dRecordQuad(const GxVertex v[4]) {
             for (const auto& entry : g_gpuTextures) {
                 if (&entry.second.tex == tex) { q.potW = entry.second.potW; q.potH = entry.second.potH; }
             }
+            // GX wrap (0 clamp, 1 repeat, 2 mirror) only maps onto the PICA when the axis is not
+            // padded; the menu's tiled patterns (e.g. the 32x32 one drawn with v 0..30) are POT.
+            auto pica = [](uint32_t gxWrap, bool unpadded) {
+                if (!unpadded) return GPU_CLAMP_TO_EDGE;
+                return gxWrap == 1 ? GPU_REPEAT : gxWrap == 2 ? GPU_MIRRORED_REPEAT : GPU_CLAMP_TO_EDGE;
+            };
+            q.wrapS = pica(slot.wrapS, q.uScale == 1.0f);
+            q.wrapT = pica(slot.wrapT, q.vScale == 1.0f);
         }
     }
     // test=2 draws the real layout with the white texture substituted, to separate "the geometry
@@ -3353,16 +3402,20 @@ static bool Gpu2dUploadBase() {
         C3D_TexSetWrap(&g_gpuBase, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
         g_gpuBaseValid = true;
     }
-    static std::vector<uint16_t> packed(static_cast<size_t>(kPotW) * kPotH);
+    // Tiled straight into the texture's LINEAR buffer (FrameBegin(SYNCDRAW) has already waited
+    // for the previous frame, so the GPU is not reading it), then flushed.
+    uint16_t* dst = static_cast<uint16_t*>(g_gpuBase.data);
     for (int y = 0; y < kScreenH; ++y) {
+        const uint32_t* src = g_fbColor + static_cast<size_t>(y) * kScreenW;
         for (int x = 0; x < kScreenW; ++x) {
-            const uint32_t c = g_fbColor[static_cast<size_t>(y) * kScreenW + x];
+            const uint32_t c = src[x];
             const uint32_t r = (c >> 24) & 0xFFu, g = (c >> 16) & 0xFFu, b = (c >> 8) & 0xFFu;
-            packed[static_cast<size_t>(y) * kPotW + x] =
+            dst[PicaTiledIndex(x, y, kPotW)] =
                 static_cast<uint16_t>(((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3));
         }
     }
-    C3D_TexUpload(&g_gpuBase, packed.data());
+    C3D_TexFlush(&g_gpuBase);
+    ++g_gpuBaseUploads;
     return true;
 }
 
@@ -3471,6 +3524,9 @@ static void Gpu2dRender() {
                            static_cast<uint32_t>(std::min(kScreenH, q.clip[3])));
         }
         if (!q.blend) C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+        // Wrap is part of the texture's param word, which citro3d reads when the draw is
+        // emitted, so set it right before binding (one texture can be drawn both ways).
+        if (tex != &g_gpuWhite) C3D_TexSetWrap(tex, q.wrapS, q.wrapT);
         C3D_TexBind(0, tex);
         C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
         for (int i = 0; i < 4; ++i) {
@@ -3521,6 +3577,9 @@ static void Gpu2dRender() {
     }
     C3D_FrameEnd(0);
     g_gpuQuads.clear();
+    // The frame just submitted is now in flight; the next one starts recording.
+    g_gpuEvictFloor = g_gpuFrameStartTick;
+    g_gpuFrameStartTick = g_gpuTexTick + 1;
 }
 
 #endif // __3DS__
@@ -8547,14 +8606,16 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 ? Memory::Read32(scene + 4) : 0u;
             AppLog(" nextSec=%u sceneState=%u hostHeapFree=%zuKB texCache=%zuKB"
                    " texDecode=%u texHit=%u texEvict=%u texTexels=%u gpu2d=%u quads=%u drawn=%u"
-                   " vram=%zuKB up=%u gev=%u\n",
+                   " vram=%zuKB up=%u gev=%u base=%u\n",
                 nextSec, sceneState, HostHeapFreeKb(), gx_bridge::g_texCacheBytes / 1024,
                 gx_bridge::g_texStatDecodes, gx_bridge::g_texStatHits,
                 gx_bridge::g_texStatEvictions, static_cast<uint32_t>(gx_bridge::g_texStatTexels),
                 gx_bridge::Gpu2dActive() ? 1u : 0u, gx_bridge::g_gpuQuadsRecorded,
                 gx_bridge::g_gpuQuadsDrawn, gx_bridge::g_gpuTexBytes / 1024,
-                gx_bridge::g_gpuTexUploads, gx_bridge::g_gpuTexEvictions);
+                gx_bridge::g_gpuTexUploads, gx_bridge::g_gpuTexEvictions,
+                gx_bridge::g_gpuBaseUploads);
             gx_bridge::g_gpuQuadsRecorded = 0;
+            gx_bridge::g_gpuBaseUploads = 0;
             gx_bridge::g_texStatDecodes = 0;
             gx_bridge::g_texStatHits = 0;
             gx_bridge::g_texStatEvictions = 0;
@@ -9495,10 +9556,21 @@ void WriteResolvedFallbackFloat32(uint32_t address, double value)
 void WriteFloat32Slow(uint32_t address, double)
 {
     if (address < 0x10000) return;
-    const CpuContext* cpu = TryGetCpuContext();
-    std::fprintf(stderr, "Unmapped float32 write: %08lX pc=%08X lr=%08X\n",
-        static_cast<unsigned long>(address), cpu ? cpu->pc : 0, cpu ? cpu->lr : 0);
-    std::abort();
+    // Unmapped 32-bit writes elsewhere in the memory model are ignored, so an abort here was
+    // inconsistent: a guest store through a garbage pointer (title-page teardown feeds a
+    // double's bit pattern into an AnimationGroup transform pointer) killed the whole run and
+    // stopped the link loop.  Report the first few and carry on.
+    static uint32_t s_reported = 0;
+    static uint32_t s_seen[8] = {};
+    for (uint32_t i = 0; i < s_reported; ++i) {
+        if (s_seen[i] == address) return;
+    }
+    if (s_reported < 8) {
+        s_seen[s_reported++] = address;
+        const CpuContext* cpu = TryGetCpuContext();
+        std::fprintf(stderr, "Unmapped float32 write: %08lX pc=%08X lr=%08X (ignored)\n",
+            static_cast<unsigned long>(address), cpu ? cpu->pc : 0, cpu ? cpu->lr : 0);
+    }
 }
 }
 
