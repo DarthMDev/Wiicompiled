@@ -3770,7 +3770,12 @@ static void Gpu2dRender() {
     }
     g_gpuQuadsDrawn = 0;
     if (g_gpuTestMode == 3) {
-        C3D_TexBind(0, g_gpuWhiteValid ? &g_gpuWhite : nullptr);
+        // Isolate vertex fetch and rasterization from texture sampling and alpha blending.
+        C3D_TexEnv* env = C3D_GetTexEnv(0);
+        C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
+        C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+        AppLog("[Gpu2d] VBO reference using primary color, blending disabled\n");
         C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
         ++g_gpuQuadsDrawn;
         C3D_FrameEnd(0);
