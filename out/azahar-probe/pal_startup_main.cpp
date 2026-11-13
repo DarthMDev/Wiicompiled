@@ -2960,9 +2960,13 @@ static bool Gpu2dInit() {
         GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) |
         GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
 
+    // C3D_ImmSendAttrib always emits a vec4, so every attribute must be declared 4 floats wide:
+    // the vertex stride citro3d programs is the sum of the declared sizes, and declaring 3+2+4
+    // while sending 12 floats per vertex shifts every attribute (positions came out garbage, so
+    // nothing was visible).
     C3D_AttrInfo* ai = C3D_GetAttrInfo();
-    AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 3); // position (pixels)
-    AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 2); // texcoord
+    AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 4); // position (pixels, w = 1)
+    AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 4); // texcoord (u, v, 0, 0)
     AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 4); // vertex colour (tint)
 
     // Layout quads are vertex * texture, straight through the first TEV stage.
@@ -3212,7 +3216,7 @@ static void Gpu2dRender() {
         const float us[4] = {0.0f, su, 0.0f, su};
         const float vs[4] = {0.0f, 0.0f, sv, sv};
         for (int i = 0; i < 4; ++i) {
-            C3D_ImmSendAttrib(xs[i], ys[i], 0.0f, 0.0f);
+            C3D_ImmSendAttrib(xs[i], ys[i], 0.0f, 1.0f);
             C3D_ImmSendAttrib(us[i], vs[i], 0.0f, 0.0f);
             C3D_ImmSendAttrib(1.0f, 1.0f, 1.0f, 1.0f);
         }
@@ -3241,7 +3245,7 @@ static void Gpu2dRender() {
         C3D_TexBind(0, tex);
         C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
         for (int i = 0; i < 4; ++i) {
-            C3D_ImmSendAttrib(q.v[i].x, q.v[i].y, 0.0f, 0.0f);
+            C3D_ImmSendAttrib(q.v[i].x, q.v[i].y, 0.0f, 1.0f);
             C3D_ImmSendAttrib(q.v[i].u * uScale, q.v[i].v * vScale, 0.0f, 0.0f);
             C3D_ImmSendAttrib(q.v[i].r, q.v[i].g, q.v[i].b, q.v[i].a);
         }
