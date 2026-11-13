@@ -93,6 +93,19 @@ static constexpr uint32_t kLockedCacheBase = 0xE0000000u;
 alignas(32) static uint8_t g_lockedCache[16 * 1024];
 static uint32_t g_lockedCacheDmaUpper = 0;
 
+#ifdef __3DS__
+#include <malloc.h>
+// Host heap headroom.  The port maps guest MEM1+MEM2 with calloc from this same heap, so on an Old
+// 3DS there is very little left; anything that allocates at runtime (texture cache, NAND buffers)
+// silently aborts the app when this reaches zero.  Logging it makes that visible.
+static size_t HostHeapFreeKb() {
+    struct mallinfo mi = mallinfo();
+    return static_cast<size_t>(mi.fordblks) / 1024;
+}
+#else
+static size_t HostHeapFreeKb() { return 0; }
+#endif
+
 static void AppLog(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
@@ -428,8 +441,9 @@ int main()
 #endif
     bool pass = false;
     if (prepare_memory()) {
-        AppLog("Guest RAM: PASS (MEM1=%uM MEM2=%uM)\n",
-            (unsigned)(guestSize / 1024 / 1024), (unsigned)(mem2Size / 1024 / 1024));
+        AppLog("Guest RAM: PASS (MEM1=%uM MEM2=%uM, host heap free %zuM)\n",
+            (unsigned)(guestSize / 1024 / 1024), (unsigned)(mem2Size / 1024 / 1024),
+            HostHeapFreeKb() / 1024);
         // PAL boot information expected by the SDK.
         Memory::Write32(0x80000000u, 0x524D4350u);
         Memory::Write32(0x80000004u, 0x30310100u);
@@ -693,7 +707,15 @@ struct DecodedTex {
 static std::map<uint64_t, DecodedTex> g_texCache;
 static size_t g_texCacheBytes = 0;
 static void BuildMipChain(DecodedTex& tex);
-static constexpr size_t kMaxTexCacheBytes = 6 * 1024 * 1024; // 6 MiB budget on Old 3DS
+#ifdef __3DS__
+// The Old 3DS app region is what is left after guest MEM1+MEM2 and our own code, so keep the
+// texture cache small: it is a pure cache, and running out of *host* heap here aborts the port
+// (that is what killed the section-63 run at frame 84 while RKSYS::Mgr::LoadTask allocated its
+// 2.8 MiB save buffer).
+static constexpr size_t kMaxTexCacheBytes = 3 * 1024 * 1024; // 3 MiB budget on Old 3DS
+#else
+static constexpr size_t kMaxTexCacheBytes = 6 * 1024 * 1024;
+#endif
 
 struct TexSlot {
     uint32_t dataAddr = 0;
@@ -4436,12 +4458,30 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         std::string path;
         size_t pos = 0;
     };
+    // Only *written* data is kept in the host heap; read-only NAND files (rksys.dat is 2.8 MiB) are
+    // streamed straight from disk on each NANDRead.  Keeping a host-side copy of the save cost more
+    // heap than the Old 3DS has left once the guest arenas are mapped.
     static std::map<std::string, std::vector<uint8_t>> s_nandStore;
     static std::map<std::string, bool> s_nandLoaded;
+    static std::map<std::string, std::string> s_nandDisk;
     static std::map<uint32_t, NandFile> s_nandOpen;
     static uint32_t s_nandNextFd = 0x500;
+    auto nandFileSize = [](const std::string& path) -> size_t {
+        auto st = s_nandStore.find(path);
+        if (st != s_nandStore.end() && !st->second.empty()) return st->second.size();
+        auto dsk = s_nandDisk.find(path);
+        if (dsk == s_nandDisk.end()) return 0;
+        FILE* fp = std::fopen(dsk->second.c_str(), "rb");
+        if (!fp) return 0;
+        std::fseek(fp, 0, SEEK_END);
+        const long size = std::ftell(fp);
+        std::fclose(fp);
+        return size > 0 ? static_cast<size_t>(size) : 0;
+    };
     auto nandLoad = [](const std::string& path) -> bool {
-        if (s_nandLoaded[path]) return s_nandStore.find(path) != s_nandStore.end();
+        if (s_nandLoaded[path]) {
+            return s_nandStore.find(path) != s_nandStore.end() || s_nandDisk.find(path) != s_nandDisk.end();
+        }
         s_nandLoaded[path] = true;
         if (path.find("rksys.dat") == std::string::npos) return false;
         const char* candidates[] = {
@@ -4455,17 +4495,12 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             if (!fp) continue;
             std::fseek(fp, 0, SEEK_END);
             const long size = std::ftell(fp);
-            std::fseek(fp, 0, SEEK_SET);
-            if (size > 0) {
-                std::vector<uint8_t>& data = s_nandStore[path];
-                data.resize(static_cast<size_t>(size));
-                const size_t got = std::fread(data.data(), 1, data.size(), fp);
-                data.resize(got);
-                std::fclose(fp);
-                AppLog("[NAND] loaded '%s' from %s (%zu bytes)\n", path.c_str(), candidate, got);
-                return got != 0;
-            }
             std::fclose(fp);
+            if (size > 0) {
+                s_nandDisk[path] = candidate;
+                AppLog("[NAND] '%s' -> %s (%ld bytes, streamed from disk)\n", path.c_str(), candidate, size);
+                return true;
+            }
         }
         return false;
     };
@@ -6615,7 +6650,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             Memory::Write8(info + 8, 1);
             Memory::Write8(info + 9, 0);
             AppLog("[NAND] NANDOpen: '%s' mode=%u -> fd=%u size=%zu\n",
-                path.c_str(), cpu->gpr[5], fd, s_nandStore[path].size());
+                path.c_str(), cpu->gpr[5], fd, nandFileSize(path));
             cpu->gpr[3] = 0;
         } else {
             AppLog("[NAND] NANDOpen: '%s' mode=%u -> missing\n", path.c_str(), cpu->gpr[5]);
@@ -6684,27 +6719,57 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 cpu->gpr[3], fd, cpu->gpr[5], mit != s_nandOpen.end() ? 1 : 0);
         }
         if (mit == s_nandOpen.end()) { cpu->gpr[3] = nandMissing; return true; }
-        const std::vector<uint8_t>& data = s_nandStore[mit->second.path];
+        const std::string& fpath = mit->second.path;
         const uint32_t buf = cpu->gpr[4];
         uint32_t len = cpu->gpr[5];
-        size_t pos = mit->second.pos;
-        if (pos >= data.size()) { cpu->gpr[3] = 0; return true; }
-        if (len > data.size() - pos) len = static_cast<uint32_t>(data.size() - pos);
-        if (Memory::Contains(buf, len)) {
-            for (uint32_t i = 0; i < len; ++i) Memory::Write8(buf + i, data[pos + i]);
+        const size_t pos = mit->second.pos;
+        const size_t total = nandFileSize(fpath);
+        if (pos >= total) { cpu->gpr[3] = 0; return true; }
+        if (len > total - pos) len = static_cast<uint32_t>(total - pos);
+        auto storeIt = s_nandStore.find(fpath);
+        const bool inMemory = storeIt != s_nandStore.end() && !storeIt->second.empty();
+        bool copied = false;
+        uint32_t hdr = 0;
+        int hdrN = 0;
+        if (inMemory) {
+            const std::vector<uint8_t>& data = storeIt->second;
+            if (Memory::Contains(buf, len)) {
+                for (uint32_t i = 0; i < len; ++i) Memory::Write8(buf + i, data[pos + i]);
+                copied = true;
+            }
+            for (int i = 0; i < 4 && pos + static_cast<size_t>(i) < data.size(); ++i) {
+                hdr = (hdr << 8) | data[pos + i];
+            }
         } else {
-            len = 0;
+            auto dsk = s_nandDisk.find(fpath);
+            FILE* fp = dsk != s_nandDisk.end() ? std::fopen(dsk->second.c_str(), "rb") : nullptr;
+            if (fp && Memory::Contains(buf, len)) {
+                std::fseek(fp, static_cast<long>(pos), SEEK_SET);
+                uint8_t chunk[4096];
+                uint32_t done = 0;
+                while (done < len) {
+                    const uint32_t want = (len - done) < sizeof(chunk) ? (len - done) : static_cast<uint32_t>(sizeof(chunk));
+                    const size_t got = std::fread(chunk, 1, want, fp);
+                    if (got == 0) break;
+                    for (size_t i = 0; i < got; ++i) {
+                        const uint8_t byte = chunk[i];
+                        Memory::Write8(buf + done + static_cast<uint32_t>(i), byte);
+                        if (hdrN < 4) { hdr = (hdr << 8) | byte; ++hdrN; }
+                    }
+                    done += static_cast<uint32_t>(got);
+                }
+                len = done;
+                copied = true;
+            }
+            if (fp) std::fclose(fp);
         }
+        if (!copied) len = 0;
         mit->second.pos = pos + len;
         static uint32_t s_nandCopyLogs = 0;
         if (s_nandCopyLogs < 6) {
             ++s_nandCopyLogs;
-            uint32_t hdr = 0;
-            for (int i = 0; i < 4 && pos + i < data.size(); ++i) {
-                hdr = (hdr << 8) | data[pos + i];
-            }
-            AppLog("[NAND] Read -> %u bytes (pos=%zu size=%zu) first4=%08X\n",
-                len, pos, data.size(), hdr);
+            AppLog("[NAND] Read -> %u bytes (pos=%zu size=%zu) first4=%08X (%s)\n",
+                len, pos, total, hdr, inMemory ? "mem" : "disk");
         }
         // The SDK returns the byte count; MKW_READ_RET0=1 tests the status-code hypothesis.
         cpu->gpr[3] = std::getenv("MKW_READ_RET0") ? 0u : len;
@@ -6718,6 +6783,24 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         const uint32_t buf = cpu->gpr[4];
         const uint32_t len = cpu->gpr[5];
         const size_t pos = mit->second.pos;
+        if (data.empty()) {
+            // First write to a disk-backed file: pull it into memory once (writes are rare).
+            auto dsk = s_nandDisk.find(mit->second.path);
+            if (dsk != s_nandDisk.end()) {
+                FILE* fp = std::fopen(dsk->second.c_str(), "rb");
+                if (fp) {
+                    std::fseek(fp, 0, SEEK_END);
+                    const long size = std::ftell(fp);
+                    std::fseek(fp, 0, SEEK_SET);
+                    if (size > 0) {
+                        data.resize(static_cast<size_t>(size));
+                        const size_t got = std::fread(data.data(), 1, data.size(), fp);
+                        data.resize(got);
+                    }
+                    std::fclose(fp);
+                }
+            }
+        }
         if (pos + len > data.size()) data.resize(pos + len, 0);
         if (Memory::Contains(buf, len)) {
             for (uint32_t i = 0; i < len; ++i) data[pos + i] = Memory::Read8(buf + i);
@@ -6734,14 +6817,14 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         const uint32_t fd = nandInfoFd(cpu->gpr[3]);
         auto mit = s_nandOpen.find(fd);
         if (mit == s_nandOpen.end()) { cpu->gpr[3] = nandMissing; return true; }
-        const std::vector<uint8_t>& data = s_nandStore[mit->second.path];
+        const size_t totalSize = nandFileSize(mit->second.path);
         const int32_t offset = static_cast<int32_t>(cpu->gpr[4]);
         int64_t base = 0;
         if (cpu->gpr[5] == 1) base = static_cast<int64_t>(mit->second.pos);
-        else if (cpu->gpr[5] == 2) base = static_cast<int64_t>(data.size());
+        else if (cpu->gpr[5] == 2) base = static_cast<int64_t>(totalSize);
         int64_t next = base + offset;
         if (next < 0) next = 0;
-        if (next > static_cast<int64_t>(data.size())) next = static_cast<int64_t>(data.size());
+        if (next > static_cast<int64_t>(totalSize)) next = static_cast<int64_t>(totalSize);
         mit->second.pos = static_cast<size_t>(next);
         cpu->gpr[3] = static_cast<uint32_t>(next);
         return true;
@@ -6753,7 +6836,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         auto mit = s_nandOpen.find(fd);
         if (mit == s_nandOpen.end()) { cpu->gpr[3] = nandMissing; return true; }
         if (Memory::Contains(cpu->gpr[4], 4)) {
-            Memory::Write32(cpu->gpr[4], static_cast<uint32_t>(s_nandStore[mit->second.path].size()));
+            Memory::Write32(cpu->gpr[4], static_cast<uint32_t>(nandFileSize(mit->second.path)));
         }
         cpu->gpr[3] = 0;
         return true;
@@ -7653,8 +7736,9 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
         if (s_frameCount >= 82 && s_frameCount <= 92) {
 #ifdef __3DS__
-            AppLog("[FrameMarker] frame=%u appFree=%zuKB\n", s_frameCount,
-                static_cast<size_t>(osGetMemRegionFree(MEMREGION_APPLICATION) / 1024));
+            AppLog("[FrameMarker] frame=%u appFree=%zuKB hostHeapFree=%zuKB texCache=%zuKB\n", s_frameCount,
+                static_cast<size_t>(osGetMemRegionFree(MEMREGION_APPLICATION) / 1024),
+                HostHeapFreeKb(), gx_bridge::g_texCacheBytes / 1024);
 #else
             AppLog("[FrameMarker] frame=%u\n", s_frameCount);
 #endif
