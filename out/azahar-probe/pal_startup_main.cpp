@@ -8,6 +8,8 @@ extern "C" {
 #include <cstdarg>
 #include <cstring>
 #include <set>
+
+static uint32_t* g_padCallCounts = nullptr;
 #include <strings.h>
 #include <bit>
 #include <cstdlib>
@@ -3674,13 +3676,21 @@ static uint32_t ScriptedPadButtons(ScriptPadKind kind)
         return 0;
     }
     uint32_t out = 0;
+    // MKW_PRESS_LEN widens the scripted window (default 3 frames); a longer window guarantees a
+    // fresh press edge for the guest's "press a button to connect your pad" binding logic, which
+    // only samples the edge on the frames it happens to run.
+    uint32_t len = 3;
+    if (const char* s = std::getenv("MKW_PRESS_LEN")) {
+        const long v = std::strtol(s, nullptr, 10);
+        if (v > 0 && v < 100000) len = static_cast<uint32_t>(v);
+    }
     if (const char* s = std::getenv("MKW_PRESS_A")) {
         const long at = std::strtol(s, nullptr, 10);
-        if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + 3) out |= kA;
+        if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + len) out |= kA;
     }
     if (const char* s = std::getenv("MKW_PRESS_START")) {
         const long at = std::strtol(s, nullptr, 10);
-        if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + 3) out |= kStart;
+        if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + len) out |= kStart;
     }
     return out;
 }
@@ -4233,6 +4243,54 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 target, cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0,
                 cpu ? cpu->lr : 0, gx_bridge::g_gxFrame);
         }
+    }
+    switch (target) {
+    case 0x8061B6ECu: case 0x8061BCC8u: case 0x8061B490u: case 0x8061AF20u:
+    case 0x8061B3CCu: case 0x8061B398u: case 0x8061B9A0u: case 0x8061B338u:
+    case 0x80524264u: case 0x8061B7C4u: case 0x8061BA48u: case 0x8061BFFCu:
+    case 0x805238F0u: case 0x805237E8u: case 0x80523520u: case 0x80523690u:
+    case 0x8051FC84u: case 0x805201B0u: case 0x80522690u: case 0x80524628u:
+    case 0x80524788u: case 0x80523724u: case 0x8051F308u: case 0x8051F22Cu:
+    case 0x80520118u: case 0x80521110u: case 0x80521768u: case 0x805242D8u:
+    case 0x80523EBCu: case 0x80521554u:
+    {
+        static std::set<uint64_t> s_padSeen;
+        static const char* const kPadNames[] = {
+            "SectionPad::RequestPad", "SectionPad::ResetAllPads", "SectionPad::SetID",
+            "SectionPad::Update", "SectionPad::HasAController", "SectionPad::GetControllerHolder",
+            "SectionPad::ResetPadsStatus", "SectionPad::ResetPadsStatusAndSet0x54",
+            "In::Manager::ResetRealController", "SectionPad::ResetPad", "SectionPad::HasControllerChanged",
+            "Pages::RecognizePad::__ct", "In::Manager::Update", "In::Manager::UpdateControllers",
+            "In::Manager::Init", "In::Manager::Prepare", "In::WiiController::UpdateImpl",
+            "In::GCNController::UpdateImpl", "In::Manager::ResetKPAD", "In::Manager::CopyPADStatus",
+            "In::Manager::SyncWiimotes", "In::Manager::ResetSelfWiiAndGCN", "In::Controller::Init",
+            "In::WiiController::Init", "In::GCNController::Init", "In::Holder::Init",
+            "In::RealHolder::Update", "In::Manager::InitControllerHolders",
+            "In::Manager::TrySetController", "In::RealHolder::SetController"};
+        static const uint32_t kPadAddrs[] = {
+            0x8061B6ECu, 0x8061BCC8u, 0x8061B490u, 0x8061AF20u, 0x8061B3CCu, 0x8061B398u,
+            0x8061B9A0u, 0x8061B338u, 0x80524264u, 0x8061B7C4u, 0x8061BA48u, 0x8061BFFCu,
+            0x805238F0u, 0x805237E8u, 0x80523520u, 0x80523690u, 0x8051FC84u, 0x805201B0u,
+            0x80522690u, 0x80524628u, 0x80524788u, 0x80523724u, 0x8051F308u, 0x8051F22Cu,
+            0x80520118u, 0x80521110u, 0x80521768u, 0x805242D8u, 0x80523EBCu, 0x80521554u};
+        const char* nm = "?";
+        for (int i = 0; i < 30; ++i) if (kPadAddrs[i] == target) nm = kPadNames[i];
+        {
+            static uint32_t s_padCalls[30] = {0};
+            for (int i = 0; i < 30; ++i) if (kPadAddrs[i] == target) { ++s_padCalls[i]; break; }
+            g_padCallCounts = &s_padCalls[0];
+        }
+        const uint32_t ths = cpu ? cpu->gpr[3] : 0;
+        const uint64_t key = (static_cast<uint64_t>(target) << 32) ^ (static_cast<uint64_t>(ths) << 16) ^
+            (cpu ? cpu->gpr[4] : 0) ^ (static_cast<uint64_t>(cpu ? cpu->lr : 0) << 40);
+        if (s_padSeen.size() < 60 && s_padSeen.insert(key).second) {
+            AppLog("[Pad] %s(%08X) this=%08X r4=%08X r5=%08X lr=%08X frame=%u\n", nm, target,
+                ths, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0, cpu ? cpu->lr : 0,
+                gx_bridge::g_gxFrame);
+        }
+        break;
+    }
+    default: break;
     }
     if (target == 0x80623390u || target == 0x80601A60u) { // Section::CreatePageById / Page::Init
         static std::set<uint64_t> s_seenPage;
@@ -7602,12 +7660,152 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 #endif
             std::fflush(stdout);
         }
+        if (s_frameCount == 150) {
+            const uint32_t o1 = 0x8042AA6Cu;
+            const uint32_t o2 = 0x8042AAACu;
+            if (Memory::Contains(o1, 64) && Memory::Contains(o2, 64)) {
+                AppLog("[PadSys] objA=%08X x(A+4)=%08X\n", o1, Memory::Read32(o1 + 4));
+                for (int i = 0; i < 12; ++i) {
+                    AppLog("[PadSys]   A+%02X=%08X\n", i * 4, Memory::Read32(o1 + i * 4));
+                }
+                for (int i = 0; i < 12; ++i) {
+                    AppLog("[PadSys]   B+%02X=%08X\n", i * 4, Memory::Read32(o2 + i * 4));
+                }
+            }
+        }
+        if (s_frameCount == 92) {
+            const uint32_t M = Memory::Read32(0x809BD70Cu);
+            const uint32_t S = Memory::Read32(0x809C1E38u);
+            if (M && S && Memory::Contains(M, 20000) && Memory::Contains(S + 52, 32)) {
+                const uint32_t sp = S + 52;
+                AppLog("[PadMap] M=%08X S=%08X S+16(holder)=%08X\n", M, sp, Memory::Read32(sp + 16));
+                for (int k = 0; k < 2; ++k) {
+                    for (int off = 0; off <= 16; off += 4) {
+                        const uint32_t c = M + 236 * k + off;
+                        const uint32_t v = Memory::Contains(c, 4) ? Memory::Read32(c) : 0;
+                        AppLog("[PadMap]   M+%d*236+%02d = %08X vtbl=%08X\n", k, off, v,
+                            (v && Memory::Contains(v, 4)) ? Memory::Read32(v) : 0);
+                    }
+                }
+            }
+        }
+        if (s_frameCount >= 83 && s_frameCount <= 95) {
+            const uint32_t mgr2 = Memory::Read32(0x809BD70Cu);
+            const uint32_t pad2 = Memory::Read32(0x809C1E38u);
+            if (mgr2 && Memory::Contains(mgr2, 20000) && pad2 && Memory::Contains(pad2 + 52, 32)) {
+                const uint32_t g0 = mgr2 + 15264;
+                const uint32_t hold2 = Memory::Read32(pad2 + 52 + 16);
+                const uint32_t ctrl2 = (hold2 && Memory::Contains(hold2 + 12, 4)) ? Memory::Read32(hold2 + 8) : 0;
+                AppLog("[PadEdge] f=%u gcn0.btn=%04X gcn0.prev=%04X gcn0.conn=%u wii0.btn=%04X "
+                       "pad.state=%u holder=%08X ctrl=%08X\n",
+                    s_frameCount, Memory::Read16(g0 + 32), Memory::Read16(g0 + 96), Memory::Read8(g0 + 80),
+                    Memory::Read16(mgr2 + 5920 + 32), Memory::Read32(pad2 + 52 + 12), hold2, ctrl2);
+            }
+        }
+        if ((s_frameCount == 200)) {
+            const uint32_t mgr = Memory::Read32(0x809BD70Cu);
+            if (mgr && Memory::Contains(mgr, 20000)) {
+                AppLog("[PadCand] f=%u mgr=%08X\n", s_frameCount, mgr);
+                for (int i = 0; i < 4; ++i) {
+                    const uint32_t c = mgr + i * 2336 + 5920;
+                    if (!Memory::Contains(c + 100, 4)) continue;
+                    const uint32_t vt = Memory::Read32(c);
+                    AppLog("[PadCand]   wii%d obj=%08X vtbl=%08X getType=%08X btn=%04X prev=%04X conn=%u\n",
+                        i, c, vt, (vt && Memory::Contains(vt + 20, 4)) ? Memory::Read32(vt + 16) : 0,
+                        Memory::Read16(c + 32), Memory::Read16(c + 96), Memory::Read8(c + 80));
+                }
+                for (int i = 0; i < 4; ++i) {
+                    const uint32_t c = mgr + i * 176 + 15264;
+                    if (!Memory::Contains(c + 100, 4)) continue;
+                    const uint32_t vt = Memory::Read32(c);
+                    AppLog("[PadCand]   gcn%d obj=%08X vtbl=%08X getType=%08X btn=%04X prev=%04X conn=%u\n",
+                        i, c, vt, (vt && Memory::Contains(vt + 20, 4)) ? Memory::Read32(vt + 16) : 0,
+                        Memory::Read16(c + 32), Memory::Read16(c + 96), Memory::Read8(c + 80));
+                }
+            }
+        }
+        if (s_frameCount >= 84 && s_frameCount <= 220 &&
+            (s_frameCount % 20 == 0 || s_frameCount == 85 || s_frameCount == 91)) {
+            {
+                const uint32_t g = Memory::Read32(0x80385FC8u);
+                const uint32_t ga = (g && Memory::Contains(g + 88, 4)) ? Memory::Read32(g + 84) : 0;
+                const uint32_t gb = (ga && Memory::Contains(ga + 40, 4)) ? Memory::Read32(ga + 36) : 0;
+                const uint32_t gv = (gb && Memory::Contains(gb, 4)) ? Memory::Read32(gb) : 0;
+                AppLog("[PadGate] f=%u obj=%08X gate(*(obj+4))=%08X vtbl=%08X slot3=%08X\n",
+                    s_frameCount, gb, (gb && Memory::Contains(gb + 8, 4)) ? Memory::Read32(gb + 4) : 0,
+                    gv, (gv && Memory::Contains(gv + 16, 4)) ? Memory::Read32(gv + 12) : 0);
+            }
+        }
+        if (g_padCallCounts && (s_frameCount == 90 || s_frameCount == 100 || s_frameCount == 150 ||
+                                s_frameCount == 200 || s_frameCount == 260)) {
+            static const char* const kNm[] = {
+                "RequestPad", "ResetAllPads", "SetID", "Update", "HasAController",
+                "GetCtrlHolder", "ResetPadsStatus", "ResetPadsStatusAndSet54", "Mgr::ResetRealCtrl",
+                "ResetPad", "HasCtrlChanged", "RecognizePad::ct", "Mgr::Update",
+                "Mgr::UpdateControllers", "Mgr::Init", "Mgr::Prepare", "WiiCtrl::UpdateImpl",
+                "GCNCtrl::UpdateImpl", "Mgr::ResetKPAD", "Mgr::CopyPADStatus", "Mgr::SyncWiimotes",
+                "Mgr::ResetSelfWiiGCN", "Ctrl::Init", "WiiCtrl::Init", "GCNCtrl::Init",
+                "Holder::Init", "RealHolder::Update", "Mgr::InitCtrlHolders", "Mgr::TrySetCtrl",
+                "RealHolder::SetCtrl"};
+            AppLog("[PadCalls] frame=%u", s_frameCount);
+            for (int i = 0; i < 30; ++i) {
+                if (g_padCallCounts[i]) AppLog(" %s=%u", kNm[i], g_padCallCounts[i]);
+            }
+            AppLog("\n");
+        }
+        if (s_frameCount >= 84 && s_frameCount <= 260) {
+            static uint32_t s_lastCtrl[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+            const uint32_t smh = Memory::Read32(0x809C1E38u);
+            if (smh && Memory::Contains(smh + 52, 32)) {
+                const uint32_t hold = Memory::Read32(smh + 52 + 16);
+                const uint32_t ctrl = (hold && Memory::Contains(hold + 12, 4)) ? Memory::Read32(hold + 8) : 0;
+                const uint32_t vt = (ctrl && Memory::Contains(ctrl, 4)) ? Memory::Read32(ctrl) : 0;
+                if (ctrl != s_lastCtrl[0] || vt != s_lastCtrl[1]) {
+                    s_lastCtrl[0] = ctrl; s_lastCtrl[1] = vt;
+                    AppLog("[Holder] frame=%u holder=%08X ctrl=%08X vtbl=%08X\n",
+                        s_frameCount, hold, ctrl, vt);
+                }
+            }
+        }
+        if (s_frameCount >= 84 && s_frameCount <= 260) {
+            static uint32_t s_lastPad[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+            const uint32_t smq = Memory::Read32(0x809C1E38u);
+            if (smq && Memory::Contains(smq + 52, 32)) {
+                const uint32_t pad = smq + 52;
+                const uint32_t id0 = Memory::Read32(pad + 4);
+                const uint32_t pend0 = Memory::Read32(pad + 8);
+                const uint32_t st0 = Memory::Read32(pad + 12);
+                const uint32_t hold0 = Memory::Read32(pad + 16);
+                if (id0 != s_lastPad[0] || pend0 != s_lastPad[1] ||
+                    st0 != s_lastPad[2] || hold0 != s_lastPad[3]) {
+                    s_lastPad[0] = id0; s_lastPad[1] = pend0;
+                    s_lastPad[2] = st0; s_lastPad[3] = hold0;
+                    AppLog("[PadFlow] frame=%u id0=%08X pend0=%08X state0=%u holder0=%08X\n",
+                        s_frameCount, id0, pend0, st0, hold0);
+                }
+            }
+        }
         if (s_frameCount >= 190 && s_frameCount <= 240 && s_frameCount % 2 == 0) {
             const uint32_t smp = Memory::Read32(0x809C1E38u);
-            if (smp && Memory::Contains(smp + 52, 32)) {
+            if (smp && Memory::Contains(smp + 52, 96)) {
                 const uint32_t pad = smp + 52;
                 AppLog("[PadState] frame=%u cur0=%08X new0=%08X st0=%08X\n", s_frameCount,
                     Memory::Read32(pad + 4), Memory::Read32(pad + 8), Memory::Read32(pad + 12));
+                // SectionPad entry layout: holder@+16 (== entry[1].+0), id@+4, pending@+8, state@+12.
+                for (int k = 0; k < 2; ++k) {
+                    const uint32_t e = pad + 16 * k;
+                    const uint32_t holder = Memory::Read32(e + 16);
+                    AppLog("[PadState]   e%d id=%08X pend=%08X state=%u holder=%08X\n", k,
+                        Memory::Read32(e + 4), Memory::Read32(e + 8), Memory::Read32(e + 12), holder);
+                    if (holder && Memory::Contains(holder + 12, 4)) {
+                        const uint32_t dev = Memory::Read32(holder + 8);
+                        const uint32_t vtbl = (dev && Memory::Contains(dev, 4)) ? Memory::Read32(dev) : 0;
+                        AppLog("[PadState]     holder+8(dev)=%08X vtbl=%08X slot4=%08X slot8=%08X\n",
+                            dev, vtbl,
+                            (vtbl && Memory::Contains(vtbl + 16, 4)) ? Memory::Read32(vtbl + 16) : 0,
+                            (vtbl && Memory::Contains(vtbl + 32, 4)) ? Memory::Read32(vtbl + 32) : 0);
+                    }
+                }
             }
         }
         if (s_frameCount >= 80 && s_frameCount <= 400 && s_frameCount % 20 == 0) {
