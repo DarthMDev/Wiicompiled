@@ -2900,9 +2900,12 @@ static bool  g_gpuReady = false;
 static bool  g_gpuTried = false;
 static C3D_RenderTarget* g_gpuTop = nullptr;
 static C3D_Mtx g_gpuProj;
+static C3D_Mtx g_gpuModelView;
 static float g_gpuYSpace = -1.0f;   // canvas y -> screen y sign (the software path uses -1)
 static bool  g_gpuVFlip = false;    // flip V on textured quads (A/B for the layout mirror)
 static bool  g_gpuScissor = false;  // per-quad scissor (MKW_GPU_SCISSOR=1)
+static uint32_t g_gpuClearOverride = 0;   // MKW_GPU_CLEAR=RRGGBB, 0 = use the guest clear
+static uint32_t g_gpuDebugQuads = 0;      // MKW_GPU_DEBUG=1 dumps the first quads' geometry
 
 struct GpuQuadVtx { float x, y, u, v, r, g, b, a; };
 struct GpuQuad {
@@ -2950,7 +2953,11 @@ static bool Gpu2dInit() {
         AppLog("[Gpu2d] C3D_Init failed\n");
         return false;
     }
-    g_gpuTop = C3D_RenderTargetCreate(kScreenW, kScreenH, GPU_RB_RGBA8, -1);
+    // The 3DS framebuffer is stored rotated: citro3d render targets for the top screen are
+    // created as (240, 400) and the projection is built with Mtx_OrthoTilt so that layout
+    // coordinates stay (x right, y down) in a 400x240 space.  Creating a (400, 240) target
+    // and using plain Mtx_Ortho puts every quad outside the target, which renders black.
+    g_gpuTop = C3D_RenderTargetCreate(kScreenH, kScreenW, GPU_RB_RGBA8, -1);
     if (!g_gpuTop) {
         AppLog("[Gpu2d] C3D_RenderTargetCreate failed\n");
         return false;
@@ -2969,19 +2976,18 @@ static bool Gpu2dInit() {
     AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 4); // texcoord (u, v, 0, 0)
     AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 4); // vertex colour (tint)
 
-    // Layout quads are vertex * texture, straight through the first TEV stage.
+    // Layout quads are vertex * texture, straight through the first TEV stage.  Every combiner
+    // stage is reset first so a leftover stage cannot feed garbage into the final result.
+    for (int i = 0; i < 6; ++i) C3D_TexEnvInit(C3D_GetTexEnv(i));
     C3D_TexEnv* env = C3D_GetTexEnv(0);
-    C3D_TexEnvSrc(env, C3D_RGB, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
-    C3D_TexEnvOpRgb(env, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR, GPU_TEVOP_RGB_SRC_COLOR);
-    C3D_TexEnvFunc(env, C3D_RGB, GPU_MODULATE);
-    C3D_TexEnvSrc(env, C3D_Alpha, GPU_TEXTURE0, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
-    C3D_TexEnvOpAlpha(env, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA, GPU_TEVOP_A_SRC_ALPHA);
-    C3D_TexEnvFunc(env, C3D_Alpha, GPU_MODULATE);
+    C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR);
+    C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
 
     C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
                    GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
-                   GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
-    C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_ALL);
+                   GPU_ONE, GPU_ONE_MINUS_SRC_ALPHA);
+    C3D_AlphaTest(false, GPU_ALWAYS, 0);
+    C3D_DepthTest(false, GPU_ALWAYS, GPU_WRITE_COLOR);
     C3D_CullFace(GPU_CULL_NONE);
 
     // A 1x1 white texel stands in for untextured quads so every draw uses one pipeline.
@@ -2995,8 +3001,11 @@ static bool Gpu2dInit() {
         g_gpuWhiteValid = true;
     }
 
-    Mtx_Ortho(&g_gpuProj, 0.0f, static_cast<float>(kScreenW),
-              static_cast<float>(kScreenH), 0.0f, -1.0f, 1.0f, false);
+    Mtx_OrthoTilt(&g_gpuProj, 0.0f, static_cast<float>(kScreenW),
+                  static_cast<float>(kScreenH), 0.0f, -1.0f, 1.0f, false);
+    // citro3d's built-in vertex shader computes projectionMtx(uniform 0) * modelViewMtx(uniform 3).
+    // Uniforms start zeroed, so an unset modelview collapses every vertex to the origin.
+    Mtx_Identity(&g_gpuModelView);
 
     g_gpuReady = true;
     AppLog("[Gpu2d] citro3d ready %dx%d texBudget=%zuKB\n",
@@ -3009,6 +3018,10 @@ static void Gpu2dConfigure() {
     if (const char* ys = std::getenv("MKW_GPU_YSIGN")) g_gpuYSpace = std::stof(ys);
     g_gpuVFlip = std::getenv("MKW_GPU_VFLIP") != nullptr;
     g_gpuScissor = std::getenv("MKW_GPU_SCISSOR") != nullptr;
+    if (const char* clr = std::getenv("MKW_GPU_CLEAR")) {
+        g_gpuClearOverride = static_cast<uint32_t>(std::strtoul(clr, nullptr, 16)) << 8 | 0xFFu;
+    }
+    g_gpuDebugQuads = std::getenv("MKW_GPU_DEBUG") ? 4u : 0u;
     if (const char* mb = std::getenv("MKW_GPU_TEX_MB")) {
         const long v = std::atol(mb);
         if (v > 0) g_gpuTexCap = static_cast<size_t>(v) * 1024ull * 1024ull;
@@ -3167,6 +3180,23 @@ static void Gpu2dRecordQuad(const GxVertex v[4]) {
     q.clip[1] = g_gx.clipY0;
     q.clip[2] = g_gx.clipX1;
     q.clip[3] = g_gx.clipY1;
+    if (g_gpuDebugQuads > 0) {
+        --g_gpuDebugQuads;
+        float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+        float minU = 1e9f, maxU = -1e9f, minV = 1e9f, maxV = -1e9f;
+        for (int i = 0; i < 4; ++i) {
+            minX = std::min(minX, q.v[i].x); maxX = std::max(maxX, q.v[i].x);
+            minY = std::min(minY, q.v[i].y); maxY = std::max(maxY, q.v[i].y);
+            minU = std::min(minU, q.v[i].u); maxU = std::max(maxU, q.v[i].u);
+            minV = std::min(minV, q.v[i].v); maxV = std::max(maxV, q.v[i].v);
+        }
+        AppLog("[Gpu2d Quad] f=%u rect=(%.1f,%.1f)-(%.1f,%.1f) uv=(%.3f,%.3f)-(%.3f,%.3f)"
+               " rgba=(%.2f,%.2f,%.2f,%.2f) tex=%ux%u blend=%u clip=(%d,%d)-(%d,%d) proj=%.5f,%.5f\n",
+            g_gxFrame, minX, minY, maxX, maxY, minU, minV, maxU, maxV,
+            q.v[0].r, q.v[0].g, q.v[0].b, q.v[0].a,
+            dt ? dt->width : 0u, dt ? dt->height : 0u, q.blend ? 1u : 0u,
+            q.clip[0], q.clip[1], q.clip[2], q.clip[3], g_gx.proj[0][0], g_gx.proj[1][1]);
+    }
     g_gpuQuads.push_back(q);
     ++g_gpuQuadsRecorded;
 }
@@ -3197,11 +3227,13 @@ static bool Gpu2dUploadBase() {
 static void Gpu2dRender() {
     if (!g_gpuReady) return;
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
-    const uint32_t clear = (g_gx.clearColor[0] << 24) | (g_gx.clearColor[1] << 16) |
-                           (g_gx.clearColor[2] << 8) | 0xFFu;
+    const uint32_t guestClear = (g_gx.clearColor[0] << 24) | (g_gx.clearColor[1] << 16) |
+                                (g_gx.clearColor[2] << 8) | 0xFFu;
+    const uint32_t clear = g_gpuClearOverride ? g_gpuClearOverride : guestClear;
     C3D_RenderTargetClear(g_gpuTop, C3D_CLEAR_ALL, clear, 0);
     C3D_FrameDrawOn(g_gpuTop);
     C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, 0, &g_gpuProj);
+    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, 3, &g_gpuModelView);
 
     // Anything the software path drew (3D) is composited underneath the layout.
     // Any pixel the software path produced (3D, or a 2D draw that did not come through the
