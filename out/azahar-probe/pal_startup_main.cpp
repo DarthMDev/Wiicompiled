@@ -4261,6 +4261,11 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             // No buttons pressed. Leaving this buffer untouched let stale guest memory decide
             // the HOME button state, which put the game on the "Return to the Wii Menu" page.
             std::memset(Memory::GetPointer(out, len), 0, len);
+            // Late A-pulse only: pulsing during boot makes the game skip the menu load, but
+            // after the menu is up it should drive the license/WiFi navigation.
+            if (len >= 2 && gx_bridge::g_gxFrame >= 200 && (gx_bridge::g_gxFrame % 8) < 3) {
+                Memory::Write16(out, 0x0800); // WPAD_BUTTON_A
+            }
         }
         cpu->gpr[3] = 0;
         return true;
