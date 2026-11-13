@@ -7660,6 +7660,20 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 #endif
             std::fflush(stdout);
         }
+        if (s_frameCount >= 84 && s_frameCount <= 220) {
+            static uint32_t s_lastFlags = 0xFFFFFFFFu;
+            const uint32_t g1 = Memory::Read32(0x809C2328u);
+            const uint32_t sm3 = Memory::Read32(0x809C1E38u);
+            const uint32_t o2 = (sm3 && Memory::Contains(sm3 + 156, 4)) ? Memory::Read32(sm3 + 152) : 0;
+            const uint32_t f1 = (g1 && Memory::Contains(g1 + 60, 1)) ? Memory::Read8(g1 + 56) : 0xEE;
+            const uint32_t f2 = (o2 && Memory::Contains(o2 + 1232, 1)) ? Memory::Read8(o2 + 1228) : 0xEE;
+            const uint32_t flags = (f1 << 8) | f2;
+            if (flags != s_lastFlags) {
+                s_lastFlags = flags;
+                AppLog("[TitleGate] f=%u flag1(*(809C2328)+56)=%u flag2(sm+152->+1228)=%u obj2=%08X\n",
+                    s_frameCount, f1, f2, o2);
+            }
+        }
         if (s_frameCount == 150) {
             const uint32_t o1 = 0x8042AA6Cu;
             const uint32_t o2 = 0x8042AAACu;
