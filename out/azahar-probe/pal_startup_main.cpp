@@ -2709,6 +2709,12 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
         if (globeObj && Memory::Contains(globeObj + 32, 1)) {
             Memory::Write8(globeObj + 32, 1);
         }
+        if (const char* st = std::getenv("MKW_FORCE_GLOBE_STATE")) {
+            const uint32_t mgr = Memory::Read32(0x809C2144u);
+            if (mgr && Memory::Contains(mgr + 30072, 4)) {
+                Memory::Write32(mgr + 30072, static_cast<uint32_t>(std::atoi(st)));
+            }
+        }
     }
     g_gxFrame = frameNumber + 1;
     g_gx.drawCallsThisFrame = 0;
