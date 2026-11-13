@@ -2970,22 +2970,6 @@ static bool Gpu2dInit() {
         GX_TRANSFER_IN_FORMAT(GX_TRANSFER_FMT_RGBA8) | GX_TRANSFER_OUT_FORMAT(GX_TRANSFER_FMT_RGB8) |
         GX_TRANSFER_SCALING(GX_TRANSFER_SCALE_NO));
 
-    // C3D_ImmSendAttrib always emits a vec4, so every attribute must be declared 4 floats wide:
-    // the vertex stride citro3d programs is the sum of the declared sizes, and declaring 3+2+4
-    // while sending 12 floats per vertex shifts every attribute (positions came out garbage, so
-    // nothing was visible).
-    C3D_AttrInfo* ai = C3D_GetAttrInfo();
-    AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 4); // position (pixels, w = 1)
-    AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 4); // texcoord (u, v, 0, 0)
-    AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 4); // vertex colour (tint)
-
-    // Layout quads are vertex * texture, straight through the first TEV stage.  Every combiner
-    // stage is reset first so a leftover stage cannot feed garbage into the final result.
-    for (int i = 0; i < 6; ++i) C3D_TexEnvInit(C3D_GetTexEnv(i));
-    C3D_TexEnv* env = C3D_GetTexEnv(0);
-    C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR);
-    C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
-
     C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
                    GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
                    GPU_ONE, GPU_ONE_MINUS_SRC_ALPHA);
@@ -3293,6 +3277,17 @@ static bool Gpu2dUploadBase() {
     return true;
 }
 
+// Project a layout pixel coordinate through the (OrthoTilt) projection on the CPU, so the draw
+// does not depend on which float-uniform slot citro3d's built-in vertex shader reads.
+static inline void TransformToClip(const C3D_Mtx& m, float x, float y, float* outX, float* outY) {
+    const float cx = m.r[0].c[0] * x + m.r[0].c[1] * y + m.r[0].c[3];
+    const float cy = m.r[1].c[0] * x + m.r[1].c[1] * y + m.r[1].c[3];
+    const float cw = m.r[3].c[0] * x + m.r[3].c[1] * y + m.r[3].c[3];
+    const float inv = (std::fabs(cw) > 1e-6f) ? 1.0f / cw : 1.0f;
+    *outX = cx * inv;
+    *outY = cy * inv;
+}
+
 static void Gpu2dRender() {
     if (!g_gpuReady) return;
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
@@ -3301,11 +3296,28 @@ static void Gpu2dRender() {
     const uint32_t clear = g_gpuClearOverride ? g_gpuClearOverride : guestClear;
     C3D_RenderTargetClear(g_gpuTop, C3D_CLEAR_ALL, clear, 0);
     C3D_FrameDrawOn(g_gpuTop);
-    // citro3d's built-in vertex shader takes the projection in one fixed uniform slot and the
-    // modelview in another; MKW_GPU_UNIF lets the pair be swapped on hardware if the default is
-    // wrong (the symptom would be geometry transformed by an all-zero matrix, i.e. nothing drawn).
-    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_gpuProjUnif, &g_gpuProj);
-    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_gpuProjUnif == 0 ? 3 : 0, &g_gpuModelView);
+
+    // Attribute layout.  AttrInfo_Init first: it is persistent GPU state and citro3d only touches
+    // the entries it is told about, so an uninitialised config scrambles the whole vertex stream
+    // (the reference quads did not appear either).  C3D_ImmSendAttrib always emits a vec4, so every
+    // attribute is declared 4 floats wide and the stride matches what is sent.
+    C3D_AttrInfo* ai = C3D_GetAttrInfo();
+    AttrInfo_Init(ai);
+    AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 4); // clip position (pre-projected on the CPU)
+    AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 4); // texcoord (u, v, 0, 0)
+    AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 4); // vertex colour (tint)
+    for (int i = 0; i < 6; ++i) C3D_TexEnvInit(C3D_GetTexEnv(i));
+    {
+        C3D_TexEnv* env = C3D_GetTexEnv(0);
+        C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR);
+        C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
+    }
+
+    // Both matrices are identity: the quads below are already in clip space.  This removes the
+    // guess about which uniform slot the built-in shader reads (uniforms start zeroed, and a zero
+    // projection collapses every vertex to the origin -- another candidate for the blank screen).
+    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, 0, &g_gpuModelView);
+    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, 3, &g_gpuModelView);
 
     // Anything the software path drew (3D) is composited underneath the layout.
     // Any pixel the software path produced (3D, or a 2D draw that did not come through the
@@ -3320,7 +3332,9 @@ static void Gpu2dRender() {
         const float us[4] = {0.0f, su, 0.0f, su};
         const float vs[4] = {0.0f, 0.0f, sv, sv};
         for (int i = 0; i < 4; ++i) {
-            C3D_ImmSendAttrib(xs[i], ys[i], 0.0f, 1.0f);
+            float cx = 0.0f, cy = 0.0f;
+            TransformToClip(g_gpuProj, xs[i], ys[i], &cx, &cy);
+            C3D_ImmSendAttrib(cx, cy, 0.0f, 1.0f);
             C3D_ImmSendAttrib(us[i], vs[i], 0.0f, 0.0f);
             C3D_ImmSendAttrib(1.0f, 1.0f, 1.0f, 1.0f);
         }
@@ -3349,7 +3363,9 @@ static void Gpu2dRender() {
         C3D_TexBind(0, tex);
         C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
         for (int i = 0; i < 4; ++i) {
-            C3D_ImmSendAttrib(q.v[i].x, q.v[i].y, 0.0f, 1.0f);
+            float cx = 0.0f, cy = 0.0f;
+            TransformToClip(g_gpuProj, q.v[i].x, q.v[i].y, &cx, &cy);
+            C3D_ImmSendAttrib(cx, cy, 0.0f, 1.0f);
             C3D_ImmSendAttrib(q.v[i].u * uScale, q.v[i].v * vScale, 0.0f, 0.0f);
             C3D_ImmSendAttrib(q.v[i].r, q.v[i].g, q.v[i].b, q.v[i].a);
         }
@@ -3371,7 +3387,9 @@ static void Gpu2dRender() {
         const float xs[4] = {20.0f, 180.0f, 20.0f, 180.0f};
         const float ys[4] = {20.0f, 20.0f, 100.0f, 100.0f};
         for (int i = 0; i < 4; ++i) {
-            C3D_ImmSendAttrib(xs[i], ys[i], 0.0f, 1.0f);
+            float cx = 0.0f, cy = 0.0f;
+            TransformToClip(g_gpuProj, xs[i], ys[i], &cx, &cy);
+            C3D_ImmSendAttrib(cx, cy, 0.0f, 1.0f);
             C3D_ImmSendAttrib(0.5f, 0.5f, 0.0f, 0.0f);
             C3D_ImmSendAttrib(1.0f, 0.0f, 1.0f, 1.0f);
         }
