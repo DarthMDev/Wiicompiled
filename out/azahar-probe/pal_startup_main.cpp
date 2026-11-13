@@ -1807,12 +1807,17 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
         float ndcY = cy * invW;
         float ndcZ = cz * invW;
 
+        // Y convention differs between the two projection kinds.  For the 2D layout projection the
+        // guest already maps canvas y (grows downward) onto NDC, so flipping here mirrors the whole
+        // menu vertically - the title logo ended up at the bottom instead of the top.  The
+        // perspective path keeps the flip.
+        const float ySign = -1.0f;  // GX NDC +y is up; keep the established mapping for now
         if (fullVp) {
             cv[i].sx = (ndcX * 0.5f + 0.5f) * static_cast<float>(kScreenW);
-            cv[i].sy = (0.5f - ndcY * 0.5f) * static_cast<float>(kScreenH);
+            cv[i].sy = (0.5f + ySign * ndcY * 0.5f) * static_cast<float>(kScreenH);
         } else {
             float efbX = g_gx.vpLeft + (ndcX * 0.5f + 0.5f) * g_gx.vpWidth;
-            float efbY = g_gx.vpTop  + (0.5f - ndcY * 0.5f) * g_gx.vpHeight;
+            float efbY = g_gx.vpTop  + (0.5f + ySign * ndcY * 0.5f) * g_gx.vpHeight;
             cv[i].sx = efbX * (static_cast<float>(kScreenW) / efbW);
             cv[i].sy = efbY * (static_cast<float>(kScreenH) / efbH);
         }
@@ -1823,6 +1828,8 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
         cv[i].sz = ndcZ;
         cv[i].invW = invW;
         cv[i].u = vin.uv0[0];
+        // With the unflipped 2D screen mapping (see ySign above) the guest's UV origin is at the
+        // bottom, so V has to be mirrored for the orthographic layout pass to draw upright.
         cv[i].v = vin.uv0[1];
         if (vin.hasColor0) {
             cv[i].r = vin.color0[0];
@@ -3761,6 +3768,12 @@ enum class ScriptPadKind { kGcPad, kClassic };
 // press edge alone, so an A press made while the title was still fading in would otherwise never
 // register.  Set by the pad-registration nudge at endRender.
 static uint32_t g_padEdgeMaskFrame = 0xFFFFFFFFu;
+// Frames left to keep reporting A as held after the player pressed it while the pad was still
+// unregistered.  The registration window only opens once the section transition finishes and the
+// guest binds on the press *edge* alone, so an A press made the moment the title appears (a second
+// or two earlier) would otherwise be thrown away and the title would ignore the pad for ever.
+static uint32_t g_padHoldAUntilBound = 0;
+static bool g_padAPressSeen = false;   // saw an A press while nothing was registered yet
 
 static uint32_t ScriptedPadButtons(ScriptPadKind kind)
 {
@@ -3794,7 +3807,11 @@ static uint32_t ScriptedPadButtons(ScriptPadKind kind)
         const long at = std::strtol(s, nullptr, 10);
         if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + len) out |= kStart;
     }
-    if (frame == g_padEdgeMaskFrame) out &= ~kA;   // one frame of "A released"
+    if (frame == g_padEdgeMaskFrame) out &= ~kA;   // one frame of "A released" -> fresh edge
+    if (gc && g_padHoldAUntilBound > 0 && frame != g_padEdgeMaskFrame) {
+        --g_padHoldAUntilBound;
+        out |= kA;
+    }
     return out;
 }
 
@@ -7691,23 +7708,46 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 // which is the "requested but nothing bound yet" state - that must keep nudging.)
                 const bool bound = id != 0u && id == pending;
                 (void)state;
+                if (bound) {
+                    g_padHoldAUntilBound = 0;
+                    g_padAPressSeen = false;
+                } else {
+                    // The registration window only opens once the scene is running (~1s after the
+                    // title appears), so watch for the A press on *every* frame and remember it.
+                    const uint32_t mgrNow = Memory::Read32(0x809BD70Cu);
+                    if (mgrNow != 0u && Memory::Contains(mgrNow, 20000) && !g_padAPressSeen) {
+                        for (int i = 0; i < 4 && !g_padAPressSeen; ++i) {
+                            const uint32_t cand = mgrNow + 15264u + static_cast<uint32_t>(i) * 176u;
+                            if (!Memory::Contains(cand + 100, 4)) continue;
+                            if (Memory::Read8(cand + 80) == 0u) continue;
+                            if ((Memory::Read16(cand + 32) & 1u) != 0u) g_padAPressSeen = true;
+                        }
+                    }
+                }
                 if (sceneState == 1u && !bound) {
                     s_lastPadNudge = s_frameCount;
                     // If A is already held when the registration window opens, mask it for one frame
                     // so the guest sees a fresh press edge and Input::Manager::TrySetController binds
                     // the pad (this is the only path that updates the holder bookkeeping correctly).
-                    if (g_padEdgeMaskFrame == 0xFFFFFFFFu) {
+                    // A press seen before this window opened is re-armed: one frame with A
+                    // released (g_padEdgeMaskFrame) and then A held for a while, which the guest
+                    // reads as a fresh press edge and uses to bind the pad.
+                    {
                         const uint32_t mgr = Memory::Read32(0x809BD70Cu);
-                        if (mgr != 0u && Memory::Contains(mgr, 20000)) {
-                            for (int i = 0; i < 4; ++i) {
+                        if (mgr != 0u && Memory::Contains(mgr, 20000) && g_padHoldAUntilBound == 0) {
+                            bool aPressed = g_padAPressSeen;
+                            for (int i = 0; i < 4 && !aPressed; ++i) {
                                 const uint32_t cand = mgr + 15264u + static_cast<uint32_t>(i) * 176u;
                                 if (!Memory::Contains(cand + 100, 4)) continue;
                                 if (Memory::Read8(cand + 80) == 0u) continue;
-                                if ((Memory::Read16(cand + 32) & 1u) == 0u) continue;
+                                if ((Memory::Read16(cand + 32) & 1u) != 0u) aPressed = true;
+                            }
+                            if (aPressed) {
+                                g_padHoldAUntilBound = 90;
                                 g_padEdgeMaskFrame = gx_bridge::g_gxFrame + 1u;
-                                AppLog("[PadNudge] A held at window open (f=%u) -> refreshing its edge\n",
+                                g_padAPressSeen = false;
+                                AppLog("[PadNudge] A seen while unregistered (f=%u) -> re-arming its edge\n",
                                     s_frameCount);
-                                break;
                             }
                         }
                     }
