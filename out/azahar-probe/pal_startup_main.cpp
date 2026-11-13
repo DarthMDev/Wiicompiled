@@ -4068,6 +4068,19 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 cpu->lr, target, cpu->gpr[3], gx_bridge::g_gxFrame);
         }
     }
+    if (target == 0x8063C91Cu) {
+        static std::set<uint32_t> s_seenListNull;
+        const uint32_t obj = cpu ? cpu->gpr[3] : 0;
+        const uint32_t p24 = (obj && Memory::Contains(obj + 24, 4)) ? Memory::Read32(obj + 24) : 0;
+        if (obj && p24 == 0 && s_seenListNull.size() < 8 && s_seenListNull.insert(cpu->lr).second) {
+            AppLog("[ListNull] lr=%08X obj=%08X vt=%08X p20=%08X p24=%08X p56=%08X frame=%u\n",
+                cpu->lr, obj, (obj && Memory::Contains(obj, 4)) ? Memory::Read32(obj) : 0,
+                (obj && Memory::Contains(obj + 20, 4)) ? Memory::Read32(obj + 20) : 0,
+                p24,
+                (obj && Memory::Contains(obj + 56, 4)) ? Memory::Read32(obj + 56) : 0,
+                gx_bridge::g_gxFrame);
+        }
+    }
     if (target == 0x8059DFBCu || target == 0x8059E080u || target == 0x8059E0E4u) {
         static std::set<uint32_t> s_seenGlobeCtor;
         const uint32_t key = (target << 16) ^ (cpu ? (cpu->lr & 0xFFFFu) : 0);
@@ -4670,6 +4683,19 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                         Memory::Read32(cpu->gpr[30] + 20),
                         Memory::Read32(cpu->gpr[30] + 24),
                         Memory::Read32(cpu->gpr[30] + 28));
+                }
+                const uint32_t o31 = cpu->gpr[31];
+                if (o31 && Memory::Contains(o31, 64)) {
+                    AppLog("  r31obj=%08X vt=%08X p0=%08X p20=%08X p24=%08X p56=%08X\n",
+                        o31, Memory::Read32(o31), Memory::Read32(o31),
+                        Memory::Read32(o31 + 20), Memory::Read32(o31 + 24), Memory::Read32(o31 + 56));
+                    uint32_t node = Memory::Read32(o31 + 24);
+                    char buf[512]; int n = 0;
+                    for (int i = 0; i < 10 && node && Memory::Contains(node, 16); ++i) {
+                        n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " %08X->%08X", node, Memory::Read32(node));
+                        node = Memory::Read32(node);
+                    }
+                    AppLog("  list:%s (tail=%08X sentinel=%08X)\n", buf, node, o31 + 24);
                 }
             }
         }
