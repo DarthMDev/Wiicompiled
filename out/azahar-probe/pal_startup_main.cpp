@@ -3756,6 +3756,12 @@ static bool g_raceShortcut = false;
 
 enum class ScriptPadKind { kGcPad, kClassic };
 
+// Frame on which the GC pad's A bit is masked, so a *held* A becomes a fresh press edge.  The pad
+// registration window opens only after the section transition finishes, and MKWii binds on the
+// press edge alone, so an A press made while the title was still fading in would otherwise never
+// register.  Set by the pad-registration nudge at endRender.
+static uint32_t g_padEdgeMaskFrame = 0xFFFFFFFFu;
+
 static uint32_t ScriptedPadButtons(ScriptPadKind kind)
 {
     const uint32_t frame = gx_bridge::g_gxFrame;
@@ -3784,6 +3790,7 @@ static uint32_t ScriptedPadButtons(ScriptPadKind kind)
         const long at = std::strtol(s, nullptr, 10);
         if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + len) out |= kStart;
     }
+    if (frame == g_padEdgeMaskFrame) out &= ~kA;   // one frame of "A released"
     return out;
 }
 
@@ -7624,6 +7631,139 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x8020FF9Cu: { // EGG::AsyncDisplay::endRender
         static uint32_t s_frameCount = 0;
         ++s_frameCount;
+        // --- Controller registration ------------------------------------------------
+        // MKWii binds a pad inside SectionPad::Update, but only while the current Scene is in
+        // its "running" state (Scene+4 == 1) and only when the pad slot is in the *requested*
+        // state (SectionPad entry +12 == 1).  Pages::Title::OnActivate opens that window while
+        // the section transition is still running (scene state 2), so the request is always
+        // dropped there.  On hardware the "press A to connect your controller" page
+        // (Pages::RegisterPad / RecognizePadMenu / BlinkingPressA) re-issues
+        // SectionPad::RequestPad every frame after that, and the first A press binds the pad.
+        // That page is reached through an audio-timed title branch, and this port has no audio
+        // clock, so nothing ever re-asks - Pages::Title::AfterControlUpdate then never sees
+        // SectionPad::HasAController() == true and the title never advances.
+        // Re-issue the request ourselves for the menu path; it is exactly what
+        // Pages::RegisterPad::AfterControlUpdate does (state 1, pending 0, holder 0).
+        if (!g_raceShortcut) {
+            static uint32_t s_lastPadNudge = 0xFFFFFFFFu;
+            const uint32_t sectionMgr = Memory::Read32(0x809C1E38u);
+            if (sectionMgr != 0u && Memory::Contains(sectionMgr + 52, 20) && s_lastPadNudge != s_frameCount) {
+                const uint32_t pad = sectionMgr + 52;
+                const uint32_t rootSys = Memory::Read32(0x80385FC8u);
+                const uint32_t sceneMgr = (rootSys && Memory::Contains(rootSys + 88, 4))
+                    ? Memory::Read32(rootSys + 84) : 0u;
+                const uint32_t scene = (sceneMgr && Memory::Contains(sceneMgr + 40, 4))
+                    ? Memory::Read32(sceneMgr + 36) : 0u;
+                const uint32_t sceneState = (scene && Memory::Contains(scene + 8, 4))
+                    ? Memory::Read32(scene + 4) : 0u;
+                const uint32_t id = Memory::Read32(pad + 4);
+                const uint32_t pending = Memory::Read32(pad + 8);
+                const uint32_t state = Memory::Read32(pad + 12);
+                const bool bound = (state != 0u || id != 0u) && id == pending;
+                if (sceneState == 1u && !bound) {
+                    s_lastPadNudge = s_frameCount;
+                    // If A is already held when the registration window opens, mask it for one frame
+                    // so the guest sees a fresh press edge and Input::Manager::TrySetController binds
+                    // the pad (this is the only path that updates the holder bookkeeping correctly).
+                    if (g_padEdgeMaskFrame == 0xFFFFFFFFu) {
+                        const uint32_t mgr = Memory::Read32(0x809BD70Cu);
+                        if (mgr != 0u && Memory::Contains(mgr, 20000)) {
+                            for (int i = 0; i < 4; ++i) {
+                                const uint32_t cand = mgr + 15264u + static_cast<uint32_t>(i) * 176u;
+                                if (!Memory::Contains(cand + 100, 4)) continue;
+                                if (Memory::Read8(cand + 80) == 0u) continue;
+                                if ((Memory::Read16(cand + 32) & 1u) == 0u) continue;
+                                g_padEdgeMaskFrame = gx_bridge::g_gxFrame + 1u;
+                                AppLog("[PadNudge] A held at window open (f=%u) -> refreshing its edge\n",
+                                    s_frameCount);
+                                break;
+                            }
+                        }
+                    }
+                    // SectionPad::Update only binds on a *fresh* A edge, so a press made while the
+                    // section was still transitioning (i.e. before this window opened) is lost and
+                    // the player would have to release and press again.  Treat "A is held now" as
+                    // the registration press instead: bind the first connected real pad exactly the
+                    // way Input::Manager::TrySetController would (RealControllerHolder::
+                    // SetController(holder, controller, 0)); the next SectionPad::Update then picks
+                    // it up, computes the matching ID and the pad is registered.
+                    const uint32_t inputMgr = Memory::Read32(0x809BD70Cu);
+                    if (inputMgr != 0u && Memory::Contains(inputMgr, 20000)) {
+                        uint32_t candidates[8];
+                        for (int i = 0; i < 4; ++i) {
+                            candidates[i] = inputMgr + 5920u + static_cast<uint32_t>(i) * 2336u;
+                            candidates[4 + i] = inputMgr + 15264u + static_cast<uint32_t>(i) * 176u;
+                        }
+                        uint32_t chosen = 0;
+                        for (const uint32_t cand : candidates) {
+                            if (!Memory::Contains(cand + 100, 4)) continue;
+                            if (Memory::Read8(cand + 80) == 0u) continue;          // not connected
+                            if ((Memory::Read16(cand + 32) & 1u) == 0u) continue;  // A not held
+                            const uint32_t vtbl = Memory::Read32(cand);
+                            const uint32_t getType = (vtbl && Memory::Contains(vtbl + 20, 4))
+                                ? Memory::Read32(vtbl + 16) : 0u;
+                            // Only real controllers (GCN 0x8052286C, Wii 0x8052292C); the base
+                            // Input::Controller placeholder reports type -1 and is no use here.
+                            if (getType != 0x8052286Cu && getType != 0x8052292Cu) continue;
+                            chosen = cand;
+                            break;
+                        }
+                        {
+                            const uint32_t holderCtrl = Memory::Contains(inputMgr + 12, 4)
+                                ? Memory::Read32(inputMgr + 12) : 0u;
+                            const uint32_t holderVt = (holderCtrl && Memory::Contains(holderCtrl, 4))
+                                ? Memory::Read32(holderCtrl) : 0u;
+                            static int s_bindLogs = 0;
+                            if (s_bindLogs < 8) {
+                                ++s_bindLogs;
+                                AppLog("[PadNudge] f=%u gcn0 btn=%04X conn=%u gt=%08X chosen=%08X holderCtrl=%08X vtbl=%08X\n",
+                                    s_frameCount,
+                                    static_cast<uint16_t>(Memory::Read16(candidates[4] + 32)),
+                                    Memory::Read8(candidates[4] + 80),
+                                    (Memory::Read32(candidates[4]) && Memory::Contains(Memory::Read32(candidates[4]) + 20, 4))
+                                        ? Memory::Read32(Memory::Read32(candidates[4]) + 16) : 0u,
+                                    chosen, holderCtrl, holderVt);
+                            }
+                        }
+                        // Kept behind an env flag: calling ControllerParams::Fill from here is not
+                        // safe yet (it aborted at frame 106), and the edge-refresh below binds the
+                        // pad through the guest's own TrySetController path instead.
+                        static const bool s_directBind = std::getenv("MKW_PAD_DIRECTBIND") != nullptr;
+                        if (s_directBind && chosen != 0u) {
+                            CpuContext bindCtx = *cpu;
+                            bindCtx.gpr[3] = inputMgr + 4u;   // pad 0 -> Input::Manager holder 0
+                            bindCtx.gpr[4] = chosen;
+                            bindCtx.gpr[5] = 0;
+                            bindCtx.lr = 0;
+                            CpuContextScope bindScope(&bindCtx);
+                            InvokeIndirectCpu(0x80521554u, &bindCtx);  // RealControllerHolder::SetController
+                            // Finish what Input::Manager::TrySetController's success path does, so
+                            // RealControllerHolder::Update does not undo the assignment on the next
+                            // frame: mirror the controller pointer into holder+16 and refresh the
+                            // ControllerParams copy at holder+204.
+                            const uint32_t holderBase = inputMgr + 4u;
+                            const uint32_t ctrl = Memory::Contains(holderBase + 12, 4)
+                                ? Memory::Read32(holderBase + 8) : 0u;
+                            if (ctrl != 0u && Memory::Contains(holderBase + 208, 4)) {
+                                Memory::Write32(holderBase + 16, ctrl);
+                                CpuContext fillCtx = *cpu;
+                                fillCtx.gpr[3] = holderBase + 204u;
+                                fillCtx.gpr[4] = ctrl;
+                                fillCtx.lr = 0;
+                                CpuContextScope fillScope(&fillCtx);
+                                InvokeIndirectCpu(0x80522364u, &fillCtx);  // ControllerParams::Fill
+                            }
+                        }
+                    }
+                    CpuContext padCtx = *cpu;
+                    padCtx.gpr[3] = pad;
+                    padCtx.gpr[4] = 0;
+                    padCtx.lr = 0;
+                    CpuContextScope scope(&padCtx);
+                    InvokeIndirectCpu(0x8061B6ECu, &padCtx);   // SectionPad::RequestPad(pad, 0)
+                }
+            }
+        }
         gx_bridge::PresentFrameTo3DS(s_frameCount);
         static bool s_profiled100 = false;
         if (!s_profiled100 && s_frameCount >= 100) {
