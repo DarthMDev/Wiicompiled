@@ -770,21 +770,35 @@ struct DecodedTex {
     uint16_t height = 0;
     uint8_t  format = 0;
     uint32_t hash = 0;
+    uint64_t lastUse = 0;       // LRU stamp
     std::vector<uint32_t> rgba; // width * height of 0xRRGGBBAA
-    std::vector<std::vector<uint32_t>> mips; // box-filtered levels, mips[0] unused/empty
+    mutable std::vector<std::vector<uint32_t>> mips; // lazily built box-filtered levels
 };
 
 static std::map<uint64_t, DecodedTex> g_texCache;
 static size_t g_texCacheBytes = 0;
+static uint64_t g_texTick = 0;                  // LRU clock
+static DecodedTex g_texScratch;                 // decode target for textures that do not fit
+static uint32_t g_texStatDecodes = 0;           // textures decoded since the last report
+static uint32_t g_texStatHits = 0;
+static uint32_t g_texStatEvictions = 0;
+static size_t   g_texStatTexels = 0;
 static void BuildMipChain(DecodedTex& tex);
 #ifdef __3DS__
 // The Old 3DS app region is what is left after guest MEM1+MEM2 and our own code, so keep the
 // texture cache small: it is a pure cache, and running out of *host* heap here aborts the port
 // (that is what killed the section-63 run at frame 84 while RKSYS::Mgr::LoadTask allocated its
 // 2.8 MiB save buffer).
-static constexpr size_t kMaxTexCacheBytes = 3 * 1024 * 1024; // 3 MiB budget on Old 3DS
+// The menu's decoded-texture working set is ~5.4 MiB.  With the guest's DOL _text blob no longer
+// embedded there is room for it, and keeping the cache warm removes the clear-and-redecode every
+// other frame that made the title screen crawl.  Allocation failures are caught and fall back to
+// untextured quads, so an over-large cap degrades instead of crashing.
+// The menu's decoded set measures ~5.9 MiB (23 textures) and a full mip chain adds another third,
+// so a 5 MiB cap evicted and re-decoded textures every frame (2 s/frame on device).  7 MiB holds
+// the set outright now that the guest DOL _text blob is gone.
+static constexpr size_t kMaxTexCacheBytes = 8 * 1024 * 1024;
 #else
-static constexpr size_t kMaxTexCacheBytes = 6 * 1024 * 1024;
+static constexpr size_t kMaxTexCacheBytes = 24 * 1024 * 1024;
 #endif
 
 struct TexSlot {
@@ -1273,38 +1287,71 @@ static const DecodedTex* GetOrDecodeTexture(const TexSlot& slot) {
                    static_cast<uint64_t>(slot.format);
     auto it = g_texCache.find(key);
     if (it != g_texCache.end() && it->second.hash == sampleHash) {
+        it->second.lastUse = ++g_texTick;
+        ++g_texStatHits;
         return &it->second;
     }
 
-    size_t neededBytes = static_cast<size_t>(slot.width) * static_cast<size_t>(slot.height) * sizeof(uint32_t) * 4 / 3;
-    if (g_texCacheBytes + neededBytes > kMaxTexCacheBytes) {
-        g_texCache.clear();
-        g_texCacheBytes = 0;
+    // RGBA8888 per texel; the old estimate added 33% on top, which made the cache hit its cap a
+    // third too early and then cleared *everything*.  That total wipe is what cost 2 seconds per
+    // frame: every other frame re-decoded the whole menu texture set.
+    const size_t neededBytes = static_cast<size_t>(slot.width) * static_cast<size_t>(slot.height) * sizeof(uint32_t);
+    const bool fitsCache = neededBytes <= kMaxTexCacheBytes;
+    if (fitsCache) {
+        // Evict least-recently-used entries instead of dropping the whole cache.
+        while (g_texCacheBytes + neededBytes > kMaxTexCacheBytes && !g_texCache.empty()) {
+            auto victim = g_texCache.end();
+            for (auto scan = g_texCache.begin(); scan != g_texCache.end(); ++scan) {
+                if (victim == g_texCache.end() || scan->second.lastUse < victim->second.lastUse)
+                    victim = scan;
+            }
+            if (victim == g_texCache.end()) break;
+            g_texCacheBytes -= static_cast<size_t>(victim->second.width) *
+                static_cast<size_t>(victim->second.height) * sizeof(uint32_t);
+            g_texCache.erase(victim);
+            ++g_texStatEvictions;
+        }
     }
 
-    // On an Old 3DS the host heap can be nearly empty, so the decode buffer allocation can fail.
-    // That used to escape as std::bad_alloc and take the whole app down (the emulator shows 0 FPS
-    // with the last frame frozen).  Drop the cache and retry once, and if the allocation still
-    // fails just draw the quad untextured; a missing texture must never stop the game.
+    // Decode target: the cache when the texture fits, otherwise a reusable scratch buffer, so an
+    // oversized texture is never cached and never wipes the cache.  Allocation failure (a very
+    // tight Old 3DS heap) frees the cache once and retries, then gives up and draws untextured.
     const size_t pixels = static_cast<size_t>(slot.width) * static_cast<size_t>(slot.height);
-    try {
-        DecodedTex& tex = g_texCache[key];
-        tex.width = slot.width;
-        tex.height = slot.height;
-        tex.format = slot.format;
-        tex.hash = sampleHash;
-        tex.rgba.assign(pixels, 0xFFFFFFFFu);
-    } catch (const std::bad_alloc&) {
-        g_texCache.clear();
-        g_texCacheBytes = 0;
+    DecodedTex* target = nullptr;
+    for (int attempt = 0; attempt < 2 && target == nullptr; ++attempt) {
         try {
-            DecodedTex& tex = g_texCache[key];
-            tex.width = slot.width;
-            tex.height = slot.height;
-            tex.format = slot.format;
-            tex.hash = sampleHash;
-            tex.rgba.assign(pixels, 0xFFFFFFFFu);
+            if (fitsCache) {
+                auto stale = g_texCache.find(key);
+                if (stale != g_texCache.end()) {
+                    g_texCacheBytes -= static_cast<size_t>(stale->second.width) *
+                        static_cast<size_t>(stale->second.height) * sizeof(uint32_t);
+                    g_texCache.erase(stale);
+                }
+                DecodedTex& tex = g_texCache[key];
+                tex.width = slot.width;
+                tex.height = slot.height;
+                tex.format = slot.format;
+                tex.hash = sampleHash;
+                tex.lastUse = ++g_texTick;
+                tex.rgba.assign(pixels, 0xFFFFFFFFu);
+                g_texCacheBytes += neededBytes;
+                target = &tex;
+            } else {
+                g_texScratch.width = slot.width;
+                g_texScratch.height = slot.height;
+                g_texScratch.format = slot.format;
+                g_texScratch.hash = sampleHash;
+                g_texScratch.mips.clear();
+                g_texScratch.rgba.assign(pixels, 0xFFFFFFFFu);
+                target = &g_texScratch;
+            }
         } catch (const std::bad_alloc&) {
+            g_texCache.erase(key);
+            if (attempt == 0 && !g_texCache.empty()) {
+                g_texCache.clear();
+                g_texCacheBytes = 0;
+                continue;
+            }
             static uint32_t s_texFailLogs = 0;
             if (s_texFailLogs < 8) {
                 ++s_texFailLogs;
@@ -1312,13 +1359,14 @@ static const DecodedTex* GetOrDecodeTexture(const TexSlot& slot) {
                     slot.width, slot.height, slot.format, neededBytes / 1024,
                     g_texCacheBytes / 1024, HostHeapFreeKb());
             }
-            g_texCache.erase(key);
             return nullptr;
         }
     }
+    if (target == nullptr) return nullptr;
 
-    DecodedTex& tex = g_texCache[key];
-    g_texCacheBytes += neededBytes;
+    DecodedTex& tex = *target;
+    ++g_texStatDecodes;
+    g_texStatTexels += pixels;
 
     const int w = slot.width;
     const int h = slot.height;
@@ -1486,7 +1534,6 @@ static const DecodedTex* GetOrDecodeTexture(const TexSlot& slot) {
     default:
         break;
     }
-    BuildMipChain(tex);
     return &tex;
 }
 
@@ -1575,6 +1622,16 @@ static inline uint32_t SampleTexture(const DecodedTex* tex, const TexSlot& slot,
     const bool repeatS = slot.wrapS != 0;
     const bool repeatT = slot.wrapT != 0;
     int level = 0;
+    if (lod > 0.0f && g_gx.projType != 1) {
+        if (tex->mips.empty()) {
+            BuildMipChain(const_cast<DecodedTex&>(*tex));
+            // Mips are real memory for the cache budget too (previously uncounted, which let the
+            // cache grow a third past its cap and thrash).
+            size_t mipBytes = 0;
+            for (const auto& levelData : tex->mips) mipBytes += levelData.size() * sizeof(uint32_t);
+            g_texCacheBytes += mipBytes;
+        }
+    }
     if (lod > 0.0f && !tex->mips.empty()) {
         level = static_cast<int>(lod + 0.5f);
         if (level > static_cast<int>(tex->mips.size())) level = static_cast<int>(tex->mips.size());
@@ -7708,7 +7765,29 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         // Heartbeat: if the device stops producing frames, the last Beat line shows the frame, the
         // section being booted and how much host heap was left - a frozen screen otherwise says
         // nothing at all.
+        if (s_frameCount == 200) {   // one-off: what is actually in the texture cache?
+            size_t mipBytes = 0;
+            size_t baseBytes = 0;
+            for (const auto& kv : gx_bridge::g_texCache) {
+                const auto& t = kv.second;
+                baseBytes += static_cast<size_t>(t.width) * t.height * 4;
+                for (const auto& m : t.mips) mipBytes += m.size() * 4;
+            }
+            AppLog("[TexDump] entries=%zu base=%zuKB mips=%zuKB accounted=%zuKB cap=%zuKB\n",
+                gx_bridge::g_texCache.size(), baseBytes / 1024, mipBytes / 1024,
+                gx_bridge::g_texCacheBytes / 1024, gx_bridge::kMaxTexCacheBytes / 1024);
+        }
         if (s_frameCount % 20 == 0) {
+#ifdef __3DS__
+            static u64 s_lastTick = 0;
+            const u64 nowTick = osGetTime();
+            const double msPerFrame = s_lastTick ? static_cast<double>(nowTick - s_lastTick) / 20.0 : 0.0;
+            s_lastTick = nowTick;
+            AppLog("[Beat] f=%u fps=%.1f msPerFrame=%.1f", s_frameCount,
+                msPerFrame > 0.0 ? 1000.0 / msPerFrame : 0.0, msPerFrame);
+#else
+            AppLog("[Beat] f=%u", s_frameCount);
+#endif
             const uint32_t smBeat = Memory::Read32(0x809C1E38u);
             const uint32_t nextSec = (smBeat && Memory::Contains(smBeat + 16, 4))
                 ? Memory::Read32(smBeat + 12) : 0u;
@@ -7719,8 +7798,15 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 ? Memory::Read32(sceneMgr + 36) : 0u;
             const uint32_t sceneState = (scene && Memory::Contains(scene + 8, 4))
                 ? Memory::Read32(scene + 4) : 0u;
-            AppLog("[Beat] f=%u nextSec=%u sceneState=%u hostHeapFree=%zuKB texCache=%zuKB\n",
-                s_frameCount, nextSec, sceneState, HostHeapFreeKb(), gx_bridge::g_texCacheBytes / 1024);
+            AppLog(" nextSec=%u sceneState=%u hostHeapFree=%zuKB texCache=%zuKB"
+                   " texDecode=%u texHit=%u texEvict=%u texTexels=%u\n",
+                nextSec, sceneState, HostHeapFreeKb(), gx_bridge::g_texCacheBytes / 1024,
+                gx_bridge::g_texStatDecodes, gx_bridge::g_texStatHits,
+                gx_bridge::g_texStatEvictions, static_cast<uint32_t>(gx_bridge::g_texStatTexels));
+            gx_bridge::g_texStatDecodes = 0;
+            gx_bridge::g_texStatHits = 0;
+            gx_bridge::g_texStatEvictions = 0;
+            gx_bridge::g_texStatTexels = 0;
         }
         // --- Controller registration ------------------------------------------------
         // MKWii binds a pad inside SectionPad::Update, but only while the current Scene is in
