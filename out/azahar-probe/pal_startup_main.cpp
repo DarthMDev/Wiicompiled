@@ -4222,7 +4222,11 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     }
     if (target == 0x8085151Cu || target == 0x808515A0u || target == 0x808516ACu ||
         target == 0x805EFE40u || target == 0x805EEF20u || target == 0x805EEC58u ||
-        target == 0x8062B240u || target == 0x80626078u || target == 0x806261E8u) {
+        target == 0x8062B240u || target == 0x80626078u || target == 0x806261E8u ||
+        target == 0x8063AD64u || target == 0x8063B698u || target == 0x8063C210u ||
+        target == 0x80850DB0u || target == 0x808503DCu || target == 0x80850D54u ||
+        target == 0x8063AFC8u || target == 0x8063C398u || target == 0x8063AE94u ||
+        target == 0x8063C27Cu || target == 0x8063B7F0u) {
         static std::set<uint32_t> s_seenAction;
         if (s_seenAction.size() < 24 && s_seenAction.insert(target).second) {
             AppLog("[MenuAction] target=%08X this=%08X r4=%08X r5=%08X lr=%08X frame=%u\n",
@@ -7598,12 +7602,47 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 #endif
             std::fflush(stdout);
         }
-        if (s_frameCount >= 80 && s_frameCount <= 140 && s_frameCount % 10 == 0) {
+        if (s_frameCount >= 190 && s_frameCount <= 240 && s_frameCount % 2 == 0) {
+            const uint32_t smp = Memory::Read32(0x809C1E38u);
+            if (smp && Memory::Contains(smp + 52, 32)) {
+                const uint32_t pad = smp + 52;
+                AppLog("[PadState] frame=%u cur0=%08X new0=%08X st0=%08X\n", s_frameCount,
+                    Memory::Read32(pad + 4), Memory::Read32(pad + 8), Memory::Read32(pad + 12));
+            }
+        }
+        if (s_frameCount >= 80 && s_frameCount <= 400 && s_frameCount % 20 == 0) {
             // func_80554E14 reads *(0x809C0000 - 10504) = *(0x809BD6F8), then +76.
             const uint32_t gateMgr = Memory::Read32(0x809BD6F8u);
             const uint32_t gateFlag = (gateMgr && Memory::Contains(gateMgr + 76, 1)) ? Memory::Read8(gateMgr + 76) : 0xFFu;
             const uint32_t arcMgr = Memory::Read32(0x809BD748u);
             AppLog("[PageGate] frame=%u gateMgr=%08X flag=%u arcMgr=%08X\n", s_frameCount, gateMgr, gateFlag, arcMgr);
+            // Section page-layer stack: count at section+892, stack at section+852.
+            // Section::IsPageTopLayer() gates Pages::Title::AfterControlUpdate's input check on it,
+            // so an empty stack means the title page can never acknowledge a button press.
+            const uint32_t smp = Memory::Read32(0x809C1E38u);
+            const uint32_t sec = (smp && Memory::Contains(smp, 4)) ? Memory::Read32(smp) : 0;
+            const uint32_t layerCount = (sec && Memory::Contains(sec + 892, 4)) ? Memory::Read32(sec + 892) : 0xFFFFFFFFu;
+            const uint32_t topPage = (layerCount != 0xFFFFFFFFu && layerCount >= 1 && layerCount <= 32 &&
+                                      Memory::Contains(sec + 852 + 4 * (layerCount - 1), 4))
+                ? Memory::Read32(sec + 852 + 4 * (layerCount - 1)) : 0;
+            AppLog("[PageLayer] frame=%u sec=%08X count=%u top=%08X\n", s_frameCount, sec, layerCount, topPage);
+            if (smp && Memory::Contains(smp + 52, 96)) {
+                const uint32_t pad = smp + 52;
+                for (int i = 0; i < 4; ++i) {
+                    const uint32_t e = pad + i * 16;
+                    AppLog("[PageLayer]   pad[%d] +0=%08X +4=%08X +8=%08X +C=%08X\n", i,
+                        Memory::Read32(e), Memory::Read32(e + 4),
+                        Memory::Read32(e + 8), Memory::Read32(e + 12));
+                }
+                AppLog("[PageLayer]   pad+84=%08X pad+88=%08X pad+92=%08X\n",
+                    Memory::Read32(pad + 84), Memory::Read32(pad + 88), Memory::Read32(pad + 92));
+            }
+            if (topPage && Memory::Contains(topPage, 848)) {
+                AppLog("[PageLayer]   top+8=%08X top+828=%u top+832=%d top+840=%u top+844=%u\n",
+                    Memory::Read32(topPage + 8), Memory::Read8(topPage + 828),
+                    static_cast<int32_t>(Memory::Read32(topPage + 832)),
+                    Memory::Read8(topPage + 840), Memory::Read32(topPage + 844));
+            }
         }
         if (s_frameCount <= 20 || s_frameCount % 40 == 0) {
             const uint32_t sm = Memory::Read32(0x809C1E38u);
