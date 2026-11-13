@@ -2984,6 +2984,9 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
         if (const char* st = std::getenv("MKW_FORCE_GLOBE_STATE")) {
             const uint32_t mgr = Memory::Read32(0x809C2144u);
             if (mgr && Memory::Contains(mgr + 30072, 4)) {
+                // +16 is the state machine's "active" flag; the update returns immediately
+                // while it is 0, so a state override alone never runs the handler.
+                if (Memory::Contains(mgr + 16, 4)) Memory::Write32(mgr + 16, 1);
                 Memory::Write32(mgr + 30072, static_cast<uint32_t>(std::atoi(st)));
             }
         }
@@ -4020,6 +4023,15 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         if (s_seenEarth.size() < 12 && s_seenEarth.insert(key).second) {
             AppLog("[EarthDraw] lr=%08X target=%08X this=%08X frame=%u\n",
                 cpu->lr, target, cpu->gpr[3], gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x8059DFBCu || target == 0x8059E080u || target == 0x8059E0E4u) {
+        static std::set<uint32_t> s_seenGlobeCtor;
+        const uint32_t key = (target << 16) ^ (cpu ? (cpu->lr & 0xFFFFu) : 0);
+        if (s_seenGlobeCtor.size() < 12 && s_seenGlobeCtor.insert(key).second) {
+            AppLog("[GlobeCtor] target=%08X lr=%08X pc=%08X this=%08X frame=%u\n",
+                target, cpu ? cpu->lr : 0, cpu ? cpu->pc : 0, cpu ? cpu->gpr[3] : 0,
+                gx_bridge::g_gxFrame);
         }
     }
     if (target == 0x80554D10u || target == 0x80554E6Cu || target == 0x80554AD4u) {
