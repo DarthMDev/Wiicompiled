@@ -1282,12 +1282,42 @@ static const DecodedTex* GetOrDecodeTexture(const TexSlot& slot) {
         g_texCacheBytes = 0;
     }
 
+    // On an Old 3DS the host heap can be nearly empty, so the decode buffer allocation can fail.
+    // That used to escape as std::bad_alloc and take the whole app down (the emulator shows 0 FPS
+    // with the last frame frozen).  Drop the cache and retry once, and if the allocation still
+    // fails just draw the quad untextured; a missing texture must never stop the game.
+    const size_t pixels = static_cast<size_t>(slot.width) * static_cast<size_t>(slot.height);
+    try {
+        DecodedTex& tex = g_texCache[key];
+        tex.width = slot.width;
+        tex.height = slot.height;
+        tex.format = slot.format;
+        tex.hash = sampleHash;
+        tex.rgba.assign(pixels, 0xFFFFFFFFu);
+    } catch (const std::bad_alloc&) {
+        g_texCache.clear();
+        g_texCacheBytes = 0;
+        try {
+            DecodedTex& tex = g_texCache[key];
+            tex.width = slot.width;
+            tex.height = slot.height;
+            tex.format = slot.format;
+            tex.hash = sampleHash;
+            tex.rgba.assign(pixels, 0xFFFFFFFFu);
+        } catch (const std::bad_alloc&) {
+            static uint32_t s_texFailLogs = 0;
+            if (s_texFailLogs < 8) {
+                ++s_texFailLogs;
+                AppLog("[TexFail] %ux%u fmt=%u needs=%zuKB cache=%zuKB hostHeapFree=%zuKB\n",
+                    slot.width, slot.height, slot.format, neededBytes / 1024,
+                    g_texCacheBytes / 1024, HostHeapFreeKb());
+            }
+            g_texCache.erase(key);
+            return nullptr;
+        }
+    }
+
     DecodedTex& tex = g_texCache[key];
-    tex.width = slot.width;
-    tex.height = slot.height;
-    tex.format = slot.format;
-    tex.hash = sampleHash;
-    tex.rgba.assign(static_cast<size_t>(slot.width) * static_cast<size_t>(slot.height), 0xFFFFFFFFu);
     g_texCacheBytes += neededBytes;
 
     const int w = slot.width;
@@ -1811,7 +1841,7 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
         // guest already maps canvas y (grows downward) onto NDC, so flipping here mirrors the whole
         // menu vertically - the title logo ended up at the bottom instead of the top.  The
         // perspective path keeps the flip.
-        const float ySign = -1.0f;  // GX NDC +y is up; keep the established mapping for now
+        const float ySign = -1.0f;  // keep the established mapping until the 2D UV convention is fixed
         if (fullVp) {
             cv[i].sx = (ndcX * 0.5f + 0.5f) * static_cast<float>(kScreenW);
             cv[i].sy = (0.5f + ySign * ndcY * 0.5f) * static_cast<float>(kScreenH);
@@ -1828,8 +1858,6 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
         cv[i].sz = ndcZ;
         cv[i].invW = invW;
         cv[i].u = vin.uv0[0];
-        // With the unflipped 2D screen mapping (see ySign above) the guest's UV origin is at the
-        // bottom, so V has to be mirrored for the orthographic layout pass to draw upright.
         cv[i].v = vin.uv0[1];
         if (vin.hasColor0) {
             cv[i].r = vin.color0[0];
@@ -1873,6 +1901,7 @@ static void RasterizeTriangle(const GxVertex& v0, const GxVertex& v1, const GxVe
             cv[i].b *= std::min(1.0f, ab + mb * ndl * lb);
         }
     }
+
 
     float area = (cv[1].sx - cv[0].sx) * (cv[2].sy - cv[0].sy) -
                  (cv[1].sy - cv[0].sy) * (cv[2].sx - cv[0].sx);
@@ -7675,6 +7704,24 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x8020FF9Cu: { // EGG::AsyncDisplay::endRender
         static uint32_t s_frameCount = 0;
         ++s_frameCount;
+        gx_bridge::PresentFrameTo3DS(s_frameCount);
+        // Heartbeat: if the device stops producing frames, the last Beat line shows the frame, the
+        // section being booted and how much host heap was left - a frozen screen otherwise says
+        // nothing at all.
+        if (s_frameCount % 20 == 0) {
+            const uint32_t smBeat = Memory::Read32(0x809C1E38u);
+            const uint32_t nextSec = (smBeat && Memory::Contains(smBeat + 16, 4))
+                ? Memory::Read32(smBeat + 12) : 0u;
+            const uint32_t rootSys = Memory::Read32(0x80385FC8u);
+            const uint32_t sceneMgr = (rootSys && Memory::Contains(rootSys + 88, 4))
+                ? Memory::Read32(rootSys + 84) : 0u;
+            const uint32_t scene = (sceneMgr && Memory::Contains(sceneMgr + 40, 4))
+                ? Memory::Read32(sceneMgr + 36) : 0u;
+            const uint32_t sceneState = (scene && Memory::Contains(scene + 8, 4))
+                ? Memory::Read32(scene + 4) : 0u;
+            AppLog("[Beat] f=%u nextSec=%u sceneState=%u hostHeapFree=%zuKB texCache=%zuKB\n",
+                s_frameCount, nextSec, sceneState, HostHeapFreeKb(), gx_bridge::g_texCacheBytes / 1024);
+        }
         // --- Controller registration ------------------------------------------------
         // MKWii binds a pad inside SectionPad::Update, but only while the current Scene is in
         // its "running" state (Scene+4 == 1) and only when the pad slot is in the *requested*
