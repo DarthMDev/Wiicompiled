@@ -2941,7 +2941,7 @@ static bool  g_gpuVFlip = false;    // flip V on textured quads (A/B for the lay
 static bool  g_gpuScissor = false;  // per-quad scissor (MKW_GPU_SCISSOR=1)
 static uint32_t g_gpuClearOverride = 0;   // MKW_GPU_CLEAR=RRGGBB, 0 = use the guest clear
 static uint32_t g_gpuDebugQuads = 0;      // dumps the first few quads' geometry
-static bool     g_gpuTestDraw = false;    // MKW_GPU_TEST=1 draws fixed reference quads
+static int      g_gpuTestMode = 0;        // 1 = reference pattern, 2 = layout with white texture
 static int      g_gpuProjUnif = 0;        // MKW_GPU_UNIF=n picks the projection uniform slot
 
 struct GpuQuadVtx { float x, y, u, v, r, g, b, a; };
@@ -2950,6 +2950,8 @@ struct GpuQuad {
     C3D_Tex* tex = nullptr;
     float uScale = 1.0f;
     float vScale = 1.0f;
+    int potW = 0;
+    int potH = 0;
     bool blend = true;
     int clip[4] = {0, 0, kScreenW, kScreenH};
 };
@@ -2958,6 +2960,8 @@ struct GpuTexEntry {
     bool valid = false;
     size_t bytes = 0;
     uint64_t lastUse = 0;
+    int potW = 0;
+    int potH = 0;
     float uScale = 1.0f;  // logical width  / padded width
     float vScale = 1.0f;
 };
@@ -3014,7 +3018,8 @@ static bool Gpu2dInit() {
     C3D_BindProgram(&g_gpuProgram);
     g_gpuProgramReady = true;
 
-    g_gpuTop = C3D_RenderTargetCreate(kScreenH, kScreenW, GPU_RB_RGBA8, -1);
+    g_gpuTop = C3D_RenderTargetCreate(kScreenH, kScreenW, GPU_RB_RGBA8,
+                                      GPU_RB_DEPTH24_STENCIL8);
     if (!g_gpuTop) {
         AppLog("[Gpu2d] C3D_RenderTargetCreate failed\n");
         return false;
@@ -3095,7 +3100,7 @@ static bool Gpu2dReadConfig() {
         const bool on = n != 0;
         any = true;
         if (std::strcmp(k, "gpu") == 0) g_gpu2d = on;
-        else if (std::strcmp(k, "test") == 0) g_gpuTestDraw = on;
+        else if (std::strcmp(k, "test") == 0) g_gpuTestMode = static_cast<int>(n);
         else if (std::strcmp(k, "unif") == 0) g_gpuProjUnif = static_cast<int>(n) & 3;
         else if (std::strcmp(k, "ysign") == 0) g_gpuYSpace = (n == 0) ? 0.0f : static_cast<float>(n);
         else if (std::strcmp(k, "vflip") == 0) g_gpuVFlip = on;
@@ -3109,7 +3114,7 @@ static bool Gpu2dReadConfig() {
     std::fclose(fp);
     if (any) AppLog("[Gpu2d] config sdmc:/mkwii/gpu.cfg loaded: gpu=%d test=%d unif=%d ysign=%.1f "
                     "vflip=%d scissor=%d debug=%u clear=%08X texmb=%zu\n",
-                    g_gpu2d ? 1 : 0, g_gpuTestDraw ? 1 : 0, g_gpuProjUnif, g_gpuYSpace,
+                    g_gpu2d ? 1 : 0, g_gpuTestMode, g_gpuProjUnif, g_gpuYSpace,
                     g_gpuVFlip ? 1 : 0, g_gpuScissor ? 1 : 0, g_gpuDebugQuads,
                     g_gpuClearOverride, g_gpuTexCap / (1024 * 1024));
     return any;
@@ -3124,7 +3129,7 @@ static void Gpu2dConfigure() {
         g_gpuClearOverride = static_cast<uint32_t>(std::strtoul(clr, nullptr, 16)) << 8 | 0xFFu;
     }
     g_gpuDebugQuads = std::getenv("MKW_GPU_NODEBUG") ? 0u : 4u;
-    g_gpuTestDraw = std::getenv("MKW_GPU_TEST") != nullptr;
+    if (const char* t = std::getenv("MKW_GPU_TEST")) g_gpuTestMode = std::atoi(t);
     if (const char* u = std::getenv("MKW_GPU_UNIF")) g_gpuProjUnif = std::atoi(u) & 3;
 #ifdef __3DS__
     Gpu2dReadConfig(); // the config file wins: it is the one that is easy to edit on device
@@ -3230,12 +3235,31 @@ static C3D_Tex* Gpu2dAcquireTexture(uint64_t key, const DecodedTex& dt,
         AppLog("[Gpu2d] C3D_TexInit failed %dx%d (have %zuKB)\n", potW, potH, g_gpuTexBytes / 1024);
         return nullptr;
     }
-    C3D_TexUpload(&entry.tex, packed.data());
+    // C3D_TexUpload converts the image with a GPU transfer, so the source must be LINEAR memory.
+    // A plain heap buffer silently produced an EMPTY texture: the layout quads then modulated
+    // texture(0,0,0,0) into the framebuffer and vanished under alpha blending, while the white
+    // reference texture (uploaded the same way, but 8x8 of 0xFFFF) still worked.
+    void* staging = linearAlloc(bytes);
+    if (staging) {
+        std::memcpy(staging, packed.data(), bytes);
+        // linearAlloc memory is cache-coherent for CPU writes on the 3DS;
+        C3D_TexUpload(&entry.tex, staging);
+        linearFree(staging);
+    } else {
+        AppLog("[Gpu2d] linearAlloc(%zu) failed, uploading from the heap\n", bytes);
+        C3D_TexUpload(&entry.tex, packed.data());
+    }
+    AppLog("[Gpu2d] upload pot=%dx%d %s texel0=%04X texel1=%04X region=%dx%d",
+        potW, potH, opaque ? "RGB565" : "RGBA4", packed.empty() ? 0u : packed[0],
+        packed.size() < 2 ? 0u : packed[1], dt.width, dt.height);
+    AppLog("\n");
     C3D_TexSetFilter(&entry.tex, GPU_LINEAR, GPU_LINEAR);
     C3D_TexSetWrap(&entry.tex, GPU_CLAMP_TO_EDGE, GPU_CLAMP_TO_EDGE);
     entry.valid = true;
     entry.bytes = bytes;
     entry.lastUse = ++g_gpuTexTick;
+    entry.potW = potW;
+    entry.potH = potH;
     entry.uScale = static_cast<float>(dt.width) / static_cast<float>(potW);
     entry.vScale = static_cast<float>(dt.height) / static_cast<float>(potH);
     g_gpuTexBytes += bytes;
@@ -3279,8 +3303,16 @@ static void Gpu2dRecordQuad(const GxVertex v[4]) {
     if (slotIdx >= 0 && v[0].hasUv0) {
         const TexSlot& slot = g_gx.texSlots[slotIdx];
         dt = GetOrDecodeTexture(slot);
-        if (dt) tex = Gpu2dAcquireTexture(TexSlotKey(slot), *dt, &q.uScale, &q.vScale);
+        if (dt) {
+            tex = Gpu2dAcquireTexture(TexSlotKey(slot), *dt, &q.uScale, &q.vScale);
+            for (const auto& entry : g_gpuTextures) {
+                if (&entry.second.tex == tex) { q.potW = entry.second.potW; q.potH = entry.second.potH; }
+            }
+        }
     }
+    // test=2 draws the real layout with the white texture substituted, to separate "the geometry
+    // and blending work" from "the uploaded texture samples as nothing".
+    if (g_gpuTestMode == 2 && g_gpuWhiteValid) { tex = &g_gpuWhite; q.uScale = 1.0f; q.vScale = 1.0f; }
     q.tex = tex;
     q.blend = (g_gx.blendMode != 0);
     q.clip[0] = g_gx.clipX0;
@@ -3303,6 +3335,9 @@ static void Gpu2dRecordQuad(const GxVertex v[4]) {
             q.v[0].r, q.v[0].g, q.v[0].b, q.v[0].a,
             dt ? dt->width : 0u, dt ? dt->height : 0u, q.blend ? 1u : 0u,
             q.clip[0], q.clip[1], q.clip[2], q.clip[3], g_gx.proj[0][0], g_gx.proj[1][1]);
+        AppLog("[Gpu2d Tex] f=%u gputex=%s pot=%dx%d uScale=%.3f vScale=%.3f cpuFirst=%08X\n",
+            g_gxFrame, q.tex ? "ok" : "null", q.potW, q.potH, q.uScale, q.vScale,
+            (dt && !dt->rgba.empty()) ? dt->rgba[0] : 0u);
     }
     g_gpuQuads.push_back(q);
     ++g_gpuQuadsRecorded;
@@ -3394,6 +3429,30 @@ static void Gpu2dRender() {
     }
 
     g_gpuQuadsDrawn = 0;
+    // test=1: a pure reference pattern (full-screen quad + two blocks) instead of the guest's
+    // layout.  If this does not appear, nothing about the frame setup works and the guest is not
+    // involved at all.
+    if (g_gpuTestMode == 1) {
+        static bool s_logged = false;
+        if (!s_logged) { s_logged = true; AppLog("[Gpu2d] drawing the reference pattern\n"); }
+        C3D_TexBind(0, g_gpuWhiteValid ? &g_gpuWhite : nullptr);
+        C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
+        const float fx[4] = {0.0f, 400.0f, 0.0f, 400.0f};
+        const float fy[4] = {0.0f, 0.0f, 240.0f, 240.0f};
+        for (int i = 0; i < 4; ++i) {
+            float cx = 0.0f, cy = 0.0f;
+            TransformToClip(g_gpuProj, fx[i], fy[i], &cx, &cy);
+            C3D_ImmSendAttrib(cx, cy, 0.0f, 1.0f);
+            C3D_ImmSendAttrib(0.5f, 0.5f, 0.0f, 0.0f);
+            C3D_ImmSendAttrib(0.0f, 0.45f, 0.9f, 1.0f); // blue-green, unmistakable
+        }
+        C3D_ImmDrawEnd();
+        ++g_gpuQuadsDrawn;
+        C3D_SetScissor(static_cast<GPU_SCISSORMODE>(0), 0, 0, 0, 0);
+        C3D_FrameEnd(0);
+        g_gpuQuads.clear();
+        return;
+    }
     for (const GpuQuad& q : g_gpuQuads) {
         C3D_Tex* tex = q.tex;
         // UVs address the logical texture; the VRAM copy is padded up to power-of-two, so the
@@ -3433,7 +3492,7 @@ static void Gpu2dRender() {
     // MKW_GPU_TEST: two reference quads at known coordinates.  If these appear the pipeline
     // (projection uniform, TEV, blend, presentation) works and only the guest geometry is wrong;
     // if they do not, the fault is in the frame setup itself.
-    if (g_gpuTestDraw) {
+    if (g_gpuTestMode == 1) {
         C3D_TexBind(0, g_gpuWhiteValid ? &g_gpuWhite : nullptr);
         C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
         const float xs[4] = {20.0f, 180.0f, 20.0f, 180.0f};
