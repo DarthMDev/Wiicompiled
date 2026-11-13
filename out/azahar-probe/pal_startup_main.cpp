@@ -594,6 +594,7 @@ int main()
     }
 
 #ifdef __3DS__
+    AppLogFlush();
     std::puts("\nSTART to exit");
     while (aptMainLoop()) {
         hidScanInput();
@@ -2905,7 +2906,9 @@ static float g_gpuYSpace = -1.0f;   // canvas y -> screen y sign (the software p
 static bool  g_gpuVFlip = false;    // flip V on textured quads (A/B for the layout mirror)
 static bool  g_gpuScissor = false;  // per-quad scissor (MKW_GPU_SCISSOR=1)
 static uint32_t g_gpuClearOverride = 0;   // MKW_GPU_CLEAR=RRGGBB, 0 = use the guest clear
-static uint32_t g_gpuDebugQuads = 0;      // MKW_GPU_DEBUG=1 dumps the first quads' geometry
+static uint32_t g_gpuDebugQuads = 0;      // dumps the first few quads' geometry
+static bool     g_gpuTestDraw = false;    // MKW_GPU_TEST=1 draws fixed reference quads
+static int      g_gpuProjUnif = 0;        // MKW_GPU_UNIF=n picks the projection uniform slot
 
 struct GpuQuadVtx { float x, y, u, v, r, g, b, a; };
 struct GpuQuad {
@@ -3021,7 +3024,9 @@ static void Gpu2dConfigure() {
     if (const char* clr = std::getenv("MKW_GPU_CLEAR")) {
         g_gpuClearOverride = static_cast<uint32_t>(std::strtoul(clr, nullptr, 16)) << 8 | 0xFFu;
     }
-    g_gpuDebugQuads = std::getenv("MKW_GPU_DEBUG") ? 4u : 0u;
+    g_gpuDebugQuads = std::getenv("MKW_GPU_NODEBUG") ? 0u : 4u;
+    g_gpuTestDraw = std::getenv("MKW_GPU_TEST") != nullptr;
+    if (const char* u = std::getenv("MKW_GPU_UNIF")) g_gpuProjUnif = std::atoi(u) & 3;
     if (const char* mb = std::getenv("MKW_GPU_TEX_MB")) {
         const long v = std::atol(mb);
         if (v > 0) g_gpuTexCap = static_cast<size_t>(v) * 1024ull * 1024ull;
@@ -3232,8 +3237,11 @@ static void Gpu2dRender() {
     const uint32_t clear = g_gpuClearOverride ? g_gpuClearOverride : guestClear;
     C3D_RenderTargetClear(g_gpuTop, C3D_CLEAR_ALL, clear, 0);
     C3D_FrameDrawOn(g_gpuTop);
-    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, 0, &g_gpuProj);
-    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, 3, &g_gpuModelView);
+    // citro3d's built-in vertex shader takes the projection in one fixed uniform slot and the
+    // modelview in another; MKW_GPU_UNIF lets the pair be swapped on hardware if the default is
+    // wrong (the symptom would be geometry transformed by an all-zero matrix, i.e. nothing drawn).
+    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_gpuProjUnif, &g_gpuProj);
+    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, g_gpuProjUnif == 0 ? 3 : 0, &g_gpuModelView);
 
     // Anything the software path drew (3D) is composited underneath the layout.
     // Any pixel the software path produced (3D, or a 2D draw that did not come through the
@@ -3289,6 +3297,35 @@ static void Gpu2dRender() {
         ++g_gpuQuadsDrawn;
     }
     if (g_gpuScissor) C3D_SetScissor(static_cast<GPU_SCISSORMODE>(0), 0, 0, 0, 0);
+
+    // MKW_GPU_TEST: two reference quads at known coordinates.  If these appear the pipeline
+    // (projection uniform, TEV, blend, presentation) works and only the guest geometry is wrong;
+    // if they do not, the fault is in the frame setup itself.
+    if (g_gpuTestDraw) {
+        C3D_TexBind(0, g_gpuWhiteValid ? &g_gpuWhite : nullptr);
+        C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
+        const float xs[4] = {20.0f, 180.0f, 20.0f, 180.0f};
+        const float ys[4] = {20.0f, 20.0f, 100.0f, 100.0f};
+        for (int i = 0; i < 4; ++i) {
+            C3D_ImmSendAttrib(xs[i], ys[i], 0.0f, 1.0f);
+            C3D_ImmSendAttrib(0.5f, 0.5f, 0.0f, 0.0f);
+            C3D_ImmSendAttrib(1.0f, 0.0f, 1.0f, 1.0f);
+        }
+        C3D_ImmDrawEnd();
+        if (g_gpuWhiteValid) {
+            // Same quad, untextured white texture, to prove texture sampling as well.
+            C3D_TexBind(0, &g_gpuWhite);
+            C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
+            const float xs2[4] = {200.0f, 380.0f, 200.0f, 380.0f};
+            const float ys2[4] = {20.0f, 20.0f, 100.0f, 100.0f};
+            for (int i = 0; i < 4; ++i) {
+                C3D_ImmSendAttrib(xs2[i], ys2[i], 0.0f, 1.0f);
+                C3D_ImmSendAttrib(0.25f, 0.25f, 0.0f, 0.0f);
+                C3D_ImmSendAttrib(0.0f, 1.0f, 0.0f, 1.0f);
+            }
+            C3D_ImmDrawEnd();
+        }
+    }
     C3D_FrameEnd(0);
     g_gpuQuads.clear();
 }
