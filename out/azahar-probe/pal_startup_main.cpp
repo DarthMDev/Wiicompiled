@@ -2922,6 +2922,27 @@ static void PresentFrameTo3DS(uint32_t frameNumber) {
                     frameNumber, mgr, Memory::Read32(mgr + 30072), Memory::Read32(mgr + 30076));
             }
         }
+        {
+            // 444-byte "menu director" created by func_8077EF84 right before the globe object.
+            // Its fields are the strongest candidate for the missing globe sub-objects.
+            const uint32_t dir = Memory::Read32(0x809C2DF0u);
+            if (dir && Memory::Contains(dir, 444)) {
+                char buf[512];
+                int n = std::snprintf(buf, sizeof(buf), "[MenuDirector] frame=%u obj=%08X vt=%08X",
+                    frameNumber, dir, Memory::Read32(dir));
+                for (int i = 1; i < 16 && n > 0 && n < static_cast<int>(sizeof(buf)) - 16; ++i) {
+                    n += std::snprintf(buf + n, sizeof(buf) - static_cast<size_t>(n), " +%02X=%08X", i * 4, Memory::Read32(dir + i * 4));
+                }
+                AppLog("%s\n", buf);
+            }
+            const uint32_t go = Memory::Read32(0x809C1988u);
+            if (go && Memory::Contains(go, 64)) {
+                AppLog("[GlobeFields] frame=%u obj=%08X vt=%08X p16=%08X p20=%08X p24=%08X p28=%08X b32=%u b33=%u p60=%08X\n",
+                    frameNumber, go, Memory::Read32(go), Memory::Read32(go + 16),
+                    Memory::Read32(go + 20), Memory::Read32(go + 24), Memory::Read32(go + 28),
+                    Memory::Read8(go + 32), Memory::Read8(go + 33), Memory::Read32(go + 60));
+            }
+        }
         if (gx_bridge::g_panicTotal != 0 && (frameNumber % 200 == 0)) {
             std::string sites;
             uint32_t shown = 0;
@@ -3632,6 +3653,28 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
         s_lastTarget = target;
         s_lastLr = cpu ? cpu->lr : 0;
+    }
+    // Watch the menu director's +04/+08/+0C/+10 slots (created by func_8077EF84). +08 is the
+    // globe object; +04/+0C/+10 are the candidates for its missing drawable sub-objects.
+    {
+        static uint32_t s_lastDir[4] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+        static uint32_t s_lastDirTarget = 0;
+        static uint32_t s_lastDirLr = 0;
+        const uint32_t dir = Memory::Read32(0x809C2DF0u);
+        if (dir && Memory::Contains(dir + 16, 4)) {
+            const uint32_t slots[4] = {
+                Memory::Read32(dir + 4), Memory::Read32(dir + 8),
+                Memory::Read32(dir + 12), Memory::Read32(dir + 16)
+            };
+            if ((slots[0] | slots[1] | slots[2] | slots[3]) != (s_lastDir[0] | s_lastDir[1] | s_lastDir[2] | s_lastDir[3])) {
+                AppLog("[DirWatch] +04=%08X +08=%08X +0C=%08X +10=%08X prevTarget=%08X prevLr=%08X nowTarget=%08X nowLr=%08X frame=%u\n",
+                    slots[0], slots[1], slots[2], slots[3], s_lastDirTarget, s_lastDirLr,
+                    target, cpu ? cpu->lr : 0, gx_bridge::g_gxFrame);
+                for (int i = 0; i < 4; ++i) s_lastDir[i] = slots[i];
+            }
+        }
+        s_lastDirTarget = target;
+        s_lastDirLr = cpu ? cpu->lr : 0;
     }
     // Stack-depth guard. Each recompiled guest frame consumes ~4 KB of host stack (0xF20 in the
     // prologue), so a guest loop that recurses a few thousand deep overflows the stack and dies
