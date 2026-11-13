@@ -80,7 +80,9 @@ static constexpr uint32_t guestBase = 0x80000000u;
 static constexpr size_t guestSize = 0x01800000u;
 static uint8_t* guestRam;
 static constexpr uint32_t mem2Base = 0x90000000u;
-static size_t mem2Size = 32u * 1024 * 1024; // ARM11 falls back to 28/24/20 MiB.
+static size_t mem2Size = 48u * 1024 * 1024; // Wii MEM2 is 64 MiB; the title UI archive needs
+                                             // ~12 MiB of free MEM2 on top of the menu heaps.
+                                             // ARM11 falls back to 28/24/20 MiB.
 static uint8_t* mem2Ram;
 static constexpr uint32_t kRaceSzsBase = 0x95000000u;
 static constexpr size_t kRaceSzsSize = 6u * 1024 * 1024;
@@ -327,6 +329,10 @@ static bool prepare_memory()
         }
     }
 #else
+    if (const char* mb = std::getenv("MKW_MEM2_MB")) {
+        const long v = std::strtol(mb, nullptr, 10);
+        if (v >= 16 && v <= 64) mem2Size = static_cast<size_t>(v) * 1024 * 1024;
+    }
     mem2Ram = static_cast<uint8_t*>(std::calloc(1, mem2Size));
 #endif
     if (!mem2Ram) {
@@ -4068,6 +4074,133 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 cpu->lr, target, cpu->gpr[3], gx_bridge::g_gxFrame);
         }
     }
+    {
+        static const uint32_t kLifecycle[] = {
+            0x805BD3A8u, 0x805BD518u, 0x805BD720u, 0x805BDBE0u,
+            0x8063CE6Cu, 0x8063D004u, 0x8063DAC0u, 0x8063D954u,
+            0x8063D278u, 0x8063D268u,
+            0x808504E4u, // Pages::MainMenu::CreateExternalControl
+            0x80850580u, // Pages::MainMenu::CreateControl
+            0x8060245Cu, // Page::InitControlGroup
+            0x8060246Cu, // Page::AddControl
+            0x805C2868u, // ControlGroup::InitControls
+            0x80601D24u, // Page::Init
+            0x80836B9Cu, // Pages::Menu::OnInit
+            0x8083752Cu, // Pages::Menu::SelectButton
+            0x805C2620u, // ControlGroup::Init(Page)
+        };
+        for (uint32_t lc : kLifecycle) {
+            if (target == lc) {
+                static std::set<uint64_t> s_seenLife;
+                const uint32_t th = cpu ? cpu->gpr[3] : 0;
+                const uint64_t lk = (static_cast<uint64_t>(target) << 32) | th;
+                if (s_seenLife.size() < 48 && s_seenLife.insert(lk).second) {
+                    AppLog("[Lifecycle] tgt=%08X this=%08X r4=%08X r5=%08X p152=%08X lr=%08X frame=%u\n",
+                        target, th, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0,
+                        (th && Memory::Contains(th + 152, 4)) ? Memory::Read32(th + 152) : 0,
+                        cpu ? cpu->lr : 0, gx_bridge::g_gxFrame);
+                }
+                break;
+            }
+        }
+    }
+    if (target == 0x805BDAF0u) {
+        static int s_seenBtn = 0;
+        if (cpu && s_seenBtn < 12) {
+            ++s_seenBtn;
+            const uint32_t th = cpu->gpr[3];
+            const uint32_t arr = (th && Memory::Contains(th + 152, 4)) ? Memory::Read32(th + 152) : 0;
+            AppLog("[BtnAnim] this=%08X vt=%08X slot=%u arr=%08X lr=%08X frame=%u\n", th,
+                (th && Memory::Contains(th, 4)) ? Memory::Read32(th) : 0, cpu->gpr[4], arr,
+                cpu->lr, gx_bridge::g_gxFrame);
+            if (arr && Memory::Contains(arr, 0x120)) {
+                for (int e = 0; e < 4; ++e) {
+                    const uint32_t o = arr + e * 68;
+                    AppLog("  elem%d=%08X: %08X %08X %08X %08X %08X %08X %08X %08X\n", e, o,
+                        Memory::Read32(o), Memory::Read32(o + 4), Memory::Read32(o + 8), Memory::Read32(o + 12),
+                        Memory::Read32(o + 16), Memory::Read32(o + 20), Memory::Read32(o + 24), Memory::Read32(o + 28));
+                }
+            }
+        }
+    }
+    if (target == 0x8063CBE4u && cpu) { // AnimationGroup::Update
+        const uint32_t g = cpu->gpr[3];
+        static int s_seenGrp = 0;
+        static bool s_reportedBad = false;
+        const uint32_t tbl = (g && Memory::Contains(g, 4)) ? Memory::Read32(g) : 0;
+        const uint32_t cnt = (g && Memory::Contains(g + 4, 4)) ? Memory::Read32(g + 4) : 0;
+        const uint32_t idx = (g && Memory::Contains(g + 56, 4)) ? Memory::Read32(g + 56) : 0;
+        const uint32_t slotPtr = (tbl && Memory::Contains(tbl + idx * 16, 4)) ? (tbl + idx * 16) : 0;
+        const uint32_t tr = slotPtr ? Memory::Read32(slotPtr) : 0;
+        const bool bad = (idx != 0xFFFFFFFFu) && (!slotPtr || !tr || !Memory::Contains(tr, 20));
+        if (bad && !s_reportedBad) {
+            s_reportedBad = true;
+            AppLog("[AnimGrpBad] g=%08X tbl=%08X cnt=%u idx=%u slot=%08X tr=%08X b53=%u f60=%g lr=%08X frame=%u\n",
+                g, tbl, cnt, idx, slotPtr, tr,
+                (g && Memory::Contains(g + 53, 1)) ? Memory::Read8(g + 53) : 0,
+                (g && Memory::Contains(g + 60, 4)) ? static_cast<float>(Memory::Read32(g + 60)) : 0.0f,
+                cpu->lr, gx_bridge::g_gxFrame);
+            if (tbl && Memory::Contains(tbl, 4)) {
+                for (int b = 0; b < 16; ++b) {
+                    AppLog("   tbl[%d]=%08X\n", b,
+                        Memory::Contains(tbl + b * 16, 4) ? Memory::Read32(tbl + b * 16) : 0);
+                }
+            }
+            if (g && Memory::Contains(g, 64)) {
+                for (int b = 0; b < 64; b += 16) {
+                    AppLog("   grp+%02X: %08X %08X %08X %08X\n", b,
+                        Memory::Read32(g + b), Memory::Read32(g + b + 4),
+                        Memory::Read32(g + b + 8), Memory::Read32(g + b + 12));
+                }
+            }
+        }
+        if (s_seenGrp < 40) {
+            const uint64_t k = (static_cast<uint64_t>(g) << 32) ^ idx;
+            static std::set<uint64_t> s_grpSeen;
+            if (s_grpSeen.insert(k).second) {
+                ++s_seenGrp;
+                AppLog("[AnimGrp] g=%08X tbl=%08X cnt=%u idx=%u tr=%08X lr=%08X frame=%u\n",
+                    g, tbl, cnt, idx, tr, cpu->lr, gx_bridge::g_gxFrame);
+            }
+        }
+    }
+    if (target == 0x80198CA8u || target == 0x80198D88u) {
+        static int s_heapLogs = 0;
+        const bool bigAlloc = (target == 0x80198D88u && cpu && cpu->gpr[4] >= 4194304u);
+        if (cpu && s_heapLogs < 40 && (target == 0x80198CA8u || bigAlloc)) {
+            ++s_heapLogs;
+            if (target == 0x80198CA8u) {
+                AppLog("[HeapCreate] start=%08X size=%u attr=%08X frame=%u\n",
+                    cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], gx_bridge::g_gxFrame);
+            } else {
+                AppLog("[HeapAlloc] heap=%08X size=%u align=%u frame=%u\n",
+                    cpu->gpr[3], cpu->gpr[4], cpu->gpr[5], gx_bridge::g_gxFrame);
+            }
+        }
+    }
+    if (target == 0x8063C91Cu || target == 0x805C4380u || target == 0x8063C820u) {
+        static std::set<uint64_t> s_seenAnimPlay;
+        if (cpu) {
+            const uint32_t obj = cpu->gpr[3];
+            const uint64_t key = (static_cast<uint64_t>(target) << 32) | obj;
+            if (s_seenAnimPlay.size() < 24 && s_seenAnimPlay.insert(key).second) {
+                const uint32_t tbl = (obj && Memory::Contains(obj, 4)) ? Memory::Read32(obj) : 0;
+                AppLog("[AnimPlay] tgt=%08X lr=%08X this=%08X idx=%u tbl=%08X lst=%08X cur=%08X b34=%u b35=%u f1=%g frame=%u\n",
+                    target, cpu->lr, obj, cpu->gpr[4], tbl,
+                    (obj && Memory::Contains(obj + 24, 4)) ? Memory::Read32(obj + 24) : 0,
+                    (obj && Memory::Contains(obj + 56, 4)) ? Memory::Read32(obj + 56) : 0,
+                    (obj && Memory::Contains(obj + 52, 1)) ? Memory::Read8(obj + 52) : 0,
+                    (obj && Memory::Contains(obj + 53, 1)) ? Memory::Read8(obj + 53) : 0,
+                    static_cast<float>(cpu->fpr[1].d), gx_bridge::g_gxFrame);
+                if (target == 0x805C4380u && obj && Memory::Contains(obj, 8)) {
+                    const uint32_t arr = Memory::Read32(obj + 152);
+                    AppLog("[AnimPlay]   arr=%08X elem0=%08X elem1=%08X\n", arr,
+                        arr ? Memory::Read32(arr) : 0,
+                        (arr && Memory::Contains(arr + 0x44, 4)) ? Memory::Read32(arr + 0x44) : 0);
+                }
+            }
+        }
+    }
     if (target == 0x8063C91Cu) {
         static std::set<uint32_t> s_seenListNull;
         const uint32_t obj = cpu ? cpu->gpr[3] : 0;
@@ -4677,6 +4810,12 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         if (++s_panicPrints <= 10) {
             AppLog("[NW4R Panic] %s:%u (caller lr=%08X): %s\n", fileStr.c_str(), line, cpu ? cpu->lr : 0, msgStr.c_str());
             if (cpu) {
+                const uint32_t sp = cpu->gpr[1];
+                AppLog("  savedlr=%08X f1=%g frame=%u\n",
+                    (sp && Memory::Contains(sp + 68, 4)) ? Memory::Read32(sp + 68) : 0,
+                    static_cast<float>(cpu->fpr[1].d), gx_bridge::g_gxFrame);
+            }
+            if (cpu) {
                 AppLog("  r20=%08X r29=%08X r30=%08X r31=%08X\n", cpu->gpr[20], cpu->gpr[29], cpu->gpr[30], cpu->gpr[31]);
                 if (cpu->gpr[30] && Memory::Contains(cpu->gpr[30], 64)) {
                     AppLog("  *(r30+20)=%08X *(r30+24)=%08X *(r30+28)=%08X\n",
@@ -4696,6 +4835,27 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                         node = Memory::Read32(node);
                     }
                     AppLog("  list:%s (tail=%08X sentinel=%08X)\n", buf, node, o31 + 24);
+                    for (int b = 0; b < 64; b += 16) {
+                        AppLog("  obj+%02X: %08X %08X %08X %08X\n", b,
+                            Memory::Read32(o31 + b), Memory::Read32(o31 + b + 4),
+                            Memory::Read32(o31 + b + 8), Memory::Read32(o31 + b + 12));
+                    }
+                    const uint32_t l0 = Memory::Read32(o31 + 24);
+                    if (l0 && Memory::Contains(l0, 64)) {
+                        for (int b = 0; b < 64; b += 16) {
+                            AppLog("  list+%02X: %08X %08X %08X %08X\n", b,
+                                Memory::Read32(l0 + b), Memory::Read32(l0 + b + 4),
+                                Memory::Read32(l0 + b + 8), Memory::Read32(l0 + b + 12));
+                        }
+                    }
+                    const uint32_t vt31 = Memory::Read32(o31);
+                    if (vt31 && Memory::Contains(vt31, 32)) {
+                        AppLog("  vt=%08X: %08X %08X %08X %08X %08X %08X %08X %08X\n", vt31,
+                            Memory::Read32(vt31), Memory::Read32(vt31 + 4),
+                            Memory::Read32(vt31 + 8), Memory::Read32(vt31 + 12),
+                            Memory::Read32(vt31 + 16), Memory::Read32(vt31 + 20),
+                            Memory::Read32(vt31 + 24), Memory::Read32(vt31 + 28));
+                    }
                 }
             }
         }
@@ -6491,6 +6651,17 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x80218C2Cu: { // EGG::Decomp::decodeSZS
         const uint32_t src = cpu->gpr[3];
         const uint32_t dst = cpu->gpr[4];
+        {
+            const uint32_t expSize = (src && Memory::Contains(src + 4, 4))
+                ? ((static_cast<uint32_t>(Memory::Read8(src + 4)) << 24) |
+                   (static_cast<uint32_t>(Memory::Read8(src + 5)) << 16) |
+                   (static_cast<uint32_t>(Memory::Read8(src + 6)) << 8) |
+                   static_cast<uint32_t>(Memory::Read8(src + 7)))
+                : 0u;
+            AppLog("[Decomp] decodeSZS src=%08X dst=%08X expand=%u lr=%08X r5=%08X r6=%08X r7=%08X frame=%u\n",
+                src, dst, expSize, cpu->lr, cpu->gpr[5], cpu->gpr[6], cpu->gpr[7],
+                gx_bridge::g_gxFrame);
+        }
         if (dst == 0) {
             AppLog("[Decomp] Rejecting decodeSZS to null destination!\n");
             cpu->gpr[3] = 0;
