@@ -1,38 +1,31 @@
 #ifdef __3DS__
 #include <3ds.h>
 #include <citro3d.h>
-// Pass-through vertex shader for the 2D layout pass, compiled with picasso from:
-//
-//   .out outpos position
-//   .out outtc texcoord0
-//   .out outcolor color
-//   .alias inpos v0
-//   .alias inuv v1
-//   .alias incolor v2
-//   .proc main
-//       mov outpos.xy, inpos.xy
-//       mov outpos.z, inpos.z
-//       mov outpos.w, inpos.w
-//       mov outtc.xy, inuv.xy
-//       mov outcolor, incolor
-//   .end
-//
-// (source kept as out/azahar-probe/runtime-overlay/gpu2d.v.pica; the binary is inlined here so the
-// tracked build needs no external tool step).  Positions arrive in clip space, so the shader
-// forwards them: no matrices, and therefore no dependence on citro3d's built-in shader uniforms.
+// Pass-through vertex shader for the 2D layout pass, compiled from
+// out/azahar-probe/runtime-overlay/gpu2d.v.pica. Its four attributes follow the native renderer's
+// packed Vertex layout: float3 position, float3 normal, float4 UVs, byte4 color. Positions are
+// pre-projected on the CPU; byte colors are normalized by 1/255 in the shader.
 static const uint8_t kGpu2dShader[] = {
-    68, 86, 76, 66, 1, 0, 0, 0, 104, 0, 0, 0, 68, 86, 76, 80,
-    0, 0, 0, 0, 40, 0, 0, 0, 5, 0, 0, 0, 60, 0, 0, 0,
-    4, 0, 0, 0, 92, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 0, 0, 0, 0, 0, 0, 76, 1, 0, 0, 76, 2, 0, 0, 76,
-    0, 16, 32, 76, 3, 32, 64, 76, 172, 2, 0, 0, 0, 0, 0, 0,
-    66, 21, 0, 0, 0, 0, 0, 0, 225, 31, 0, 0, 0, 0, 0, 0,
-    111, 3, 0, 0, 0, 0, 0, 0, 68, 86, 76, 69, 2, 16, 0, 0,
-    0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0,
-    64, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0,
-    64, 0, 0, 0, 3, 0, 0, 0, 88, 0, 0, 0, 0, 0, 0, 0,
-    88, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 0, 0,
-    3, 0, 1, 0, 15, 0, 0, 0, 2, 0, 2, 0, 15, 0, 0, 0,
+    68, 86, 76, 66, 1, 0, 0, 0, 104, 0, 0, 0,
+    68, 86, 76, 80, 0, 0, 0, 0, 40, 0, 0, 0,
+    5, 0, 0, 0, 60, 0, 0, 0, 4, 0, 0, 0,
+    92, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 76, 1, 240, 7, 76,
+    2, 32, 32, 76, 131, 225, 71, 32, 0, 0, 0, 136,
+    78, 3, 0, 0, 0, 0, 0, 0, 161, 10, 0, 0,
+    0, 0, 0, 0, 172, 2, 0, 0, 0, 0, 0, 0,
+    15, 192, 6, 0, 0, 0, 0, 0, 68, 86, 76, 69,
+    2, 16, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0,
+    0, 0, 7, 0, 0, 0, 0, 0, 64, 0, 0, 0,
+    2, 0, 0, 0, 104, 0, 0, 0, 0, 0, 0, 0,
+    104, 0, 0, 0, 3, 0, 0, 0, 128, 0, 0, 0,
+    0, 0, 0, 0, 128, 0, 0, 0, 0, 0, 0, 0,
+    2, 0, 95, 0, 0, 0, 0, 0, 0, 0, 63, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 94, 0,
+    1, 1, 55, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 15, 0, 0, 0,
+    3, 0, 1, 0, 15, 0, 0, 0, 2, 0, 2, 0,
+    15, 0, 0, 0,
 };
 static_assert(sizeof(kGpu2dShader) % 4 == 0, "shader binary must be word aligned");
 extern "C" {
@@ -3132,7 +3125,8 @@ static int      g_gpuProjUnif = 0;        // MKW_GPU_UNIF=n picks the projection
 static bool     g_gpuPnMtx = true;        // apply the pane matrix (GXLoadPosMtxImm) to layout quads
 
 struct GpuQuadVtx { float x, y, u, v, r, g, b, a; };
-struct GpuDrawVertex { float position[4], texcoord[4], color[4], reserved[4]; };
+struct GpuDrawVertex { float position[3], normal[3], texcoord[4]; uint8_t color[4]; };
+static_assert(sizeof(GpuDrawVertex) == 44, "native PICA vertex layout");
 struct GpuQuad {
     GpuQuadVtx v[4] = {};
     C3D_Tex* tex = nullptr;
@@ -3634,27 +3628,27 @@ static void Gpu2dRender() {
     const uint32_t clear = g_gpuClearOverride ? g_gpuClearOverride : guestClear;
     C3D_RenderTargetClear(g_gpuTop, C3D_CLEAR_ALL, clear, 0);
     C3D_FrameDrawOn(g_gpuTop);
+    // Match the native renderer's explicit viewport for the rotated top-screen target.
+    C3D_SetViewport(0, 0, kScreenH, kScreenW);
 
-    // Attribute layout.  AttrInfo_Init first: it is persistent GPU state and citro3d only touches
-    // the entries it is told about, so an uninitialised config scrambles the whole vertex stream
-    // (the reference quads did not appear either).  C3D_ImmSendAttrib always emits a vec4, so every
-    // attribute is declared 4 floats wide and the stride matches what is sent.
+    // Match the native renderer: bind the program before initializing its vertex input layout.
+    // C3D_BindProgram may update persistent shader/attribute state, so doing this in the opposite
+    // order risks invalidating the buffer loaders used by C3D_DrawArrays.
+    if (g_gpuProgramReady) C3D_BindProgram(&g_gpuProgram);
+
+    // Attribute layout.  AttrInfo_Init first: citro3d only touches entries it is told about.
     C3D_AttrInfo* ai = C3D_GetAttrInfo();
     AttrInfo_Init(ai);
-    AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 4); // clip position (pre-projected on the CPU)
-    AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 4); // texcoord (u, v, 0, 0)
-    AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 4); // vertex colour (tint)
-    AttrInfo_AddLoader(ai, 3, GPU_FLOAT, 4); // reserved fourth attribute (native 3DS buffer layout)
+    AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 3); // clip position (pre-projected on the CPU)
+    AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 3); // normal (unused by pass-through shader)
+    AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 4); // UV0/UV1
+    AttrInfo_AddLoader(ai, 3, GPU_UNSIGNED_BYTE, 4); // normalized RGBA vertex colour
     for (int i = 0; i < 6; ++i) C3D_TexEnvInit(C3D_GetTexEnv(i));
     {
         C3D_TexEnv* env = C3D_GetTexEnv(0);
         C3D_TexEnvSrc(env, C3D_Both, GPU_TEXTURE0, GPU_PRIMARY_COLOR);
         C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
     }
-
-    // The pass-through shader takes no uniforms; binding it every frame keeps the program valid
-    // even if something else in the process changed the GPU program.
-    if (g_gpuProgramReady) C3D_BindProgram(&g_gpuProgram);
 
     // Anything the software path drew (3D) is composited underneath the layout.
     // Any pixel the software path produced (3D, or a 2D draw that did not come through the
@@ -3731,15 +3725,15 @@ static void Gpu2dRender() {
             GpuDrawVertex& dst = g_gpuDrawVertices[qi * 6 + vi];
             TransformToClip(g_gpuProj, src.x, src.y, &dst.position[0], &dst.position[1]);
             dst.position[2] = 0.0f;
-            dst.position[3] = 1.0f;
+            dst.normal[0] = dst.normal[1] = 0.0f;
+            dst.normal[2] = 1.0f;
             dst.texcoord[0] = src.u * q.uScale;
             dst.texcoord[1] = src.v * q.vScale;
             dst.texcoord[2] = dst.texcoord[3] = 0.0f;
-            dst.color[0] = src.r;
-            dst.color[1] = src.g;
-            dst.color[2] = src.b;
-            dst.color[3] = src.a;
-            std::fill(std::begin(dst.reserved), std::end(dst.reserved), 0.0f);
+            dst.color[0] = static_cast<uint8_t>(std::lround(std::clamp(src.r, 0.0f, 1.0f) * 255.0f));
+            dst.color[1] = static_cast<uint8_t>(std::lround(std::clamp(src.g, 0.0f, 1.0f) * 255.0f));
+            dst.color[2] = static_cast<uint8_t>(std::lround(std::clamp(src.b, 0.0f, 1.0f) * 255.0f));
+            dst.color[3] = static_cast<uint8_t>(std::lround(std::clamp(src.a, 0.0f, 1.0f) * 255.0f));
         }
     }
     if (g_gpuTestMode == 3) {
@@ -3749,14 +3743,14 @@ static void Gpu2dRender() {
             GpuDrawVertex& dst = g_gpuDrawVertices[i];
             TransformToClip(g_gpuProj, xs[i], ys[i], &dst.position[0], &dst.position[1]);
             dst.position[2] = 0.0f;
-            dst.position[3] = 1.0f;
+            dst.normal[0] = dst.normal[1] = 0.0f;
+            dst.normal[2] = 1.0f;
             dst.texcoord[0] = dst.texcoord[1] = 0.5f;
             dst.texcoord[2] = dst.texcoord[3] = 0.0f;
-            dst.color[0] = 0.0f;
-            dst.color[1] = 0.45f;
-            dst.color[2] = 0.9f;
-            dst.color[3] = 1.0f;
-            std::fill(std::begin(dst.reserved), std::end(dst.reserved), 0.0f);
+            dst.color[0] = 0;
+            dst.color[1] = 115;
+            dst.color[2] = 230;
+            dst.color[3] = 255;
         }
         AppLog("[Gpu2d] drawing VBO reference pattern vertices=%zu stride=%zu\n",
                vertexCount, sizeof(GpuDrawVertex));

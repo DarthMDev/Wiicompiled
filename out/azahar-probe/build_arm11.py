@@ -73,8 +73,9 @@ def main():
             print(f"  Reusing cached {obj.name}")
 
     if to_compile:
-        print(f"Compiling {len(to_compile)} compilation units in parallel across 8 cores...")
-        with ThreadPoolExecutor(max_workers=min(len(to_compile), 8)) as ex:
+        workers = min(len(to_compile), max(1, int(os.environ.get('MKW_BUILD_JOBS', '4'))))
+        print(f"Compiling {len(to_compile)} compilation units in parallel across {workers} workers...")
+        with ThreadPoolExecutor(max_workers=workers) as ex:
             futures = [ex.submit(compile_src, src, obj) for src, obj in to_compile]
             results = [f.result() for f in futures]
 
