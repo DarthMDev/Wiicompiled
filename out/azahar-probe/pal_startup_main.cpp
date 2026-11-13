@@ -7660,18 +7660,61 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 #endif
             std::fflush(stdout);
         }
-        if (s_frameCount >= 84 && s_frameCount <= 220) {
+        // Experiment: re-open the SectionPad request window ("RequestPad" semantics:
+        // pending=0, state=1, holder=0) at a chosen frame, so the guest's own
+        // TrySetController bind path can run once its gate reads 1 (~f120).
+        if (const char* poke = std::getenv("MKW_POKE_PADREQ")) {
+            const long at = std::strtol(poke, nullptr, 10);
+            if (at >= 0 && s_frameCount == static_cast<uint32_t>(at)) {
+                const uint32_t smp2 = Memory::Read32(0x809C1E38u);
+                if (smp2 && Memory::Contains(smp2 + 52, 32)) {
+                    const uint32_t p0 = smp2 + 52;
+                    AppLog("[PadPoke] f=%u re-request pad0 (was id=%08X pend=%08X state=%u)\n",
+                        s_frameCount, Memory::Read32(p0 + 4), Memory::Read32(p0 + 8),
+                        Memory::Read32(p0 + 12));
+                    Memory::Write32(p0 + 8, 0);
+                    Memory::Write32(p0 + 12, 1);
+                    Memory::Write32(p0 + 16, 0);
+                }
+            }
+        }
+        {
+            static uint32_t s_lastG1 = 0xFFFFFFFFu, s_lastF1 = 0xFFFFFFFFu;
+            const uint32_t g1b = Memory::Read32(0x809C2328u);
+            const uint32_t f1b = (g1b && Memory::Contains(g1b + 60, 1)) ? Memory::Read8(g1b + 56) : 0xEE;
+            if (g1b != s_lastG1 || f1b != s_lastF1) {
+                s_lastG1 = g1b; s_lastF1 = f1b;
+                const uint32_t vt = (g1b && Memory::Contains(g1b, 4)) ? Memory::Read32(g1b) : 0;
+                AppLog("[G2328] f=%u g1=%08X flag56=%u vtbl=%08X\n", s_frameCount, g1b, f1b, vt);
+                if (vt && Memory::Contains(vt, 32)) {
+                    for (int i = 0; i < 8; ++i) {
+                        AppLog("[G2328]   vt[%d]=%08X\n", i, Memory::Read32(vt + i * 4));
+                    }
+                }
+                if (g1b && Memory::Contains(g1b, 128)) {
+                    for (int i = 0; i < 128; i += 16) {
+                        AppLog("[G2328]   +%02X: %08X %08X %08X %08X\n", i,
+                            Memory::Read32(g1b + i), Memory::Read32(g1b + i + 4),
+                            Memory::Read32(g1b + i + 8), Memory::Read32(g1b + i + 12));
+                    }
+                }
+            }
+        }
+        if (s_frameCount >= 60 && s_frameCount <= 400) {
             static uint32_t s_lastFlags = 0xFFFFFFFFu;
             const uint32_t g1 = Memory::Read32(0x809C2328u);
             const uint32_t sm3 = Memory::Read32(0x809C1E38u);
             const uint32_t o2 = (sm3 && Memory::Contains(sm3 + 156, 4)) ? Memory::Read32(sm3 + 152) : 0;
             const uint32_t f1 = (g1 && Memory::Contains(g1 + 60, 1)) ? Memory::Read8(g1 + 56) : 0xEE;
             const uint32_t f2 = (o2 && Memory::Contains(o2 + 1232, 1)) ? Memory::Read8(o2 + 1228) : 0xEE;
-            const uint32_t flags = (f1 << 8) | f2;
+            const uint32_t flags = (f1 << 8) | f2 | ((sm3 && Memory::Contains(sm3 + 52, 4))
+                ? (Memory::Read32(sm3 + 48) << 16) : 0);
             if (flags != s_lastFlags) {
                 s_lastFlags = flags;
-                AppLog("[TitleGate] f=%u flag1(*(809C2328)+56)=%u flag2(sm+152->+1228)=%u obj2=%08X\n",
-                    s_frameCount, f1, f2, o2);
+                AppLog("[TitleGate] f=%u flag1(audio+56)=%u flag2(sm+152->+1228)=%u sm+48=%d obj2=%08X\n",
+                    s_frameCount, f1, f2,
+                    (sm3 && Memory::Contains(sm3 + 52, 4)) ? static_cast<int32_t>(Memory::Read32(sm3 + 48)) : -999,
+                    o2);
             }
         }
         if (s_frameCount == 150) {
