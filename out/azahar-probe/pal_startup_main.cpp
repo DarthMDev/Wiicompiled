@@ -3132,7 +3132,7 @@ static int      g_gpuProjUnif = 0;        // MKW_GPU_UNIF=n picks the projection
 static bool     g_gpuPnMtx = true;        // apply the pane matrix (GXLoadPosMtxImm) to layout quads
 
 struct GpuQuadVtx { float x, y, u, v, r, g, b, a; };
-struct GpuDrawVertex { float position[4], texcoord[4], color[4]; };
+struct GpuDrawVertex { float position[4], texcoord[4], color[4], reserved[4]; };
 struct GpuQuad {
     GpuQuadVtx v[4] = {};
     C3D_Tex* tex = nullptr;
@@ -3644,6 +3644,7 @@ static void Gpu2dRender() {
     AttrInfo_AddLoader(ai, 0, GPU_FLOAT, 4); // clip position (pre-projected on the CPU)
     AttrInfo_AddLoader(ai, 1, GPU_FLOAT, 4); // texcoord (u, v, 0, 0)
     AttrInfo_AddLoader(ai, 2, GPU_FLOAT, 4); // vertex colour (tint)
+    AttrInfo_AddLoader(ai, 3, GPU_FLOAT, 4); // reserved fourth attribute (native 3DS buffer layout)
     for (int i = 0; i < 6; ++i) C3D_TexEnvInit(C3D_GetTexEnv(i));
     {
         C3D_TexEnv* env = C3D_GetTexEnv(0);
@@ -3706,7 +3707,7 @@ static void Gpu2dRender() {
     // works for the diagnostic pattern, but the menu path needs a persistent vertex stream with
     // per-draw offsets so each texture/state change is represented by a normal PICA draw call.
     const size_t layoutVertexCount = g_gpuQuads.size() * 6;
-    const size_t vertexCount = std::max(layoutVertexCount, g_gpuTestMode == 3 ? size_t{6} : size_t{0});
+    const size_t vertexCount = g_gpuTestMode == 3 ? size_t{6} : layoutVertexCount;
     if (vertexCount > g_gpuDrawVertexCapacity) {
         size_t newCapacity = 256;
         while (newCapacity < vertexCount) newCapacity *= 2;
@@ -3738,6 +3739,7 @@ static void Gpu2dRender() {
             dst.color[1] = src.g;
             dst.color[2] = src.b;
             dst.color[3] = src.a;
+            std::fill(std::begin(dst.reserved), std::end(dst.reserved), 0.0f);
         }
     }
     if (g_gpuTestMode == 3) {
@@ -3754,6 +3756,7 @@ static void Gpu2dRender() {
             dst.color[1] = 0.45f;
             dst.color[2] = 0.9f;
             dst.color[3] = 1.0f;
+            std::fill(std::begin(dst.reserved), std::end(dst.reserved), 0.0f);
         }
         AppLog("[Gpu2d] drawing VBO reference pattern vertices=%zu stride=%zu\n",
                vertexCount, sizeof(GpuDrawVertex));
@@ -3763,7 +3766,7 @@ static void Gpu2dRender() {
         GSPGPU_FlushDataCache(g_gpuDrawVertices, vertexBytes);
         C3D_BufInfo* buf = C3D_GetBufInfo();
         BufInfo_Init(buf);
-        BufInfo_Add(buf, g_gpuDrawVertices, sizeof(GpuDrawVertex), 3, 0x210);
+        BufInfo_Add(buf, g_gpuDrawVertices, sizeof(GpuDrawVertex), 4, 0x3210);
     }
     g_gpuQuadsDrawn = 0;
     if (g_gpuTestMode == 3) {
