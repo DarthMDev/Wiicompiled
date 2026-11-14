@@ -3138,6 +3138,14 @@ static bool AudioStart(const char* path) {
     }
     const size_t got = std::fread(g_audioFile.data(), 1, g_audioFile.size(), fp);
     std::fclose(fp);
+    // AudioParseBrstm reallocates the ADPCM payload the DSP may still be reading, so silence the
+    // voices before the old plane goes away; they are set up again below.
+    if (g_audioReady) {
+        for (int v = 0; v < g_audioChannels; ++v) {
+            ndspChnWaveBufClear(v);
+            ndspChnReset(v);
+        }
+    }
     if (got != g_audioFile.size() || !AudioParseBrstm(g_audioFile.data(), g_audioFile.size())) {
         std::snprintf(g_audioLoadFail, sizeof(g_audioLoadFail), "%s", path);
         AppLog("[Audio] %s is not a playable BRSTM\n", path);
