@@ -1101,6 +1101,64 @@ static void SanitizeModelViewMatrix(float* m) {
 // switched off by default. Set to a real frame number to debug a specific frame.
 static const uint32_t kGxTraceFrame = [](){ const char* e = std::getenv("MKW_TRACE_FRAME"); return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0xFFFFFFFFu; }();
 static uint32_t g_gxFrame = 1;
+
+// --- hot-target profile (diagnostic, gpu.cfg prof=1) ---------------------------------------
+// Every guest call reaches handle_startup_hle first, so counting there covers the whole recompiled
+// guest without touching the 12490-case dispatch switch.  Counts, not time: a target that runs
+// 3000 times per beat is where the reinterpreted guest time goes, and once the top targets are
+// mapped to their shard_N.cpp we can rebuild only those shards at -O2 instead of the whole image.
+struct ProfBucket { uint32_t target; uint32_t hits; };
+static constexpr uint32_t kProfSlots = 8192;          // power of two, open addressing
+static ProfBucket g_profBuckets[kProfSlots];
+static bool     g_profOn = false;
+static uint32_t g_profCalls = 0;
+
+static void ProfNote(uint32_t target)
+{
+    ++g_profCalls;
+    uint32_t slot = (target * 2654435761u) & (kProfSlots - 1u);
+    for (uint32_t probe = 0; probe < 16u; ++probe, slot = (slot + 1u) & (kProfSlots - 1u)) {
+        if (g_profBuckets[slot].target == target) { ++g_profBuckets[slot].hits; return; }
+        if (g_profBuckets[slot].target == 0u) {
+            g_profBuckets[slot].target = target;
+            g_profBuckets[slot].hits = 1;
+            return;
+        }
+    }
+}
+
+// Appends " prof=<calls> top=<addr>:<hits>,..." to the [Beat] line and clears the table.
+static void ProfReport()
+{
+    if (!g_profOn) return;
+    constexpr int kTop = 8;
+    uint32_t bestAddr[kTop] = {0};
+    uint32_t bestHits[kTop] = {0};
+    for (uint32_t i = 0; i < kProfSlots; ++i) {
+        const uint32_t hits = g_profBuckets[i].hits;
+        if (!hits) continue;
+        for (int s = 0; s < kTop; ++s) {
+            if (hits > bestHits[s]) {
+                for (int t = kTop - 1; t > s; --t) {
+                    bestAddr[t] = bestAddr[t - 1];
+                    bestHits[t] = bestHits[t - 1];
+                }
+                bestAddr[s] = g_profBuckets[i].target;
+                bestHits[s] = hits;
+                break;
+            }
+        }
+    }
+    AppLog(" prof=%u top=", g_profCalls);
+    bool first = true;
+    for (int s = 0; s < kTop; ++s) {
+        if (!bestHits[s]) break;
+        AppLog("%s%08X:%u", first ? "" : ",", bestAddr[s], bestHits[s]);
+        first = false;
+    }
+    for (uint32_t i = 0; i < kProfSlots; ++i) g_profBuckets[i] = ProfBucket{0u, 0u};
+    g_profCalls = 0;
+}
 // --- Debug chase camera -------------------------------------------------------------
 // The guest never registers a race camera in this boot path (the camera manager stays empty),
 // so the view is stuck in the opening flyover. Build a look-at camera ourselves and use it for
@@ -4026,6 +4084,7 @@ static bool Gpu2dReadConfig() {
         else if (std::strcmp(k, "vflip") == 0) { pendingVFlip = on; hasDebugOverrideKey = true; }
         else if (std::strcmp(k, "pnmtx") == 0) { pendingPnMtx = on; hasDebugOverrideKey = true; }
         else if (std::strcmp(k, "scissor") == 0) g_gpuScissor = on;
+        else if (std::strcmp(k, "prof") == 0) g_profOn = on;
         else if (std::strcmp(k, "debug") == 0) g_gpuDebugQuads = on ? 4u : 0u;
         else if (std::strcmp(k, "clear") == 0)
             g_gpuClearOverride = (static_cast<uint32_t>(std::strtoul(v, nullptr, 16)) << 8) | 0xFFu;
@@ -5793,6 +5852,7 @@ static void NoteSndCall(uint32_t target) {
 
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
+    if (gx_bridge::g_profOn) gx_bridge::ProfNote(target);
     // Full indirect-call trace for a short frame window (diagnostic only).  Used to find which
     // page/caller schedules an idle section reinit right after the licence page activates.
     static const bool s_traceIndirectAll = std::getenv("MKW_TRACE_INDIRECT") != nullptr;
@@ -6592,6 +6652,19 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         AppLog("[BtnHle] HandleClick self=%08X r4=%08X r5=%08X vt=%08X clickFn=%08X handler=%08X frame=%u\n",
             self, arg4, arg5, vt, clickFn, handler, gx_bridge::g_gxFrame);
         return true;
+    }
+    if (target == 0x80634FBCu || target == 0x80635080u || target == 0x8051AB58u ||
+        target == 0x80540680u) { // LoadSection / EnterSection / GameScene::enter / LoadUIArchive
+        static uint32_t s_secEnterLogs = 0;
+        if (s_secEnterLogs < 80) {
+            ++s_secEnterLogs;
+            const uint32_t namePtr = cpu ? cpu->gpr[4] : 0;
+            const char* nm = (namePtr && Memory::Contains(namePtr, 1))
+                ? reinterpret_cast<const char*>(Memory::GetPointer(namePtr, 1)) : "";
+            AppLog("[SecEnter] tgt=%08X r3=%08X r4=%08X r5=%08X name='%s' lr=%08X frame=%u\n",
+                target, cpu ? cpu->gpr[3] : 0, namePtr, cpu ? cpu->gpr[5] : 0, nm,
+                cpu ? cpu->lr : 0, gx_bridge::g_gxFrame);
+        }
     }
     if (target == 0x80602530u || target == 0x806025B0u || target == 0x806024B0u ||
         target == 0x80635A3Cu || target == 0x80635AC8u || target == 0x80635B2Cu) {
@@ -10040,6 +10113,8 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 gx_bridge::g_gpuQuadsDrawn, gx_bridge::g_gpuTexBytes / 1024,
                 gx_bridge::g_gpuTexUploads, gx_bridge::g_gpuTexEvictions,
                 gx_bridge::g_gpuBaseUploads);
+            gx_bridge::ProfReport();
+            AppLog("\n");
             g_hleAudioSndCalls = 0;
             g_hleAudioAxCalls = 0;
             gx_bridge::g_gpuQuadsRecorded = 0;
@@ -10671,6 +10746,23 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                     Memory::Write32(sm + 44, 0xFFFFFFFFu);
                     Memory::Write32(sm + 48, 0);
                     Memory::Write32(sm + 28, 0);
+                }
+            }
+        }
+        // Let the pending section reinit run to completion instead of cancelling it: set its
+        // countdown to <timer> once, leaving SectionMgr+48 in state 1 so SectionMgr::Update
+        // continues into LoadSection/EnterSection.  Format: <frame>:<timer>.
+        if (const char* s = std::getenv("MKW_POKE_SECWAIT")) {
+            const long at = std::strtol(s, nullptr, 10);
+            const char* colon = std::strchr(s, ':');
+            const long timer = colon ? std::strtol(colon + 1, nullptr, 10) : 5;
+            if (at >= 0 && s_frameCount == static_cast<uint32_t>(at)) {
+                const uint32_t sm = Memory::Read32(0x809C1E38u);
+                if (sm && Memory::Contains(sm + 48, 4)) {
+                    AppLog("[SecWait] f=%u sm=%08X next=%u state=%u timer=%u -> %ld\n",
+                        s_frameCount, sm, Memory::Read32(sm + 12), Memory::Read32(sm + 48),
+                        Memory::Read32(sm + 28), timer);
+                    Memory::Write32(sm + 28, static_cast<uint32_t>(timer));
                 }
             }
         }

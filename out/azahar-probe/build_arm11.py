@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 import time
@@ -28,8 +29,21 @@ common_flags = [
     f'-I{sdk}/libctru/include'
 ]
 
+# Per-shard optimisation.  -O2 for the whole image costs +4.1 MiB of binary, which is heap the
+# texture cache and the audio ring need, so instead MKW_HOT_SHARDS lists the shard indices that own
+# the hottest guest targets (see "prof=" in [Beat]) and only those are rebuilt at -O2.
+#  MKW_HOT_SHARDS=0,4,8 MKW_HOT_OPT=-O2 python3 out/azahar-probe/build_arm11.py
+hot_shards = {int(x) for x in os.environ.get('MKW_HOT_SHARDS', '').replace(' ', '').split(',') if x.isdigit()}
+hot_opt = os.environ.get('MKW_HOT_OPT', '-O2')
+
+def hot_flags_for(src):
+    m = re.fullmatch(r'shard_(\d+)\.cpp', src.name)
+    if m and int(m.group(1)) in hot_shards:
+        return [hot_opt]
+    return []
+
 def compile_src(src, obj):
-    cmd = [str(gxx)] + common_flags + ['-c', str(src), '-o', str(obj)]
+    cmd = [str(gxx)] + common_flags + hot_flags_for(src) + ['-c', str(src), '-o', str(obj)]
     t0 = time.time()
     res = subprocess.run(cmd, cwd=work_dir, capture_output=True, text=True)
     dt = time.time() - t0
@@ -39,6 +53,8 @@ def compile_src(src, obj):
 
 def main():
     print(f"Using devkitARM at {sdk}")
+    if hot_shards:
+        print(f"Hot shards at {hot_opt}: {sorted(hot_shards)}")
     t_start = time.time()
 
     # Base sources
@@ -63,6 +79,15 @@ def main():
     ) if overlay_dir.exists() else 0
 
     force_clean = '--clean' in sys.argv or '-f' in sys.argv
+
+    # Shard objects carry whatever hot set was configured last time; rebuild them all when that set
+    # changes, otherwise a stale -Os object silently survives a new MKW_HOT_SHARDS.
+    hot_stamp = work_dir / '.hot_shards'
+    stamp_text = ','.join(str(i) for i in sorted(hot_shards)) + '|' + hot_opt
+    previous_stamp = hot_stamp.read_text().strip() if hot_stamp.exists() else ''
+    if previous_stamp != stamp_text:
+        force_clean = True
+        hot_stamp.write_text(stamp_text)
 
     to_compile = []
     for src, obj in tasks:
