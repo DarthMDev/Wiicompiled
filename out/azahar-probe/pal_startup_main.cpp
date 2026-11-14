@@ -1296,11 +1296,11 @@ static bool g_audioEnabled = true;
 static bool g_audioFollowSection = true;   // false once bgm= names a stream explicitly
 #ifdef __3DS__
 static bool AudioStart(const char* path);
-static void AudioTick(uint32_t section);
+static void AudioTick(uint32_t section, uint32_t soundId);
 void AudioShutdown();
 #else
 static bool AudioStart(const char*) { return false; }
-static void AudioTick(uint32_t) {}
+static void AudioTick(uint32_t, uint32_t) {}
 void AudioShutdown() {}
 #endif
 
@@ -3052,8 +3052,9 @@ static bool AudioParseBrstm(const uint8_t* d, size_t size) {
     // so each plane is a plain run of 8-byte frames, which is what a mono voice wants.
     const size_t dataBlock = RdU32(d, 0x20);
     if (dataBlock + 0x10 > size) return false;
-    size_t audio = 0;
-    if (!RdDataRef(d, size, dataBlock + 8, dataBlock + 8, &audio)) return false;
+    // The DATA block's payload offset is a plain big-endian u32 at +8 (not a Util::DataRef), and the
+    // audio itself starts after the block's own 8-byte header.
+    const size_t audio = dataBlock + 8 + RdU32(d, dataBlock + 8);
     const size_t chanBytes = static_cast<size_t>(blocks - 1) * blockSize + lastPadded;
     const size_t need = chanBytes * channels;
     if (audio + need > size) {
@@ -3223,35 +3224,54 @@ static bool AudioStart(const char* path) {
     return true;
 }
 
-// Which retail stream backs a section's BGM.  Every menu-ish section shares the menu track:
-// STRM_O_OPTION is the only BGM *stream* in the archive (the other menu tunes, e.g. SEQ_O_EARTH,
-// are RSEQ sequences inside revo_kart.brsar, which would need a full nw4r synth).  Section ids are
-// the ones mapped in docs/TITLE_FLOW_FINDINGS.md; a section with no entry (race, ending) keeps
-// whatever is playing instead of cutting the music.
-static const char* AudioStreamForSection(uint32_t section) {
+// The BGM streams in revo_kart.brsar, by sound id.  The section picks its own id at runtime through
+// the guest's Section::GetSoundId, so the port follows the game instead of guessing per screen.
+// Ids that are not streams (the menu sequences SEQ_O_EARTH / SEQ_O_SELECT_CH / SEQ_O_RANKING_CH /
+// SEQ_O_OPTION_CH, and every SE_/VO_/fanfare) have no entry: those would need an nw4r RSEQ synth.
+struct AudioStreamId { uint32_t id; const char* file; };
+static const AudioStreamId kAudioStreamIds[] = {
+    {83, "o_Option_32.brstm"},            // STRM_O_OPTION - menu / options BGM
+    {115, "strm_me.brstm"},               // STRM_O_LEVEL_OPEN_FAN
+    {201, "n_BossMI_32.brstm"},           // STRM_M_BOSS1
+    {202, "o_hyousyou_winningrun.brstm"}, // STRM_O_GP_AWARD
+    {203, "o_hyousyou_normal.brstm"},     // STRM_O_VS_AWARD
+    {204, "o_hyousyou_cut.brstm"},        // STRM_O_AWARD_CUT
+    {205, "o_hyousyou_lose.brstm"},       // STRM_O_AWARD_LOSE
+    {206, "o_Ending_PartA_32.brstm"},     // STRM_O_ENDING_PART_A
+    {207, "o_Wi-Fi_waiting32.brstm"},     // STRM_O_GALLERY
+};
+
+static const char* AudioStreamForSoundId(uint32_t soundId) {
+    for (const auto& e : kAudioStreamIds)
+        if (e.id == soundId) return e.file;
+    return nullptr;
+}
+
+// Sections that are menus (docs/TITLE_FLOW_FINDINGS.md): 63 title, 16-24 / 69 / 71 options,
+// 78 / 81 single player, 84 multiplayer, 21 / 22 channel.
+static bool AudioMenuSection(uint32_t section) {
     switch (section) {
-        case 16: case 17: case 18: case 19: case 20: case 23: case 24:  // options (MenuOther.szs)
-        case 21: case 22:                                                // channel
-        case 63:                                                         // title
-        case 69: case 71:                                                // options
-        case 78: case 81:                                                // single player
-        case 84:                                                         // multiplayer
-            return "o_Option_32.brstm";
+        case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 24:
+        case 63: case 69: case 71: case 78: case 81: case 84:
+            return true;
         default:
-            return nullptr;
+            return false;
     }
 }
 
-// Called once per frame from the frame boundary: queues the BGM the current section wants.
-static void AudioTick(uint32_t section) {
+// Called once per frame from the frame boundary.  soundId is what the guest's Section::GetSoundId
+// reported for this section (0xFFFFFFFF when unknown); a stream id wins, otherwise a menu section
+// falls back to the menu track so the game is never silent, and anything else keeps the current one.
+static void AudioTick(uint32_t section, uint32_t soundId) {
     if (!g_audioEnabled || g_audioFailed) return;
     char path[sizeof(g_audioPathBuf)];
-    if (g_audioFollowSection) {
-        const char* name = AudioStreamForSection(section);
-        if (!name) return;
-        std::snprintf(path, sizeof(path), "sdmc:/mkwii/sound/strm/%s", name);
-    } else {
+    if (!g_audioFollowSection) {
         std::snprintf(path, sizeof(path), "%s", g_audioPathBuf);
+    } else {
+        const char* name = AudioStreamForSoundId(soundId);
+        if (!name && AudioMenuSection(section)) name = "o_Option_32.brstm";
+        if (!name) return;   // no stream for this screen: leave the current track playing
+        std::snprintf(path, sizeof(path), "sdmc:/mkwii/sound/strm/%s", name);
     }
     if (std::strcmp(g_audioPlaying, path) == 0) return;   // already queued
     if (std::strcmp(g_audioLoadFail, path) == 0) return;  // missing/unsupported: no per-frame retry
@@ -9083,7 +9103,21 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             const uint32_t smAudio = Memory::Read32(0x809C1E38u);
             const uint32_t audioSection = (smAudio && Memory::Contains(smAudio + 8, 4))
                 ? Memory::Read32(smAudio + 4) : 0u;
-            gx_bridge::AudioTick(audioSection);
+            // Ask the game which sound it wants for this section (Section::GetSoundId is a pure
+            // switch on the section id), once per section change, and log it.
+            static uint32_t s_audioSection = 0xFFFFFFFFu;
+            static uint32_t s_audioSoundId = 0xFFFFFFFFu;
+            if (audioSection != s_audioSection) {
+                s_audioSection = audioSection;
+                CpuContext idCtx = *cpu;
+                idCtx.gpr[3] = audioSection;
+                idCtx.lr = 0;
+                CpuContextScope idScope(&idCtx);
+                InvokeIndirectCpu(0x80631C68u, &idCtx);   // Section::GetSoundId(sectionId)
+                s_audioSoundId = idCtx.gpr[3];
+                AppLog("[Audio] section=%u wants soundId=%u\n", audioSection, s_audioSoundId);
+            }
+            gx_bridge::AudioTick(audioSection, s_audioSoundId);
         }
 #endif
         if (s_frameCount % 20 == 0) {
