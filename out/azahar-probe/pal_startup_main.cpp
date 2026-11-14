@@ -1271,6 +1271,8 @@ static inline uint64_t ProfTicksToUs(uint64_t ticks) { return 0; }
 // the software rasteriser so frames can still be dumped to PPM.
 static bool g_gpu2d = false;
 static uint32_t g_gpuQuadsRecorded = 0;
+static uint32_t g_texDecodesThisFrame = 0;   // reset every frame; see decodebudget
+static uint32_t g_texDecodeBudget = 0;       // gpu.cfg decodebudget=N (0 = decode everything at once)
 static uint32_t g_gpuQuadsDrawn = 0;
 static size_t   g_gpuTexBytes = 0;
 static uint32_t g_gpuTexUploads = 0;
@@ -1281,11 +1283,13 @@ static inline bool Gpu2dActive() { return g_gpu2d; }
 static void Gpu2dConfigure();
 static bool Gpu2dInit();
 static void Gpu2dRecordQuad(const GxVertex v[4]);
+static void Gpu2dRecordTri(const GxVertex& a, const GxVertex& b, const GxVertex& c, uint32_t pnMtx);
 static void Gpu2dRender();
 #else
 static void Gpu2dConfigure() {}
 static bool Gpu2dInit() { return false; }
 static void Gpu2dRecordQuad(const GxVertex[4]) {}
+static void Gpu2dRecordTri(const GxVertex&, const GxVertex&, const GxVertex&, uint32_t) {}
 static void Gpu2dRender() {}
 #endif
 
@@ -1295,7 +1299,8 @@ static char g_audioPathBuf[160] = "sdmc:/mkwii/sound/strm/o_Option_32.brstm";
 static bool g_audioEnabled = true;
 static bool g_audioFollowSection = true;   // false once bgm= names a stream explicitly
 static bool g_audioTone = false;           // gpu.cfg tone=1: play a PCM16 test tone instead of BGM
-static bool g_audioStubCfg = false;        // gpu.cfg stubguestaudio=1: silence the guest's own mixer
+static int  g_audioStubCfg = 0;            // gpu.cfg stubguestaudio=N (0 off, 1 after boot, 2 always)
+static uint32_t g_audioStubFromFrame = 120;   // mode 1: leave the boot's sound init alone
 #ifdef __3DS__
 static bool AudioStart(const char* path);
 static void AudioTick(uint32_t section, uint32_t soundId);
@@ -1418,6 +1423,13 @@ static const DecodedTex* GetOrDecodeTexture(const TexSlot& slot) {
         ++g_texStatHits;
         return &it->second;
     }
+
+    // A page entry binds a dozen new textures in a single frame (~575 ms measured on the first
+    // licence-page frame), which is the hitch you see on section/page transitions.  decodebudget=N
+    // caps decodes per frame: the surplus is drawn with the white texture and filled in over the next
+    // few frames instead of blocking the frame for half a second.
+    if (g_texDecodeBudget && g_texDecodesThisFrame >= g_texDecodeBudget) return nullptr;
+    ++g_texDecodesThisFrame;
 
     // RGBA8888 per texel; the old estimate added 33% on top, which made the cache hit its cap a
     // third too early and then cleared *everything*.  That total wipe is what cost 2 seconds per
@@ -2783,7 +2795,13 @@ static void HandleLoadIndx(uint8_t cmd, const uint8_t* d) {
 
 
 static void ExecutePrimitive(uint8_t primCmd, uint16_t vtxCount, const uint8_t*& p) {
-    if (!RasterThisFrame()) { ++g_gx.drawCallsSkipped; return; }
+    // 2D primitives that do not come through the layout DrawQuad hook (page backgrounds, movies,
+    // sprite drawers) used to be rasterised in C++ every kRasterStride-th frame - which is where the
+    // half-second page-entry stalls came from.  They now go through the same citro3d batch as the
+    // layout quads (triangles are recorded as degenerate quads), in guest draw order, and the
+    // software rasteriser stays for 3D and for gpu=0.
+    const bool gpuPrim = g_gpu2d && g_gx.projType == 1 && Gpu2dInit();
+    if (!gpuPrim && !RasterThisFrame()) { ++g_gx.drawCallsSkipped; return; }
     uint32_t vatIdx = primCmd & 7u;
     uint8_t primType = primCmd & 0xF8u;
     if (vtxCount == 0) return;
@@ -2803,27 +2821,31 @@ static void ExecutePrimitive(uint8_t primCmd, uint16_t vtxCount, const uint8_t*&
 
     const auto* verts = s_verts.data();
     const auto* mtxs = s_mtxs.data();
+    auto emitTri = [gpuPrim](const GxVertex& a, const GxVertex& b, const GxVertex& c, uint32_t mtx) {
+        if (gpuPrim) Gpu2dRecordTri(a, b, c, mtx);
+        else RasterizeTriangle(a, b, c, mtx);
+    };
 
     if (primType == 0x80 || primType == 0x88) { // GX_QUADS
         for (uint16_t i = 0; i + 3 < decodeCount; i += 4) {
-            RasterizeTriangle(verts[i], verts[i + 1], verts[i + 2], mtxs[i]);
-            RasterizeTriangle(verts[i], verts[i + 2], verts[i + 3], mtxs[i]);
+            emitTri(verts[i], verts[i + 1], verts[i + 2], mtxs[i]);
+            emitTri(verts[i], verts[i + 2], verts[i + 3], mtxs[i]);
         }
     } else if (primType == 0x90) { // GX_TRIANGLES
         for (uint16_t i = 0; i + 2 < decodeCount; i += 3) {
-            RasterizeTriangle(verts[i], verts[i + 1], verts[i + 2], mtxs[i]);
+            emitTri(verts[i], verts[i + 1], verts[i + 2], mtxs[i]);
         }
     } else if (primType == 0x98) { // GX_TRIANGLESTRIP
         for (uint16_t i = 0; i + 2 < decodeCount; ++i) {
             if ((i & 1u) == 0) {
-                RasterizeTriangle(verts[i], verts[i + 1], verts[i + 2], mtxs[i]);
+                emitTri(verts[i], verts[i + 1], verts[i + 2], mtxs[i]);
             } else {
-                RasterizeTriangle(verts[i + 1], verts[i], verts[i + 2], mtxs[i]);
+                emitTri(verts[i + 1], verts[i], verts[i + 2], mtxs[i]);
             }
         }
     } else if (primType == 0xA0) { // GX_TRIANGLEFAN
         for (uint16_t i = 1; i + 1 < decodeCount; ++i) {
-            RasterizeTriangle(verts[0], verts[i], verts[i + 1], mtxs[0]);
+            emitTri(verts[0], verts[i], verts[i + 1], mtxs[0]);
         }
     }
 }
@@ -3799,6 +3821,7 @@ static C3D_Mtx g_gpuModelView;
 static float g_gpuYSpace = -1.0f;   // canvas y -> screen y sign (the software path uses -1)
 static bool  g_gpuVFlip = false;    // flip V on textured quads (A/B for the layout mirror)
 static bool  g_gpuScissor = false;  // per-quad scissor (MKW_GPU_SCISSOR=1)
+static bool  g_gpuSyncFrame = true;  // gpu.cfg syncframe=0 lets frames pipeline (see Gpu2dRender)
 static uint32_t g_gpuClearOverride = 0;   // MKW_GPU_CLEAR=RRGGBB, 0 = use the guest clear
 static uint32_t g_gpuDebugQuads = 0;      // dumps the first few quads' geometry
 static int      g_gpuTestMode = 0;        // 1 = reference pattern, 2 = layout with white texture
@@ -4007,7 +4030,9 @@ static bool Gpu2dReadConfig() {
             g_gpuClearOverride = (static_cast<uint32_t>(std::strtoul(v, nullptr, 16)) << 8) | 0xFFu;
         else if (std::strcmp(k, "audio") == 0) g_audioEnabled = on;
         else if (std::strcmp(k, "tone") == 0) g_audioTone = on;
-        else if (std::strcmp(k, "stubguestaudio") == 0) g_audioStubCfg = on;
+        else if (std::strcmp(k, "stubguestaudio") == 0) g_audioStubCfg = static_cast<int>(n);
+        else if (std::strcmp(k, "syncframe") == 0) g_gpuSyncFrame = on;
+        else if (std::strcmp(k, "decodebudget") == 0) g_texDecodeBudget = static_cast<uint32_t>(n);
         else if (std::strcmp(k, "audiopath") == 0) {
             std::snprintf(g_audioPathBuf, sizeof(g_audioPathBuf), "%s", v);
             g_audioFollowSection = false;
@@ -4032,6 +4057,8 @@ static bool Gpu2dReadConfig() {
     } else if (hasDebugOverrideKey) {
         AppLog("[Gpu2d] ignoring stale gpu.cfg debug overrides (set debug_overrides=1 to enable)\n");
     }
+    if (any) AppLog("[Gpu2d] config loaded: syncframe=%d stubguestaudio=%d tone=%d decodebudget=%u\n",
+                    g_gpuSyncFrame ? 1 : 0, g_audioStubCfg, g_audioTone ? 1 : 0, g_texDecodeBudget);
     if (any) AppLog("[Gpu2d] config sdmc:/mkwii/gpu.cfg loaded: gpu=%d test=%d unif=%d ysign=%.1f "
                     "vflip=%d pnmtx=%d scissor=%d debug=%u clear=%08X texmb=%zu\n",
                     g_gpu2d ? 1 : 0, g_gpuTestMode, g_gpuProjUnif, g_gpuYSpace,
@@ -4358,7 +4385,11 @@ static void Gpu2dRender() {
         uint64_t start;
         ~ProfGuard() { g_profGpuTicks += ProfNow() - start; }
     } profGuard{profStart};
-    C3D_FrameBegin(C3D_FRAME_SYNCDRAW);
+    // SYNCDRAW waits for the previous frame's buffer swap before recording the next one, which
+    // paces the whole loop to the vblank and shows up as ~8 ms of "GPU time" for 13 quads.  The
+    // vertex buffer is rewritten every frame, so skipping the wait can race the GPU reading it:
+    // gpu.cfg syncframe=0 is the A/B for that, not yet the default.
+    C3D_FrameBegin(g_gpuSyncFrame ? C3D_FRAME_SYNCDRAW : 0);
     const uint32_t guestClear = (g_gx.clearColor[0] << 24) | (g_gx.clearColor[1] << 16) |
                                 (g_gx.clearColor[2] << 8) | 0xFFu;
     const uint32_t clear = g_gpuClearOverride ? g_gpuClearOverride : guestClear;
@@ -4780,6 +4811,19 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
             firstTriPixels, secondTriPixels);
     }
     if (trace) LogDrawSamples(g_traceDrawOrder, before);
+}
+
+// A GX primitive triangle through the citro3d batch: reuse the quad recorder with the third vertex
+// duplicated, which makes the second triangle degenerate (zero area) and leaves the real one intact.
+static void Gpu2dRecordTri(const GxVertex& a, const GxVertex& b, const GxVertex& c, uint32_t pnMtx) {
+    GxVertex quad[4] = {a, b, c, c};
+    // The primitive carries a position-matrix index per vertex; the recorder reads the current slot.
+    const uint32_t saved = g_gx.currentPnMtx;
+    if (pnMtx < 10u) g_gx.currentPnMtx = pnMtx;
+    const bool savedLayout = g_layoutQuad;
+    Gpu2dRecordQuad(quad);
+    g_layoutQuad = savedLayout;
+    g_gx.currentPnMtx = saved;
 }
 
 static void SetEggVtxState(uint32_t type) {
@@ -5641,6 +5685,11 @@ static uint32_t g_padEdgeMaskFrame = 0xFFFFFFFFu;
 // guest binds on the press *edge* alone, so an A press made the moment the title appears (a second
 // or two earlier) would otherwise be thrown away and the title would ignore the pad for ever.
 static uint32_t g_padHoldAUntilBound = 0;
+// Last input we injected, so [Beat] can show 3DS->guest pad state side by side.
+static uint16_t g_inGcnBtn = 0;
+static int8_t   g_inGcnX = 0, g_inGcnY = 0;
+static uint32_t g_inCcBtn = 0;
+static float    g_inCcX = 0.0f, g_inCcY = 0.0f;
 static bool g_padAPressSeen = false;   // saw an A press while nothing was registered yet
 
 static uint32_t ScriptedPadButtons(ScriptPadKind kind)
@@ -5687,25 +5736,61 @@ static uint32_t ScriptedPadButtons(ScriptPadKind kind)
 // guest's own nw4r-snd/AX mixer only burns CPU.  These counters (logged in [Beat] as audioSnd /
 // audioAx) say how many indirect guest calls land in the sound ranges each frame; MKW_STUB_GUEST_AUDIO=1
 // short-circuits them for an A/B measurement of what that costs.
+// Which input path the guest actually uses.  PAD::Read (0x801AF44C) and KPADRead (0x8019812C) are
+// both in the *linked* set, so the HLE cases only fire when the guest calls them indirectly - if
+// these stay at 0 the guest is reading the pad through recompiled code and our injected buttons
+// never reach it (which would explain why only the title's A-nudge works and stick/B do nothing).
+static uint32_t g_padReadHleCalls = 0;
+static uint32_t g_kpadHleCalls = 0;
 static uint32_t g_hleAudioSndCalls = 0;
 static uint32_t g_hleAudioAxCalls = 0;
 static bool     g_stubGuestAudio = false;
 static bool     g_stubGuestAudioInit = false;
+static bool     g_stubGuestEnv = false;        // MKW_STUB_GUEST_AUDIO=1
+static int      g_stubGuestAudioCfg = 0;       // gpu.cfg stubguestaudio mode (applied lazily)
+// The sound library is NOT one tidy block: nw4r::lyt (the layout/UI library, DrawQuad is at
+// 0x80084D20) sits at 0x80078920-0x80084E90, and nw4r::ut is scattered.  From the symbol table the
+// nw4r::snd functions occupy 0x80086920-0x800AEEE0 (717 snd + 17 ut symbols), so that window is the
+// closest "sound only" range; 0x80080000-0x800E0000 as a whole also swallowed the UI library, which
+// made the layout stop drawing entirely (blue screen, only the blinking prompt) when stubbed.
 static inline bool IsGuestAudioRange(uint32_t t) {
-    return (t >= 0x80080000u && t < 0x800E0000u) ||   // nw4r::snd engine + EGG sound archive
+    return (t >= 0x80086920u && t < 0x800AEEE0u) ||   // nw4r::snd (engine, players, voices, FX)
            (t >= 0x80123000u && t < 0x80130000u);     // AX / AI hardware layer
+}
+
+// Which sound functions are actually called: target -> count, dumped at frame 200.  A coarse range
+// stub is not safe (it takes nw4r::ut::LinkList with it), so the plan is to stub a short list of
+// hot targets once this histogram says which ones they are.
+struct SndCallStat { uint32_t target; uint32_t count; };
+static SndCallStat g_sndHist[16];
+static void NoteSndCall(uint32_t target) {
+    for (auto& e : g_sndHist) {
+        if (e.target == target) { ++e.count; return; }
+        if (e.target == 0) { e.target = target; e.count = 1; return; }
+    }
 }
 
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
+    // gpu.cfg is read later than the first HLE call, so re-evaluate every time instead of caching
+    // the decision (the env var only has to be read once).
     if (!g_stubGuestAudioInit) {
         g_stubGuestAudioInit = true;
         const char* e = std::getenv("MKW_STUB_GUEST_AUDIO");
-        g_stubGuestAudio = gx_bridge::g_audioStubCfg || (e && e[0] && e[0] != '0');
-        AppLog("[Audio] guest sound stub %s\n", g_stubGuestAudio ? "ON" : "off");
+        g_stubGuestEnv = e && e[0] && e[0] != '0';
     }
+    if (gx_bridge::g_audioStubCfg != g_stubGuestAudioCfg) {
+        g_stubGuestAudioCfg = gx_bridge::g_audioStubCfg;
+        AppLog("[Audio] guest sound stub mode=%d (gpu.cfg; 1 = only after frame %u)\n",
+               g_stubGuestAudioCfg, gx_bridge::g_audioStubFromFrame);
+    }
+    // Mode 1 leaves the boot alone: stubbing the sound library from frame 0 stops the guest dead at
+    // ~frame 40 (blue screen), because the startup path waits on its calls.  Mode 2 is the blunt one.
+    g_stubGuestAudio = g_stubGuestEnv || g_stubGuestAudioCfg == 2 ||
+                       (g_stubGuestAudioCfg == 1 && gx_bridge::g_gxFrame >= gx_bridge::g_audioStubFromFrame);
     if (IsGuestAudioRange(target)) {
         if (target >= 0x80123000u) ++g_hleAudioAxCalls; else ++g_hleAudioSndCalls;
+        if (target < 0x80123000u) NoteSndCall(target);
         if (g_stubGuestAudio) {
             if (cpu) cpu->gpr[3] = 0;
             return true;
@@ -6602,6 +6687,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         return true;
     }
     case 0x8019812Cu: { // KPADRead(chan, status, size)
+        ++g_kpadHleCalls;
         uint32_t chan = cpu->gpr[3];
         uint32_t statusPtr = cpu->gpr[4];
         if (statusPtr != 0 && Memory::Contains(statusPtr, 0x40)) {
@@ -6633,6 +6719,9 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 if (kHeld & KEY_DRIGHT) hold |= 0x8000;
 
                 // Extension (Classic Controller) at offset 0x30
+                g_inCcBtn = hold;
+                g_inCcX = lx;
+                g_inCcY = ly;
                 Memory::Write32(statusPtr + 0x30, hold);
                 gx_bridge::WriteGuestFloat(statusPtr + 0x3C, lx);
                 gx_bridge::WriteGuestFloat(statusPtr + 0x40, ly);
@@ -6648,6 +6737,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         cpu->gpr[3] = 1;
         return true;
     case 0x801AF44Cu: { // PAD::Read(PADStatus* status)
+        ++g_padReadHleCalls;
         uint32_t statusPtr = cpu->gpr[3];
         if (statusPtr != 0 && Memory::Contains(statusPtr, 48)) {
             uint16_t buttons = 0;
@@ -6700,6 +6790,9 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             // Auto-pulse A + START (race intro skip) or the scripted button window.
             buttons |= static_cast<uint16_t>(ScriptedPadButtons(ScriptPadKind::kGcPad));
 
+            g_inGcnBtn = buttons;
+            g_inGcnX = stickX;
+            g_inGcnY = stickY;
             // Write Port 0 PADStatus (12 bytes)
             Memory::Write16(statusPtr + 0, buttons);
             Memory::Write8(statusPtr + 2, static_cast<uint8_t>(stickX));
@@ -9569,6 +9662,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     case 0x8020FF9Cu: { // EGG::AsyncDisplay::endRender
         static uint32_t s_frameCount = 0;
         ++s_frameCount;
+        gx_bridge::g_texDecodesThisFrame = 0;   // per-frame texture decode budget resets here
         gx_bridge::PresentFrameTo3DS(s_frameCount);
         // Heartbeat: if the device stops producing frames, the last Beat line shows the frame, the
         // section being booted and how much host heap was left - a frozen screen otherwise says
@@ -9612,6 +9706,16 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             gx_bridge::AudioTick(audioSection, s_audioSoundId);
         }
 #endif
+        if (s_frameCount == 200 || s_frameCount == 400 || s_frameCount == 1000) {
+            // Which sound-library functions are hot: candidates for a surgical stub (a range stub
+            // also takes nw4r::ut::LinkList, which the UI needs).
+            AppLog("[Audio] snd calls by target (f=%u):", s_frameCount);
+            for (const auto& e : g_sndHist) {
+                if (e.target) AppLog(" %08X=%u", e.target, e.count);
+            }
+            AppLog(" total=%u\n", g_hleAudioSndCalls);
+            std::memset(g_sndHist, 0, sizeof(g_sndHist));
+        }
         if (s_frameCount % 20 == 0) {
 #ifdef __3DS__
             static u64 s_lastTick = 0;
@@ -9646,11 +9750,18 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             gx_bridge::g_profRasterTicks = 0;
             gx_bridge::g_profGpuTicks = 0;
             gx_bridge::g_profRasterTris = 0;
-            AppLog(" rasterMs=%.1f gpuMs=%.1f swTris=%u"
+            const uint32_t inMgr = Memory::Read32(0x809BD70Cu);
+            const bool inMgrOk = inMgr != 0u && Memory::Contains(inMgr, 20000);
+            const uint16_t guestBtn = inMgrOk ? static_cast<uint16_t>(Memory::Read16(inMgr + 15264u + 32u)) : 0u;
+            const uint16_t guestPrev = inMgrOk ? static_cast<uint16_t>(Memory::Read16(inMgr + 15264u + 96u)) : 0u;
+            AppLog(" in=gcn%04X(%d,%d)/cc%04X(%.2f,%.2f) guest0=%04X/%04X"
+                   " padHle=gcn:%u/wii:%u rasterMs=%.1f gpuMs=%.1f swTris=%u"
                    " audioSnd=%u audioAx=%u stubAudio=%u dspAdv=%llu chn0=%d"
                    " nextSec=%u sceneState=%u hostHeapFree=%zuKB texCache=%zuKB"
                    " texDecode=%u texHit=%u texEvict=%u texTexels=%u gpu2d=%u quads=%u drawn=%u"
                    " vram=%zuKB up=%u gev=%u base=%u\n",
+                g_inGcnBtn, g_inGcnX, g_inGcnY, g_inCcBtn, g_inCcX, g_inCcY, guestBtn, guestPrev,
+                g_padReadHleCalls, g_kpadHleCalls,
                 profRasterMs, profGpuMs, profRasterTris,
                 g_hleAudioSndCalls, g_hleAudioAxCalls, g_stubGuestAudio ? 1u : 0u,
                 static_cast<unsigned long long>(dspAdv), gx_bridge::AudioVoicePlaying(0) ? 1 : 0,
