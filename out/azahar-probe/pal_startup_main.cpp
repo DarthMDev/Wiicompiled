@@ -123,7 +123,8 @@ static uint8_t* g_raceSzsRam = nullptr;
 // Small lazily-mapped guest arena for resources extracted from SZS archives on demand (menu
 // layouts, model params, ...).  Sits just below the race staging buffer; nothing else maps here.
 static constexpr uint32_t kMenuArenaBase = 0x94F00000u;
-static constexpr size_t kMenuArenaSize = 0x40000u; // 256 KiB
+static constexpr size_t kMenuArenaSize = 0x20000u; // 128 KiB (the menu params total ~108 KiB;
+                                                    // 256 KiB left only 87 KiB host heap at boot)
 static uint8_t* g_menuArenaRam = nullptr;
 static constexpr uint32_t kLockedCacheBase = 0xE0000000u;
 alignas(32) static uint8_t g_lockedCache[16 * 1024];
