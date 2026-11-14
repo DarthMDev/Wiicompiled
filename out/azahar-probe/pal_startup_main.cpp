@@ -1219,6 +1219,7 @@ static void SamplerNote(uint32_t target)
     }
 }
 
+#ifdef __3DS__
 static void SamplerThread(void*)
 {
     while (true) {
@@ -1236,6 +1237,9 @@ static void SamplerStartIfNeeded()
     g_samplerStarted = true;
     threadCreate(SamplerThread, nullptr, 0x2000, 0x30, -2, false);   // core 2, idle priority
 }
+#else
+static void SamplerStartIfNeeded() {}   // host harness: no PICA, no sampler
+#endif
 
 // Appends " samples=<n> stop=<addr>:<percent>,..." to the [Beat] line and clears the table.
 static void SamplerReport()
@@ -4309,8 +4313,32 @@ static uint64_t TexSlotKey(const TexSlot& slot) {
 
 // Upload a decoded texture to VRAM, packed to power-of-two size with RGB565 when it is fully opaque
 // and RGBA4 otherwise (half the bytes of RGBA8, which is what lets the whole menu set fit).
+// Free one texture that is neither used by the frame being recorded nor by the command list still
+// in flight.  Returns false when nothing is evictable.
+// key -> frame at which a failed upload may be retried.  The font glyph atlas is requested once per
+// glyph, so a texture that cannot be allocated is otherwise decoded and scanned 1000+ times a frame.
+static std::map<uint64_t, uint32_t> g_gpuTexFailFrame;
+
+static bool Gpu2dEvictOldest() {
+    auto victim = g_gpuTextures.end();
+    for (auto scan = g_gpuTextures.begin(); scan != g_gpuTextures.end(); ++scan) {
+        if (scan->second.lastUse >= g_gpuEvictFloor) continue;
+        if (victim == g_gpuTextures.end() || scan->second.lastUse < victim->second.lastUse)
+            victim = scan;
+    }
+    if (victim == g_gpuTextures.end()) return false;
+    ++g_gpuTexEvictions;
+    Gpu2dReleaseEntry(victim);
+    return true;
+}
+
 static C3D_Tex* Gpu2dAcquireTexture(uint64_t key, const DecodedTex& dt,
                                     float* outUScale = nullptr, float* outVScale = nullptr) {
+    auto failIt = g_gpuTexFailFrame.find(key);
+    if (failIt != g_gpuTexFailFrame.end()) {
+        if (g_gxFrame - failIt->second < 120u) return nullptr;
+        g_gpuTexFailFrame.erase(failIt);
+    }
     auto it = g_gpuTextures.find(key);
     if (it != g_gpuTextures.end() && it->second.valid) {
         it->second.lastUse = ++g_gpuTexTick;
@@ -4330,24 +4358,30 @@ static C3D_Tex* Gpu2dAcquireTexture(uint64_t key, const DecodedTex& dt,
         if ((dt.rgba[i] & 0xFFu) != 0xFFu) { opaque = false; break; }
     }
     const size_t bytes = static_cast<size_t>(potW) * potH * 2u; // RGB565 / RGBA4 are both 16bpp
-    while (g_gpuTexBytes + bytes > g_gpuTexCap && !g_gpuTextures.empty()) {
-        // Quads recorded this frame hold raw C3D_Tex pointers, and the previous frame's
-        // command list may still be sampling its textures, so neither may be deleted.
-        auto victim = g_gpuTextures.end();
-        for (auto scan = g_gpuTextures.begin(); scan != g_gpuTextures.end(); ++scan) {
-            if (scan->second.lastUse >= g_gpuEvictFloor) continue;
-            if (victim == g_gpuTextures.end() || scan->second.lastUse < victim->second.lastUse)
-                victim = scan;
-        }
-        if (victim == g_gpuTextures.end()) break;
-        ++g_gpuTexEvictions;
-        Gpu2dReleaseEntry(victim);
-    }
+    // Quads recorded this frame hold raw C3D_Tex pointers, and the previous frame's command list may
+    // still be sampling its textures, so neither may be deleted (g_gpuEvictFloor guards both).
+    while (g_gpuTexBytes + bytes > g_gpuTexCap && Gpu2dEvictOldest()) {}
+
 
     GpuTexEntry entry;
     const GPU_TEXCOLOR fmt = opaque ? GPU_RGB565 : GPU_RGBA4;
-    if (!C3D_TexInit(&entry.tex, potW, potH, fmt)) {
-        AppLog("[Gpu2d] C3D_TexInit failed %dx%d (have %zuKB)\n", potW, potH, g_gpuTexBytes / 1024);
+    // g_gpuTexCap only tracks what *we* have uploaded; the linear heap is shared with the guest, the
+    // audio ring and the vertex buffers, so C3D_TexInit can fail while the budget still shows room.
+    // Evicting LRU textures (which frees real linear memory) is what lets the 512x512 font glyph
+    // atlas fit instead of failing every frame and leaving every glyph sampling the white fallback.
+    bool inited = C3D_TexInit(&entry.tex, potW, potH, fmt);
+    for (int attempt = 0; !inited && attempt < 24; ++attempt) {
+        if (!Gpu2dEvictOldest()) break;
+        inited = C3D_TexInit(&entry.tex, potW, potH, fmt);
+    }
+    if (!inited) {
+        static std::set<uint64_t> s_reportedFailures;
+        if (s_reportedFailures.insert(key).second) {
+            AppLog("[Gpu2d] C3D_TexInit failed %dx%d %s (have %zuKB, %zu textures, linFree %zuKB)\n",
+                potW, potH, opaque ? "RGB565" : "RGBA4", g_gpuTexBytes / 1024,
+                g_gpuTextures.size(), linearSpaceFree() / 1024);
+        }
+        g_gpuTexFailFrame[key] = g_gxFrame;
         return nullptr;
     }
     // Write the tiled texels straight into the texture's LINEAR buffer (see PicaTiledIndex),
@@ -10533,11 +10567,16 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 gx_bridge::g_gpuQuadsDrawn, gx_bridge::g_gpuTexBytes / 1024,
                 gx_bridge::g_gpuTexUploads, gx_bridge::g_gpuTexEvictions,
                 gx_bridge::g_gpuBaseUploads);
-            AppLog(" qTex=%u tiny=%u big=%u", gx_bridge::g_quadTexSeen,
+#ifdef __3DS__
+            // linearSpaceFree is what C3D_TexInit actually draws from; hostHeapFree is the malloc
+            // arena and says nothing about whether a texture upload can succeed.
+            AppLog(" linFree=%zuKB qTex=%u tiny=%u big=%u", linearSpaceFree() / 1024,
+                gx_bridge::g_quadTexSeen,
                 gx_bridge::g_quadTiny, gx_bridge::g_quadBig);
             gx_bridge::g_quadTexSeen = 0;
             gx_bridge::g_quadTiny = 0;
             gx_bridge::g_quadBig = 0;
+#endif
             gx_bridge::SamplerStartIfNeeded();
             gx_bridge::SamplerReport();
             gx_bridge::ProfReport();
