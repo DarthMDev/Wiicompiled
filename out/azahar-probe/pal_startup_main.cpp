@@ -4815,6 +4815,8 @@ static void DrawLytQuad2D(uint32_t posAddr, uint32_t sizeAddr, uint32_t texCoord
 
 // A GX primitive triangle through the citro3d batch: reuse the quad recorder with the third vertex
 // duplicated, which makes the second triangle degenerate (zero area) and leaves the real one intact.
+// Host builds have the no-op stub above; this body only exists on the 3DS.
+#ifdef __3DS__
 static void Gpu2dRecordTri(const GxVertex& a, const GxVertex& b, const GxVertex& c, uint32_t pnMtx) {
     GxVertex quad[4] = {a, b, c, c};
     // The primitive carries a position-matrix index per vertex; the recorder reads the current slot.
@@ -4825,6 +4827,7 @@ static void Gpu2dRecordTri(const GxVertex& a, const GxVertex& b, const GxVertex&
     g_layoutQuad = savedLayout;
     g_gx.currentPnMtx = saved;
 }
+#endif
 
 static void SetEggVtxState(uint32_t type) {
     EnsureInitialized();
@@ -5720,6 +5723,16 @@ static uint32_t ScriptedPadButtons(ScriptPadKind kind)
         const long at = std::strtol(s, nullptr, 10);
         if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + len) out |= kA;
     }
+    // A second A window.  The menu path needs two separate presses: one to register the pad and
+    // leave the title, one to click a licence button (the guest only acts on a fresh edge).
+    if (const char* s = std::getenv("MKW_PRESS_A2")) {
+        const long at = std::strtol(s, nullptr, 10);
+        if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + len) out |= kA;
+    }
+    if (const char* s = std::getenv("MKW_PRESS_A3")) {
+        const long at = std::strtol(s, nullptr, 10);
+        if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + len) out |= kA;
+    }
     if (const char* s = std::getenv("MKW_PRESS_START")) {
         const long at = std::strtol(s, nullptr, 10);
         if (at >= 0 && frame >= static_cast<uint32_t>(at) && frame < static_cast<uint32_t>(at) + len) out |= kStart;
@@ -5772,6 +5785,18 @@ static void NoteSndCall(uint32_t target) {
 
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
+    // Full indirect-call trace for a short frame window (diagnostic only).  Used to find which
+    // page/caller schedules an idle section reinit right after the licence page activates.
+    static const bool s_traceIndirectAll = std::getenv("MKW_TRACE_INDIRECT") != nullptr;
+    if (s_traceIndirectAll && gx_bridge::g_gxFrame >= 136 && gx_bridge::g_gxFrame <= 146) {
+        static uint32_t s_traceN = 0;
+        if (s_traceN < 20000) {
+            ++s_traceN;
+            AppLog("[Ind] f=%u tgt=%08X lr=%08X r3=%08X r4=%08X r5=%08X f1=%g\n",
+                gx_bridge::g_gxFrame, target, cpu ? cpu->lr : 0, cpu ? cpu->gpr[3] : 0,
+                cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0, cpu ? cpu->fpr[1].d : 0.0);
+        }
+    }
     // gpu.cfg is read later than the first HLE call, so re-evaluate every time instead of caching
     // the decision (the env var only has to be read once).
     if (!g_stubGuestAudioInit) {
@@ -6337,12 +6362,244 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         target == 0x8063AD64u || target == 0x8063B698u || target == 0x8063C210u ||
         target == 0x80850DB0u || target == 0x808503DCu || target == 0x80850D54u ||
         target == 0x8063AFC8u || target == 0x8063C398u || target == 0x8063AE94u ||
-        target == 0x8063C27Cu || target == 0x8063B7F0u) {
+        target == 0x8063C27Cu || target == 0x8063B7F0u || target == 0x805EABB8u ||
+        target == 0x805EAE94u || target == 0x805EB774u || target == 0x805EB7A0u ||
+        target == 0x805EBB44u || target == 0x805EBC8Cu || target == 0x805EB7A0u) {
         static std::set<uint32_t> s_seenAction;
-        if (s_seenAction.size() < 24 && s_seenAction.insert(target).second) {
+        if (s_seenAction.size() < 48 && s_seenAction.insert(target).second) {
             AppLog("[MenuAction] target=%08X this=%08X r4=%08X r5=%08X lr=%08X frame=%u\n",
                 target, cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0,
                 cpu ? cpu->lr : 0, gx_bridge::g_gxFrame);
+        }
+    }
+    // Licence-select probe: the screen builds its MiiGroup(page+4720) from RKSYS licence records;
+    // MiiGroup::LoadStoreMii needs an RFL Mii for the licence's RFLCreateID (official Miis come
+    // from RFLRes01.arc, personal Miis from the Wii Mii DB we do not have).  Dump both sides so a
+    // dead click can be attributed to the save/Mii instead of the pad.
+    if (target == 0x805EAE94u || target == 0x805EABB8u || target == 0x805EB7A0u) {
+        static std::set<uint64_t> s_seenLic;
+        const uint32_t page = cpu ? cpu->gpr[3] : 0;
+        const uint32_t arg = cpu ? cpu->gpr[4] : 0;
+        const uint32_t key = (static_cast<uint64_t>(target) << 32) ^ page ^
+            (static_cast<uint64_t>(arg) << 16) ^ gx_bridge::g_gxFrame / 30u;
+        if (s_seenLic.size() < 24 && s_seenLic.insert(key).second) {
+            const uint32_t group = (page && Memory::Contains(page + 4720, 32)) ? page + 4720 : 0;
+            const uint32_t arr = (group && Memory::Contains(group + 4, 4)) ? Memory::Read32(group + 4) : 0;
+            const uint32_t mm = Memory::Contains(0x80386000u, 4) ? Memory::Read32(0x80386000u) : 0;
+            const uint32_t rksys = Memory::Contains(0x809BD748u, 24) ? Memory::Read32(0x809BD748u) : 0;
+            const uint32_t licBase = (rksys && Memory::Contains(rksys + 20, 4)) ? Memory::Read32(rksys + 20) : 0;
+            const uint32_t click = (arg && Memory::Contains(arg + 576, 4)) ? Memory::Read32(arg + 576) : 0;
+            AppLog("[LicClick] tgt=%08X page=%08X arg=%08X click+576=%u group=%08X arr=%08X "
+                   "mii=%08X,%08X,%08X,%08X mm=%08X mm611=%u mmID=%02X%02X%02X%02X licBase=%08X magic=%08X frame=%u\n",
+                target, page, arg, click, group, arr,
+                (arr && Memory::Contains(arr, 16)) ? Memory::Read32(arr) : 0,
+                (arr && Memory::Contains(arr + 4, 16)) ? Memory::Read32(arr + 4) : 0,
+                (arr && Memory::Contains(arr + 8, 16)) ? Memory::Read32(arr + 8) : 0,
+                (arr && Memory::Contains(arr + 12, 16)) ? Memory::Read32(arr + 12) : 0,
+                mm,
+                (mm && Memory::Contains(mm + 611, 1)) ? Memory::Read8(mm + 611) : 0xFFu,
+                (mm && Memory::Contains(mm + 240, 4)) ? Memory::Read8(mm + 240) : 0,
+                (mm && Memory::Contains(mm + 241, 4)) ? Memory::Read8(mm + 241) : 0,
+                (mm && Memory::Contains(mm + 242, 4)) ? Memory::Read8(mm + 242) : 0,
+                (mm && Memory::Contains(mm + 243, 4)) ? Memory::Read8(mm + 243) : 0,
+                licBase,
+                (licBase && Memory::Contains(licBase + 8, 4)) ? Memory::Read32(licBase + 8) : 0,
+                gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x805EF43Cu || target == 0x805EEF20u || target == 0x805EFE40u ||
+        target == 0x805F0E94u || target == 0x805F1F40u || target == 0x805F0040u ||
+        target == 0x80601C64u || target == 0x806022CCu) {
+        static std::set<uint64_t> s_seenPm;
+        const uint32_t obj = cpu ? cpu->gpr[3] : 0;
+        const uint32_t src = cpu ? cpu->gpr[4] : 0;
+        const uint64_t key = (static_cast<uint64_t>(target) << 40) ^
+            (static_cast<uint64_t>(obj) << 8) ^ (gx_bridge::g_gxFrame / 45u);
+        if (s_seenPm.size() < 120 && s_seenPm.insert(key).second) {
+            const uint32_t mask = (obj && Memory::Contains(obj + 4, 12)) ? Memory::Read32(obj + 4) : 0;
+            const uint32_t f8 = (obj && Memory::Contains(obj + 8, 12)) ? Memory::Read32(obj + 8) : 0;
+            const uint32_t b12 = (obj && Memory::Contains(obj + 12, 4)) ? Memory::Read8(obj + 12) : 0;
+            const uint32_t b13 = (obj && Memory::Contains(obj + 13, 2)) ? Memory::Read8(obj + 13) : 0;
+            const uint32_t held = (src && Memory::Contains(src + 92, 4)) ? Memory::Read16(src + 92) : 0xFFFF;
+            AppLog("[PMgr] tgt=%08X obj=%08X src=%08X mask=%02X f8=%02X b12=%u b13=%u held=%04X "
+                   "obj40=%02X%02X%02X%02X obj4=%d frame=%u\n",
+                target, obj, src, mask, f8, b12, b13, held,
+                (obj && Memory::Contains(obj + 40, 4)) ? Memory::Read8(obj + 40) : 0,
+                (obj && Memory::Contains(obj + 41, 4)) ? Memory::Read8(obj + 41) : 0,
+                (obj && Memory::Contains(obj + 42, 4)) ? Memory::Read8(obj + 42) : 0,
+                (obj && Memory::Contains(obj + 43, 4)) ? Memory::Read8(obj + 43) : 0,
+                (obj && Memory::Contains(obj + 8, 4)) ? static_cast<int32_t>(Memory::Read32(obj + 8)) : 0,
+                gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x80858A34u) {
+        AppLog("[SecReinit] this=%08X vt=%08X r4=%08X r5=%08X lr=%08X sm48=%u frame=%u\n",
+            cpu ? cpu->gpr[3] : 0,
+            (cpu && cpu->gpr[3] && Memory::Contains(cpu->gpr[3], 4)) ? Memory::Read32(cpu->gpr[3]) : 0,
+            cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0, cpu ? cpu->lr : 0,
+            (Memory::Contains(0x809C1E38u, 52) && Memory::Read32(0x809C1E38u) &&
+             Memory::Contains(Memory::Read32(0x809C1E38u) + 48, 4))
+                ? Memory::Read32(Memory::Read32(0x809C1E38u) + 48) : 0,
+            gx_bridge::g_gxFrame);
+    }
+    if (target == 0x80243984u) { // EGG::UnitHeap::alloc(this, size)
+        const uint32_t heap = (cpu && Memory::Contains(cpu->gpr[3] + 16, 4))
+            ? Memory::Read32(cpu->gpr[3] + 16) : 0;
+        const uint32_t size = cpu ? cpu->gpr[4] : 0;
+        if (!heap || !Memory::Contains(heap + 68, 4) || size > Memory::Read32(heap + 64)) {
+            if (cpu) cpu->gpr[3] = 0;
+            return true;
+        }
+        CpuContext c = *cpu;
+        c.gpr[3] = heap;
+        c.gpr[4] = size;
+        c.lr = 0;
+        CpuContextScope scope(&c);
+        InvokeIndirectCpu(0x80199A30u, &c);
+        if (cpu) cpu->gpr[3] = c.gpr[3];
+        return true;
+    }
+    if (target == 0x80199A30u) { // MEM::AllocFromUnitHeap(heap, size) - single-threaded freelist pop
+        const uint32_t heap = cpu ? cpu->gpr[3] : 0;
+        uint32_t block = 0;
+        if (heap && Memory::Contains(heap + 68, 4)) {
+            block = Memory::Read32(heap + 60);
+            if (block) {
+                Memory::Write32(heap + 60, Memory::Read32(block));
+                const uint32_t flags = Memory::Read32(heap + 56);
+                const uint32_t unit = Memory::Read32(heap + 64);
+                if (!(flags & 1u) && unit && Memory::Contains(block, unit)) {
+                    std::memset(Memory::GetPointer(block, unit), 0, unit);
+                }
+            }
+        }
+        if (cpu) cpu->gpr[3] = block;
+        return true;
+    }
+    if (target == 0x805FA3FCu) { // MiiGroup::AddMii - substitute a default Mii when RFL found none
+        static bool s_inMiiAdd = false;
+        if (!s_inMiiAdd) {
+            const uint32_t group = cpu ? cpu->gpr[3] : 0;
+            const uint32_t index = cpu ? cpu->gpr[4] : 0;
+            uint32_t mii = cpu ? cpu->gpr[5] : 0;
+            if (group && index < 8 && mii == 0) {
+                const uint32_t mm = Memory::Contains(0x809BD6D0u, 4) ? Memory::Read32(0x809BD6D0u) : 0;
+                if (mm) {
+                    CpuContext make = *cpu;
+                    make.gpr[3] = mm;
+                    make.gpr[4] = 0;      // RFLIdx 0 = first default/official Mii
+                    make.lr = 0;
+                    s_inMiiAdd = true;
+                    CpuContextScope makeScope(&make);
+                    InvokeIndirectCpu(0x80527F84u, &make);   // MiiManager::CreateDefaultMii(RFLIdx)
+                    s_inMiiAdd = false;
+                    mii = make.gpr[3];
+                    AppLog("[MiiSub] AddMii idx=%u null -> default mii=%08X mm=%08X frame=%u\n",
+                        index, mii, mm, gx_bridge::g_gxFrame);
+                }
+            }
+            if (cpu) cpu->gpr[5] = mii;
+            s_inMiiAdd = true;
+            CpuContextScope addScope(cpu);
+            InvokeIndirectCpu(0x805FA3FCu, cpu);          // run the real MiiGroup::AddMii
+            s_inMiiAdd = false;
+            return true;
+        }
+    }
+    if (target == 0x805FA6E0u || target == 0x805FA3FCu) { // MiiGroup::LoadStoreMii / AddMii
+        static uint32_t s_miiGroupLogs = 0;
+        if (s_miiGroupLogs < 40) {
+            ++s_miiGroupLogs;
+            const uint32_t idPtr = cpu ? cpu->gpr[5] : 0;
+            AppLog("[MiiGroup] %s g=%08X idx=%u mii=%08X id=%02X%02X%02X%02X%02X%02X%02X%02X arr=%08X frame=%u\n",
+                target == 0x805FA6E0u ? "LoadStoreMii" : "AddMii",
+                cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0,
+                (idPtr && Memory::Contains(idPtr, 8)) ? Memory::Read8(idPtr) : 0,
+                (idPtr && Memory::Contains(idPtr + 1, 7)) ? Memory::Read8(idPtr + 1) : 0,
+                (idPtr && Memory::Contains(idPtr + 2, 6)) ? Memory::Read8(idPtr + 2) : 0,
+                (idPtr && Memory::Contains(idPtr + 3, 5)) ? Memory::Read8(idPtr + 3) : 0,
+                (idPtr && Memory::Contains(idPtr + 4, 4)) ? Memory::Read8(idPtr + 4) : 0,
+                (idPtr && Memory::Contains(idPtr + 5, 3)) ? Memory::Read8(idPtr + 5) : 0,
+                (idPtr && Memory::Contains(idPtr + 6, 2)) ? Memory::Read8(idPtr + 6) : 0,
+                (idPtr && Memory::Contains(idPtr + 7, 1)) ? Memory::Read8(idPtr + 7) : 0,
+                (cpu && Memory::Contains(cpu->gpr[3] + 4, 4)) ? Memory::Read32(cpu->gpr[3] + 4) : 0,
+                gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x800BBBA0u || target == 0x800BBF10u || target == 0x800BC370u ||
+        target == 0x800BE150u || target == 0x800C75F0u || target == 0x800CA820u ||
+        target == 0x80526D94u || target == 0x80527B0Cu || target == 0x805276E0u ||
+        target == 0x800BD860u) {
+        static uint32_t s_miiLogs = 0;
+        if (s_miiLogs < 120) {
+            ++s_miiLogs;
+            AppLog("[MiiFlow] tgt=%08X r3=%08X r4=%08X r5=%08X lr=%08X frame=%u\n",
+                target, cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0,
+                cpu ? cpu->lr : 0, gx_bridge::g_gxFrame);
+        }
+    }
+    if (target == 0x805BE42Cu) { // PushButton::OnClick (empty virtual in the retail binary)
+        return true;
+    }
+    if (target == 0x805BE358u) { // PushButton::HandleClick (linked only through the click PTMF)
+        // Small enough to stand in for until the linker adds it: play the press animations, run the
+        // control's own click virtual, then the optional handler object and the click sound.
+        const uint32_t self = cpu ? cpu->gpr[3] : 0;
+        const uint32_t arg4 = cpu ? cpu->gpr[4] : 0;
+        const uint32_t arg5 = cpu ? cpu->gpr[5] : 0;
+        const uint32_t animConst = Memory::Contains(0x80892E24u, 4) ? Memory::Read32(0x80892E24u) : 0;
+        float animF1 = 0.0f;
+        std::memcpy(&animF1, &animConst, sizeof(animF1));
+        auto callGuest = [&](uint32_t fn, uint32_t r3, uint32_t r4, uint32_t r5, float f1) {
+            if (!fn) return;
+            CpuContext c = *cpu;
+            c.gpr[3] = r3;
+            c.gpr[4] = r4;
+            c.gpr[5] = r5;
+            c.lr = 0;
+            c.fpr[1].d = f1;
+            CpuContextScope scope(&c);
+            InvokeIndirectCpu(fn, &c);
+        };
+        const uint32_t group = (self && Memory::Contains(self + 152, 4)) ? Memory::Read32(self + 152) : 0;
+        if (group) {
+            for (int slot = 2; slot <= 3; ++slot) {
+                const uint32_t entry = Memory::Contains(group + slot * 68, 4)
+                    ? Memory::Read32(group + slot * 68) : 0;
+                if (entry) callGuest(0x8063C91Cu, entry, 0, 0, animF1);
+            }
+        }
+        const uint32_t vt = (self && Memory::Contains(self, 4)) ? Memory::Read32(self) : 0;
+        const uint32_t clickFn = (vt && Memory::Contains(vt + 72, 4)) ? Memory::Read32(vt + 72) : 0;
+        callGuest(clickFn, self, arg4, arg5, animF1);
+        const uint32_t handler = (self && Memory::Contains(self + 564, 4)) ? Memory::Read32(self + 564) : 0;
+        if (handler) {
+            const uint32_t hvt = Memory::Read32(handler);
+            const uint32_t hfn = (hvt && Memory::Contains(hvt + 8, 4)) ? Memory::Read32(hvt + 8) : 0;
+            callGuest(hfn, handler, self, arg4, animF1);
+        }
+        const uint32_t sound = (self && Memory::Contains(self + 592, 4)) ? Memory::Read32(self + 592) : 0;
+        callGuest(0x8063D74Cu, self, sound, arg4, animF1);
+        if (self && Memory::Contains(self + 592, 4)) Memory::Write32(self + 592, 8);
+        AppLog("[BtnHle] HandleClick self=%08X r4=%08X r5=%08X vt=%08X clickFn=%08X handler=%08X frame=%u\n",
+            self, arg4, arg5, vt, clickFn, handler, gx_bridge::g_gxFrame);
+        return true;
+    }
+    if (target == 0x80602530u || target == 0x806025B0u || target == 0x806024B0u ||
+        target == 0x80635A3Cu || target == 0x80635AC8u || target == 0x80635B2Cu) {
+        static uint32_t s_secReqLogs = 0;
+        if (s_secReqLogs < 40) {
+            ++s_secReqLogs;
+            const uint32_t smp2 = Memory::Contains(0x809C1E38u, 4) ? Memory::Read32(0x809C1E38u) : 0;
+            AppLog("[SecReq] tgt=%08X this=%08X r4=%08X r5=%08X r6=%08X lr=%08X "
+                   "sm44=%08X sm48=%08X sm28=%u sm40=%08X frame=%u\n",
+                target, cpu ? cpu->gpr[3] : 0, cpu ? cpu->gpr[4] : 0, cpu ? cpu->gpr[5] : 0,
+                cpu ? cpu->gpr[6] : 0, cpu ? cpu->lr : 0,
+                (smp2 && Memory::Contains(smp2 + 44, 4)) ? Memory::Read32(smp2 + 44) : 0,
+                (smp2 && Memory::Contains(smp2 + 48, 4)) ? Memory::Read32(smp2 + 48) : 0,
+                (smp2 && Memory::Contains(smp2 + 28, 4)) ? Memory::Read32(smp2 + 28) : 0,
+                (smp2 && Memory::Contains(smp2 + 40, 4)) ? Memory::Read32(smp2 + 40) : 0,
+                gx_bridge::g_gxFrame);
         }
     }
     switch (target) {
@@ -6563,13 +6820,16 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
         }
         s_nandLoaded[path] = true;
         if (path.find("rksys.dat") == std::string::npos) return false;
+        const char* envSave = std::getenv("MKW_NAND_RKSYS");
         const char* candidates[] = {
+            envSave,
             "sdmc:/mkwii/rksys.dat",
             "../../Assets/extracted-rmcp01/save/rksys.dat",
             "Assets/extracted-rmcp01/save/rksys.dat",
             "../../Assets/save/rksys.dat",
         };
         for (const char* candidate : candidates) {
+            if (!candidate || !candidate[0]) continue;
             FILE* fp = std::fopen(candidate, "rb");
             if (!fp) continue;
             std::fseek(fp, 0, SEEK_END);
@@ -9814,6 +10074,60 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 // which is the "requested but nothing bound yet" state - that must keep nudging.)
                 const bool bound = id != 0u && id == pending;
                 (void)state;
+                // Attract/demo return: once a menu page is on top the game arms a section reinit
+                // back to section 0 with a ~608-update countdown (SectionMgr+48 = 1).  While that
+                // is pending, Section::Update skips Page::CheckActions, so every menu button stops
+                // responding until the countdown fires.  On hardware player input cancels it; the
+                // port's injected pad never reaches that bookkeeping, so cancel it here on a
+                // fresh press.  Only state 1 with next-section 0 is the idle return - a real
+                // section change (state 2/5) is left alone.
+                if (bound && Memory::Contains(sectionMgr + 48, 4)) {
+                    const uint32_t idleState = Memory::Read32(sectionMgr + 48);
+                    const uint32_t idleNext = Memory::Read32(sectionMgr + 12);
+                    const uint32_t curSection = Memory::Read32(sectionMgr + 4);
+                    if (idleState == 1u && idleNext == 0u && curSection >= 16u) {
+                        bool freshPress = false;
+                        const uint32_t inputMgr = Memory::Read32(0x809BD70Cu);
+                        if (inputMgr != 0u && Memory::Contains(inputMgr, 20000)) {
+                            for (int i = 0; i < 4 && !freshPress; ++i) {
+                                const uint32_t c = inputMgr + 5920u + static_cast<uint32_t>(i) * 2336u;
+                                if (!Memory::Contains(c + 100, 4) || Memory::Read8(c + 80) == 0u) continue;
+                                if ((Memory::Read16(c + 32) & ~Memory::Read16(c + 96)) != 0u) freshPress = true;
+                            }
+                            for (int i = 0; i < 4 && !freshPress; ++i) {
+                                const uint32_t c = inputMgr + 15264u + static_cast<uint32_t>(i) * 176u;
+                                if (!Memory::Contains(c + 100, 4) || Memory::Read8(c + 80) == 0u) continue;
+                                if ((Memory::Read16(c + 32) & ~Memory::Read16(c + 96)) != 0u) freshPress = true;
+                            }
+                        }
+                        if (freshPress) {
+                            Memory::Write32(sectionMgr + 12, curSection);
+                            Memory::Write32(sectionMgr + 28, 0);
+                            Memory::Write32(sectionMgr + 44, 0xFFFFFFFFu);
+                            Memory::Write32(sectionMgr + 48, 0);
+                            // Re-arm the same press: Section::Update only checks actions when the
+                            // state above is clear, and by the next input update the edge is gone.
+                            // Clearing the candidate's previous-button word makes the held button
+                            // look newly pressed once, so the same physical press reaches the page.
+                            if (inputMgr != 0u && Memory::Contains(inputMgr, 20000)) {
+                                for (int i = 0; i < 4; ++i) {
+                                    const uint32_t c = inputMgr + 5920u + static_cast<uint32_t>(i) * 2336u;
+                                    if (!Memory::Contains(c + 100, 4) || Memory::Read8(c + 80) == 0u) continue;
+                                    if ((Memory::Read16(c + 32) & ~Memory::Read16(c + 96)) != 0u)
+                                        Memory::Write16(c + 96, 0);
+                                }
+                                for (int i = 0; i < 4; ++i) {
+                                    const uint32_t c = inputMgr + 15264u + static_cast<uint32_t>(i) * 176u;
+                                    if (!Memory::Contains(c + 100, 4) || Memory::Read8(c + 80) == 0u) continue;
+                                    if ((Memory::Read16(c + 32) & ~Memory::Read16(c + 96)) != 0u)
+                                        Memory::Write16(c + 96, 0);
+                                }
+                            }
+                            AppLog("[MenuIdle] input cancels demo reinit (sec=%u next=0) frame=%u\n",
+                                curSection, s_frameCount);
+                        }
+                    }
+                }
                 if (bound) {
                     g_padHoldAUntilBound = 0;
                     g_padAPressSeen = false;
@@ -10218,7 +10532,8 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 }
             }
         }
-        if (s_frameCount >= 83 && s_frameCount <= 95) {
+        if ((s_frameCount >= 83 && s_frameCount <= 95) ||
+            (s_frameCount >= 415 && s_frameCount <= 430)) {
             const uint32_t mgr2 = Memory::Read32(0x809BD70Cu);
             const uint32_t pad2 = Memory::Read32(0x809C1E38u);
             if (mgr2 && Memory::Contains(mgr2, 20000) && pad2 && Memory::Contains(pad2 + 52, 32)) {
@@ -10337,7 +10652,22 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 }
             }
         }
-        if (s_frameCount >= 80 && s_frameCount <= 400 && s_frameCount % 20 == 0) {
+        if (const char* s = std::getenv("MKW_POKE_SECGATE")) {
+            const long at = std::strtol(s, nullptr, 10);
+            if (at >= 0 && s_frameCount == static_cast<uint32_t>(at)) {
+                const uint32_t sm = Memory::Read32(0x809C1E38u);
+                if (sm && Memory::Contains(sm + 48, 4)) {
+                    AppLog("[SecPoke] f=%u sm=%08X 44=%08X 48=%08X 28=%u\n", s_frameCount, sm,
+                        Memory::Read32(sm + 44), Memory::Read32(sm + 48),
+                        Memory::Read32(sm + 28));
+                    Memory::Write32(sm + 44, 0xFFFFFFFFu);
+                    Memory::Write32(sm + 48, 0);
+                    Memory::Write32(sm + 28, 0);
+                }
+            }
+        }
+        if ((s_frameCount >= 120 && s_frameCount <= 170) ||
+            (s_frameCount >= 300 && s_frameCount <= 460 && s_frameCount % 20 == 0)) {
             // func_80554E14 reads *(0x809C0000 - 10504) = *(0x809BD6F8), then +76.
             const uint32_t gateMgr = Memory::Read32(0x809BD6F8u);
             const uint32_t gateFlag = (gateMgr && Memory::Contains(gateMgr + 76, 1)) ? Memory::Read8(gateMgr + 76) : 0xFFu;
@@ -10353,6 +10683,28 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                                       Memory::Contains(sec + 852 + 4 * (layerCount - 1), 4))
                 ? Memory::Read32(sec + 852 + 4 * (layerCount - 1)) : 0;
             AppLog("[PageLayer] frame=%u sec=%08X count=%u top=%08X\n", s_frameCount, sec, layerCount, topPage);
+            {
+                // Section::Update only calls Page::CheckActions (the menu's button input pass) when
+                // all of these are clear: section+909, an empty layer stack, a running section
+                // transition (SectionMgr+48) and the scene being live (Scene+4 == 1).
+                const uint32_t sceneRoot = Memory::Read32(0x80385FC8u);
+                const uint32_t sceneMgr = (sceneRoot && Memory::Contains(sceneRoot + 84, 4))
+                    ? Memory::Read32(sceneRoot + 84) : 0;
+                const uint32_t scene = (sceneMgr && Memory::Contains(sceneMgr + 36, 4))
+                    ? Memory::Read32(sceneMgr + 36) : 0;
+                const uint32_t sceneState = (scene && Memory::Contains(scene + 4, 4))
+                    ? Memory::Read32(scene + 4) : 0xFFFFFFFFu;
+                AppLog("[SecGate] frame=%u f909=%u f892=%u smgr44=%08X smgr48=%u smgr28=%u "
+                       "smgr40=%08X scene=%08X state=%u\n",
+                    s_frameCount,
+                    (sec && Memory::Contains(sec + 909, 1)) ? Memory::Read8(sec + 909) : 0xFFu,
+                    layerCount,
+                    (smp && Memory::Contains(smp + 44, 4)) ? Memory::Read32(smp + 44) : 0xFFFFFFFFu,
+                    (smp && Memory::Contains(smp + 48, 4)) ? Memory::Read32(smp + 48) : 0xFFFFFFFFu,
+                    (smp && Memory::Contains(smp + 28, 4)) ? Memory::Read32(smp + 28) : 0xFFFFFFFFu,
+                    (smp && Memory::Contains(smp + 40, 4)) ? Memory::Read32(smp + 40) : 0xFFFFFFFFu,
+                    scene, sceneState);
+            }
             if (smp && Memory::Contains(smp + 52, 96)) {
                 const uint32_t pad = smp + 52;
                 for (int i = 0; i < 4; ++i) {
