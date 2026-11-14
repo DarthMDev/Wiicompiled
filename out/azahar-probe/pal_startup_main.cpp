@@ -1295,6 +1295,7 @@ static char g_audioPathBuf[160] = "sdmc:/mkwii/sound/strm/o_Option_32.brstm";
 static bool g_audioEnabled = true;
 static bool g_audioFollowSection = true;   // false once bgm= names a stream explicitly
 static bool g_audioTone = false;           // gpu.cfg tone=1: play a PCM16 test tone instead of BGM
+static bool g_audioStubCfg = false;        // gpu.cfg stubguestaudio=1: silence the guest's own mixer
 #ifdef __3DS__
 static bool AudioStart(const char* path);
 static void AudioTick(uint32_t section, uint32_t soundId);
@@ -4006,6 +4007,7 @@ static bool Gpu2dReadConfig() {
             g_gpuClearOverride = (static_cast<uint32_t>(std::strtoul(v, nullptr, 16)) << 8) | 0xFFu;
         else if (std::strcmp(k, "audio") == 0) g_audioEnabled = on;
         else if (std::strcmp(k, "tone") == 0) g_audioTone = on;
+        else if (std::strcmp(k, "stubguestaudio") == 0) g_audioStubCfg = on;
         else if (std::strcmp(k, "audiopath") == 0) {
             std::snprintf(g_audioPathBuf, sizeof(g_audioPathBuf), "%s", v);
             g_audioFollowSection = false;
@@ -5699,7 +5701,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
     if (!g_stubGuestAudioInit) {
         g_stubGuestAudioInit = true;
         const char* e = std::getenv("MKW_STUB_GUEST_AUDIO");
-        g_stubGuestAudio = e && e[0] && e[0] != '0';
+        g_stubGuestAudio = gx_bridge::g_audioStubCfg || (e && e[0] && e[0] != '0');
         AppLog("[Audio] guest sound stub %s\n", g_stubGuestAudio ? "ON" : "off");
     }
     if (IsGuestAudioRange(target)) {
@@ -9636,10 +9638,20 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             const uint64_t dspNow = gx_bridge::AudioDspFrames();
             const uint64_t dspAdv = s_lastDspFrame ? (dspNow - s_lastDspFrame) : 0;
             s_lastDspFrame = dspNow;
-            AppLog(" audioSnd=%u audioAx=%u stubAudio=%u dspAdv=%llu chn0=%d"
+            // Where the frame went: the software rasteriser (RasterTriangle) and the citro3d pass are
+            // timed with osGetTime(); whatever is left is guest emulation, the thing to optimise next.
+            const double profRasterMs = static_cast<double>(gx_bridge::g_profRasterTicks);
+            const double profGpuMs = static_cast<double>(gx_bridge::g_profGpuTicks);
+            const uint32_t profRasterTris = gx_bridge::g_profRasterTris;
+            gx_bridge::g_profRasterTicks = 0;
+            gx_bridge::g_profGpuTicks = 0;
+            gx_bridge::g_profRasterTris = 0;
+            AppLog(" rasterMs=%.1f gpuMs=%.1f swTris=%u"
+                   " audioSnd=%u audioAx=%u stubAudio=%u dspAdv=%llu chn0=%d"
                    " nextSec=%u sceneState=%u hostHeapFree=%zuKB texCache=%zuKB"
                    " texDecode=%u texHit=%u texEvict=%u texTexels=%u gpu2d=%u quads=%u drawn=%u"
                    " vram=%zuKB up=%u gev=%u base=%u\n",
+                profRasterMs, profGpuMs, profRasterTris,
                 g_hleAudioSndCalls, g_hleAudioAxCalls, g_stubGuestAudio ? 1u : 0u,
                 static_cast<unsigned long long>(dspAdv), gx_bridge::AudioVoicePlaying(0) ? 1 : 0,
                 nextSec, sceneState, HostHeapFreeKb(), gx_bridge::g_texCacheBytes / 1024,
