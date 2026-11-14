@@ -3913,6 +3913,30 @@ struct GpuTexEntry {
 };
 
 static std::vector<GpuQuad> g_gpuQuads;
+
+// Quad-mix summary for [Beat]: how many distinct textures a frame touches and how many of its quads
+// are tiny.  A page that suddenly draws 1000+ quads from a handful of textures' worth of small
+// rectangles is drawing a placeholder/hatch pattern, not content -- that is what the main menu does
+// while its archive is missing, and it costs both guest time and one PICA draw per quad.
+static uint32_t g_quadTiny = 0, g_quadBig = 0;
+static uint32_t g_quadTexSeen = 0;
+static const void* g_quadTexSet[64] = {};
+
+static void QuadMixNote(const GpuQuad& q)
+{
+    const float w = std::fabs(q.v[1].x - q.v[0].x);
+    const float h = std::fabs(q.v[2].y - q.v[0].y);
+    if (w < 16.0f || h < 16.0f) ++g_quadTiny;
+    if (w > 64.0f && h > 64.0f) ++g_quadBig;
+    if (g_quadTexSeen < 64u) {
+        bool known = false;
+        for (uint32_t i = 0; i < g_quadTexSeen; ++i) {
+            if (g_quadTexSet[i] == q.tex) { known = true; break; }
+        }
+        if (!known) g_quadTexSet[g_quadTexSeen++] = q.tex;
+    }
+}
+
 static std::map<uint64_t, GpuTexEntry> g_gpuTextures;
 static size_t   g_gpuTexCap = 3ull * 1024 * 1024;
 static uint64_t g_gpuTexTick = 0;
@@ -4372,6 +4396,7 @@ static void Gpu2dRecordQuad(const GxVertex v[4]) {
     }
     g_gpuQuads.push_back(q);
     ++g_gpuQuadsRecorded;
+    QuadMixNote(q);
 }
 
 // Copy the software framebuffer (clear colour + any software-rendered 3D) into a texture so the GPU
@@ -10113,6 +10138,11 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 gx_bridge::g_gpuQuadsDrawn, gx_bridge::g_gpuTexBytes / 1024,
                 gx_bridge::g_gpuTexUploads, gx_bridge::g_gpuTexEvictions,
                 gx_bridge::g_gpuBaseUploads);
+            AppLog(" qTex=%u tiny=%u big=%u", gx_bridge::g_quadTexSeen,
+                gx_bridge::g_quadTiny, gx_bridge::g_quadBig);
+            gx_bridge::g_quadTexSeen = 0;
+            gx_bridge::g_quadTiny = 0;
+            gx_bridge::g_quadBig = 0;
             gx_bridge::ProfReport();
             AppLog("\n");
             g_hleAudioSndCalls = 0;
@@ -10371,7 +10401,11 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                     static_cast<int32_t>(Memory::Read32(page + 0x34)), dump.c_str());
             }
         }
-        if (s_frameCount >= 140 && s_frameCount <= 145) {
+        // Leftover diagnostics used to call into the guest directly.  Page::ChangeSectionByReinit
+        // here was the source of the phantom "licence page transition" at frame 141: it arms a
+        // 608-update reinit back to section 0, and Section::Update then skips Page::CheckActions,
+        // so the whole menu went input-dead.  Off unless explicitly requested.
+        if (std::getenv("MKW_PAGE_DRAW_TEST") && s_frameCount >= 140 && s_frameCount <= 145) {
             const uint32_t page = 0x80AB5EFCu;
             if (Memory::Contains(page, 0x44)) {
                 CpuContext c = *cpu;
@@ -10388,7 +10422,7 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                     dBefore, gx_bridge::g_gx.drawCallsThisFrame);
             }
         }
-        if (s_frameCount >= 120 && s_frameCount <= 125) {
+        if (std::getenv("MKW_SCENE_DRAW_TEST") && s_frameCount >= 120 && s_frameCount <= 125) {
             const uint32_t sys = Memory::Read32(0x80385FC8u);
             const uint32_t scnMgr = (sys && Memory::Contains(sys + 0x54, 4)) ? Memory::Read32(sys + 0x54) : 0;
             const uint32_t scene = (scnMgr && Memory::Contains(scnMgr + 0x0C, 4)) ? Memory::Read32(scnMgr + 0x0C) : 0;
