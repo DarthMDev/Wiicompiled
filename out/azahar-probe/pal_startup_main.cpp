@@ -1294,13 +1294,18 @@ static void Gpu2dRender() {}
 static char g_audioPathBuf[160] = "sdmc:/mkwii/sound/strm/o_Option_32.brstm";
 static bool g_audioEnabled = true;
 static bool g_audioFollowSection = true;   // false once bgm= names a stream explicitly
+static bool g_audioTone = false;           // gpu.cfg tone=1: play a PCM16 test tone instead of BGM
 #ifdef __3DS__
 static bool AudioStart(const char* path);
 static void AudioTick(uint32_t section, uint32_t soundId);
+static uint64_t AudioDspFrames();
+static bool AudioVoicePlaying(int voice);
 void AudioShutdown();
 #else
 static bool AudioStart(const char*) { return false; }
 static void AudioTick(uint32_t, uint32_t) {}
+static uint64_t AudioDspFrames() { return 0; }
+static bool AudioVoicePlaying(int) { return false; }
 void AudioShutdown() {}
 #endif
 
@@ -2972,8 +2977,12 @@ static void AppendFifoBytes(const uint8_t* data, size_t len) {
 static bool g_audioReady = false;     // ndspInit() succeeded
 static bool g_audioFailed = false;    // no dspfirm / no DSP: stay silent, never crash
 static std::vector<uint8_t> g_audioFile;   // whole BRSTM
-static std::vector<uint8_t> g_audioPcmStore;   // payload + alignment slack
-static const uint8_t* g_audioPcm = nullptr;    // 64-byte aligned payload, one plane per channel
+// NDSP DMAs the wave data by physical address, so the payload belongs in linear memory (64-byte
+// aligned); application memory is only the fallback when the linear heap cannot take it.
+static uint8_t* g_audioPcmLinear = nullptr;
+static size_t   g_audioPcmLinearBytes = 0;
+static std::vector<uint8_t> g_audioPcmStore;   // fallback payload + alignment slack
+static const uint8_t* g_audioPcm = nullptr;    // current payload, one plane per channel
 static uint32_t g_audioPlaneBytes = 0;    // bytes of ADPCM frames per channel
 static uint32_t g_audioRate = 32000;
 static uint32_t g_audioSamples = 0;      // total samples per channel
@@ -2983,6 +2992,69 @@ static uint32_t g_audioBytes = 0;
 static uint8_t  g_audioChannels = 2;
 static char     g_audioPlaying[192] = {};   // stream currently queued
 static char     g_audioLoadFail[192] = {};  // stream that failed to load (no per-frame retry)
+static uint64_t g_audioDspFrame0 = 0;       // DSP frame counter when the current track was queued
+static ndspWaveBuf g_audioToneWave{};   // PCM16 tone buffer, only used by the tone=1 diagnostic
+static uint64_t AudioDspFrames() { return g_audioReady ? ndspGetFrameCount() : 0; }
+
+// A plain PCM16 stereo tone (440 Hz left, 660 Hz right) through the same NDSP setup.  Nothing in it
+// depends on BRSTM parsing, DSP-ADPCM decoding or the wave-buffer contexts, so if this is silent
+// too the problem is the DSP/output path itself, not our decoder.  gpu.cfg: tone=1.
+static bool AudioStartTone() {
+    if (g_audioFailed) return false;
+    if (!g_audioReady) {
+        if (R_FAILED(ndspInit())) {
+            AppLog("[Audio] ndspInit failed (no dspfirm.cdc?) - staying silent\n");
+            g_audioFailed = true;
+            return false;
+        }
+        ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+        ndspSetMasterVol(1.0f);
+        g_audioReady = true;
+    }
+    constexpr uint32_t kSamples = 16384;   // per channel, ~0.5 s at 32728 Hz
+    constexpr uint32_t kRate = 32728;
+    if (!g_audioPcmLinear) {
+        g_audioPcmLinear = static_cast<uint8_t*>(linearMemAlign(kSamples * 4 + 64, 64));
+        g_audioPcmLinearBytes = g_audioPcmLinear ? kSamples * 4 + 64 : 0;
+    }
+    if (!g_audioPcmLinear) {
+        AppLog("[Audio] tone: no linear memory (%zuKB free)\n",
+               static_cast<size_t>(linearSpaceFree() / 1024));
+        return false;
+    }
+    int16_t* pcm = reinterpret_cast<int16_t*>(g_audioPcmLinear);
+    for (uint32_t i = 0; i < kSamples; ++i) {
+        const double tl = 2.0 * 3.14159265358979 * 440.0 * i / kRate;
+        const double tr = 2.0 * 3.14159265358979 * 660.0 * i / kRate;
+        pcm[i * 2 + 0] = static_cast<int16_t>(8000.0 * std::sin(tl));
+        pcm[i * 2 + 1] = static_cast<int16_t>(8000.0 * std::sin(tr));
+    }
+    DSP_FlushDataCache(g_audioPcmLinear, kSamples * 4);
+    const int ch = 0;
+    ndspChnWaveBufClear(ch);
+    ndspChnReset(ch);
+    ndspChnSetInterp(ch, NDSP_INTERP_LINEAR);
+    ndspChnSetFormat(ch, NDSP_FORMAT_STEREO_PCM16);
+    ndspChnSetRate(ch, static_cast<float>(kRate));
+    float mix[12] = {0};
+    mix[0] = 1.0f;
+    mix[1] = 1.0f;
+    ndspChnSetMix(ch, mix);
+    ndspWaveBuf& wave = g_audioToneWave;
+    wave = ndspWaveBuf{};
+    wave.data_vaddr = g_audioPcmLinear;
+    wave.nsamples = kSamples;
+    wave.looping = true;
+    ndspChnWaveBufAdd(ch, &wave);
+    ndspChnSetPaused(ch, false);
+    std::snprintf(g_audioPlaying, sizeof(g_audioPlaying), "tone");
+    AppLog("[Audio] test tone 440/660Hz %uHz pcm16 dspFrame=%llu\n", kRate,
+           static_cast<unsigned long long>(ndspGetFrameCount()));
+    return true;
+}
+static bool AudioVoicePlaying(int voice) {
+    return g_audioReady && voice >= 0 && voice < g_audioChannels && ndspChnIsPlaying(voice);
+}
 
 // One DSP voice per stream channel.  A BRSTM carries per-channel DSP-ADPCM coefficients and a
 // per-channel decoder history at the loop point, which a single stereo voice cannot express, so
@@ -3067,17 +3139,39 @@ static bool AudioParseBrstm(const uint8_t* d, size_t size) {
     g_audioLoops = loops && loopStart > 0 && loopStart < loopEnd && (loopStart % 14u) == 0;
     g_audioPlaneBytes = static_cast<uint32_t>(chanBytes);
 
-    // The DSP reads wave buffers directly, so keep the payload 64-byte aligned.  The host heap is
-    // tight on the menu path, so a failed allocation is a normal "silent" outcome, not a crash.
-    try {
-        g_audioPcmStore.assign(need + 64, 0);
-    } catch (...) {
-        AppLog("[Audio] out of memory for a %zuKB stream (host heap free %zuKB)\n",
-               need / 1024, HostHeapFreeKb());
-        return false;
+    // Reuse the linear block across tracks, growing it when a bigger stream comes along.
+    if (g_audioPcmLinear && g_audioPcmLinearBytes < need) {
+        linearFree(g_audioPcmLinear);
+        g_audioPcmLinear = nullptr;
+        g_audioPcmLinearBytes = 0;
     }
-    const uintptr_t rawBase = reinterpret_cast<uintptr_t>(g_audioPcmStore.data());
-    uint8_t* pcm = reinterpret_cast<uint8_t*>((rawBase + 63u) & ~static_cast<uintptr_t>(63u));
+    if (!g_audioPcmLinear) {
+        g_audioPcmLinear = static_cast<uint8_t*>(linearMemAlign(need + 64, 64));
+        g_audioPcmLinearBytes = g_audioPcmLinear ? need + 64 : 0;
+        if (g_audioPcmLinear)
+            AppLog("[Audio] %zuKB payload in linear memory (linear free %zuKB)\n",
+                   need / 1024, static_cast<size_t>(linearSpaceFree() / 1024));
+        else
+            AppLog("[Audio] linearMemAlign(%zuKB) failed (linear free %zuKB) - falling back to heap\n",
+                   need / 1024, static_cast<size_t>(linearSpaceFree() / 1024));
+    }
+    uint8_t* pcm = g_audioPcmLinear;
+    if (pcm) {
+        g_audioPcmStore.clear();
+        g_audioPcmStore.shrink_to_fit();
+        std::memset(pcm, 0, need);
+    } else {
+        // The host heap is tight on the menu path, so a failed allocation is a "silent" outcome.
+        try {
+            g_audioPcmStore.assign(need + 64, 0);
+        } catch (...) {
+            AppLog("[Audio] out of memory for a %zuKB stream (host heap free %zuKB)\n",
+                   need / 1024, HostHeapFreeKb());
+            return false;
+        }
+        const uintptr_t rawBase = reinterpret_cast<uintptr_t>(g_audioPcmStore.data());
+        pcm = reinterpret_cast<uint8_t*>((rawBase + 63u) & ~static_cast<uintptr_t>(63u));
+    }
     for (uint32_t b = 0; b < blocks; ++b) {
         const bool last = (b + 1) == blocks;
         const size_t stride = last ? lastPadded : blockSize;
@@ -3215,12 +3309,19 @@ static bool AudioStart(const char* path) {
             ac.body.looping = g_audioLoops;
             ndspChnWaveBufAdd(v, &ac.body);
         }
+        // A reset channel is not guaranteed to be running, so unpause explicitly.
+        ndspChnSetPaused(v, false);
     }
     std::snprintf(g_audioPlaying, sizeof(g_audioPlaying), "%s", path);
     g_audioLoadFail[0] = 0;
-    AppLog("[Audio] playing %s rate=%uHz ch=%u samples=%u loop=%u@%u split=%d bytes=%u\n",
+    g_audioDspFrame0 = ndspGetFrameCount();
+    AppLog("[Audio] playing %s rate=%uHz ch=%u samples=%u loop=%u@%u split=%d bytes=%u "
+           "dspFrame=%llu playing=%d/%d status=%d\n",
            path, g_audioRate, g_audioChannels, total, g_audioLoops ? 1u : 0u,
-           g_audioLoopStart, split ? 1 : 0, g_audioBytes);
+           g_audioLoopStart, split ? 1 : 0, g_audioBytes,
+           static_cast<unsigned long long>(g_audioDspFrame0),
+           ndspChnIsPlaying(0) ? 1 : 0,
+           (g_audioChannels > 1 && ndspChnIsPlaying(1)) ? 1 : 0, g_audioCh[0].body.status);
     return true;
 }
 
@@ -3247,6 +3348,372 @@ static const char* AudioStreamForSoundId(uint32_t soundId) {
     return nullptr;
 }
 
+// ===========================================================================
+// Wave-sound BGM out of revo_kart.brsar (RSAR -> RWSD -> RWAR -> RWAV)
+// ===========================================================================
+// MKWii's title theme is not a stream: sound 84 is W_BGM_TITLE, a wave sound whose samples are
+// DSP-ADPCM in the archive's wave data.  58 s of stereo at 32 kHz is ~2.1 MB, which does not fit the
+// linear heap NDSP wants, so the port decodes the ADPCM to PCM16 itself and plays it through a small
+// ring of wave buffers refilled every frame.  PCM carries no decoder state, so the blocks join
+// seamlessly, loop points stay sample-exact, and the cost is ~115 KB instead of megabytes.
+static constexpr int kPcmSlots = 4;
+static constexpr uint32_t kPcmSlotFrames = 512;   // ADPCM frames (14 samples each)
+static constexpr uint32_t kPcmSlotSamples = kPcmSlotFrames * 14;
+static constexpr size_t kPcmRingBytes =
+    static_cast<size_t>(kPcmSlots) * kPcmSlotSamples * 2 * sizeof(int16_t);
+
+struct PcmWaveSource {
+    FILE* fp = nullptr;
+    uint64_t chanOffset[2] = {0, 0};   // absolute file offset of frame 0 of each channel
+    uint32_t frames = 0;               // total ADPCM frames
+    uint32_t loopFrame = 0;            // loop point, rounded down to a frame
+    uint32_t pos = 0;                  // next frame to decode
+    uint16_t coefs[2][16] = {};
+    int16_t yn1[2] = {0, 0}, yn2[2] = {0, 0};
+    int16_t loopYn1[2] = {0, 0}, loopYn2[2] = {0, 0};   // decoder state at loopFrame
+    uint32_t rate = 32000;
+    uint8_t channels = 2;
+    bool loops = false;
+    bool ended = false;
+};
+static PcmWaveSource g_pcmSrc;
+static int16_t* g_pcmRing = nullptr;          // kPcmSlots * kPcmSlotSamples * 2, interleaved
+static ndspWaveBuf g_pcmWave[kPcmSlots];
+static char g_pcmLabel[64] = {};
+
+// One DSP-ADPCM frame (8 bytes, 14 samples) to PCM, AX arithmetic.
+static void DecodeAdpcmFrame(const uint8_t* f, const uint16_t* coefs, int16_t* yn1, int16_t* yn2,
+                             int16_t* out) {
+    const int scale = 1 << (f[0] & 15);
+    const int pred = f[0] >> 4;
+    const int c1 = static_cast<int16_t>(coefs[pred * 2]);
+    const int c2 = static_cast<int16_t>(coefs[pred * 2 + 1]);
+    int16_t h1 = *yn1, h2 = *yn2;
+    for (int i = 0; i < 14; ++i) {
+        const uint8_t b = f[1 + (i >> 1)];
+        int nib = (i & 1) ? (b & 15) : (b >> 4);
+        if (nib >= 8) nib -= 16;
+        int v = ((nib * scale) << 11) + 1024 + c1 * h1 + c2 * h2;
+        v >>= 11;
+        if (v < -32768) v = -32768;
+        else if (v > 32767) v = 32767;
+        h2 = h1;
+        h1 = static_cast<int16_t>(v);
+        out[i] = static_cast<int16_t>(v);
+    }
+    *yn1 = h1;
+    *yn2 = h2;
+}
+
+// Walk `count` frames of one channel from disk, optionally writing interleaved PCM.
+static bool PcmWalkFrames(FILE* fp, uint64_t chanOffset, uint32_t startFrame, uint32_t count,
+                          const uint16_t* coefs, int16_t* yn1, int16_t* yn2,
+                          int16_t* out, int outStride, uint32_t outFirstFrame) {
+    uint8_t chunk[256 * 8];
+    uint32_t done = 0;
+    while (done < count) {
+        const uint32_t n = std::min<uint32_t>(count - done, 256);
+        const uint64_t at = chanOffset + static_cast<uint64_t>(startFrame + done) * 8;
+        if (std::fseek(fp, static_cast<long>(at), SEEK_SET) != 0) return false;
+        if (std::fread(chunk, 1, n * 8, fp) != n * 8) return false;
+        for (uint32_t i = 0; i < n; ++i) {
+            int16_t pcm[14];
+            DecodeAdpcmFrame(chunk + i * 8, coefs, yn1, yn2, pcm);
+            if (out) {
+                int16_t* dst = out + static_cast<size_t>(outFirstFrame + done + i) * 14 * outStride;
+                for (int k = 0; k < 14; ++k) dst[k * outStride] = pcm[k];
+            }
+        }
+        done += n;
+    }
+    return true;
+}
+
+static void AudioPcmStop() {
+    if (g_pcmSrc.fp) {
+        std::fclose(g_pcmSrc.fp);
+        g_pcmSrc.fp = nullptr;
+    }
+    if (g_audioReady) {
+        // Voice 0 is ours; voice 1 may still hold the stream path's right channel.
+        ndspChnWaveBufClear(0);
+        ndspChnReset(0);
+        ndspChnWaveBufClear(1);
+        ndspChnReset(1);
+    }
+    for (auto& w : g_pcmWave) w = ndspWaveBuf{};
+    g_pcmSrc.ended = true;
+    if (g_pcmLabel[0] && std::strcmp(g_audioPlaying, g_pcmLabel) == 0) g_audioPlaying[0] = 0;
+    g_pcmLabel[0] = 0;
+}
+
+// Refill every free ring slot from the ADPCM on disk.  Called once per frame.
+static void AudioPcmPump() {
+    PcmWaveSource& s = g_pcmSrc;
+    if (!s.fp || !g_pcmRing) return;
+    for (int slot = 0; slot < kPcmSlots; ++slot) {
+        ndspWaveBuf& wb = g_pcmWave[slot];
+        if (wb.status == NDSP_WBUF_QUEUED || wb.status == NDSP_WBUF_PLAYING) continue;
+        int16_t* base = g_pcmRing + static_cast<size_t>(slot) * kPcmSlotSamples * 2;
+        uint32_t produced = 0;
+        bool ioError = false;
+        while (produced < kPcmSlotFrames) {
+            if (s.pos >= s.frames) {
+                if (!s.loops) break;
+                s.pos = s.loopFrame;
+                for (int c = 0; c < s.channels; ++c) {
+                    s.yn1[c] = s.loopYn1[c];
+                    s.yn2[c] = s.loopYn2[c];
+                }
+            }
+            const uint32_t n = std::min<uint32_t>(kPcmSlotFrames - produced, s.frames - s.pos);
+            for (int c = 0; c < s.channels; ++c) {
+                if (!PcmWalkFrames(s.fp, s.chanOffset[c], s.pos, n, s.coefs[c], &s.yn1[c], &s.yn2[c],
+                                   base + c, 2, produced)) {
+                    ioError = true;
+                    break;
+                }
+            }
+            if (ioError) break;
+            if (s.channels == 1) {
+                for (uint32_t i = 0; i < n * 14; ++i) {
+                    const size_t at = static_cast<size_t>(produced) * 14 + i;
+                    base[at * 2 + 1] = base[at * 2];
+                }
+            }
+            s.pos += n;
+            produced += n;
+        }
+        if (ioError) {
+            s.ended = true;
+            static bool s_loggedError = false;
+            if (!s_loggedError) {
+                s_loggedError = true;
+                AppLog("[Audio] read error while streaming %s\n", g_pcmLabel);
+            }
+            break;
+        }
+        if (produced == 0) break;   // end of a non-looping wave: let the queue drain
+        wb = ndspWaveBuf{};
+        wb.data_vaddr = base;
+        wb.nsamples = produced * 14;
+        wb.looping = false;
+        DSP_FlushDataCache(base, produced * 14 * 4);
+        ndspChnWaveBufAdd(0, &wb);
+    }
+}
+
+// The RSAR is 107 MB, so read the few structures we need at absolute offsets.
+static bool FReadAt(FILE* fp, uint64_t off, void* dst, size_t n) {
+    if (!fp) return false;
+    return std::fseek(fp, static_cast<long>(off), SEEK_SET) == 0 && std::fread(dst, 1, n, fp) == n;
+}
+static uint32_t FReadU32(FILE* fp, uint64_t off) {
+    uint8_t b[4] = {0, 0, 0, 0};
+    FReadAt(fp, off, b, 4);
+    return (static_cast<uint32_t>(b[0]) << 24) | (static_cast<uint32_t>(b[1]) << 16) |
+           (static_cast<uint32_t>(b[2]) << 8) | b[3];
+}
+static uint16_t FReadU16(FILE* fp, uint64_t off) {
+    uint8_t b[2] = {0, 0};
+    FReadAt(fp, off, b, 2);
+    return static_cast<uint16_t>((b[0] << 8) | b[1]);
+}
+
+// RSAR 1.4 sound id -> RWSD note -> RWAR wave -> RWAV, then start the PCM ring on it.
+static bool AudioStartWaveSound(uint32_t soundId, const char* label) {
+    if (g_audioFailed) return false;
+    FILE* fp = std::fopen("sdmc:/mkwii/sound/revo_kart.brsar", "rb");
+    if (!fp) {
+        AppLog("[Audio] revo_kart.brsar missing; cannot play sound id %u\n", soundId);
+        return false;
+    }
+    // Every Util::DataRef inside the INFO section is relative to infoOffset + 8.
+    const uint64_t infoOff = FReadU32(fp, 0x18);
+    const uint64_t base = infoOff + 8;
+    auto ref = [&](uint64_t at, uint64_t* out) -> bool {
+        uint8_t t = 0;
+        if (!FReadAt(fp, at, &t, 1) || t != 1) return false;
+        const uint32_t v = FReadU32(fp, at + 4);
+        if (!v) return false;
+        *out = base + v;
+        return true;
+    };
+    uint64_t sounds = 0, files = 0, groups = 0;
+    if (!ref(base, &sounds) || !ref(base + 0x18, &files) || !ref(base + 0x20, &groups)) {
+        AppLog("[Audio] RSAR INFO tables not found\n");
+        std::fclose(fp);
+        return false;
+    }
+    uint64_t soundEntry = 0;
+    uint8_t type = 0;
+    if (!ref(sounds + 4 + static_cast<uint64_t>(soundId) * 8, &soundEntry)) {
+        std::fclose(fp);
+        return false;
+    }
+    FReadAt(fp, soundEntry + 0x16, &type, 1);
+    if (type != 3) {   // 3 = SOUND_TYPE_WAVE
+        std::fclose(fp);
+        return false;
+    }
+    const uint32_t fileId = FReadU32(fp, soundEntry + 4);
+    uint64_t waveInfoRef = 0;
+    const int32_t subNo = ref(soundEntry + 0x18, &waveInfoRef)
+        ? static_cast<int32_t>(FReadU32(fp, waveInfoRef)) : 0;
+
+    // file -> first group position -> group item: main data is the RWSD, wave data the RWAR.
+    uint64_t fileEntry = 0, posTable = 0, pos0 = 0;
+    if (!ref(files + 4 + static_cast<uint64_t>(fileId) * 8, &fileEntry) ||
+        !ref(fileEntry + 0x14, &posTable) || !ref(posTable + 4, &pos0)) {
+        std::fclose(fp);
+        return false;
+    }
+    const uint32_t groupId = FReadU32(fp, pos0);
+    const uint32_t index = FReadU32(fp, pos0 + 4);
+    uint64_t groupEntry = 0, items = 0, item = 0;
+    if (!ref(groups + 4 + static_cast<uint64_t>(groupId) * 8, &groupEntry) ||
+        !ref(groupEntry + 0x20, &items) ||
+        !ref(items + 4 + static_cast<uint64_t>(index) * 8, &item) ||
+        FReadU32(fp, item) != fileId) {
+        std::fclose(fp);
+        return false;
+    }
+    const uint64_t mainOff = FReadU32(fp, groupEntry + 0x10) + FReadU32(fp, item + 4);
+    const uint64_t waveOff = FReadU32(fp, groupEntry + 0x18) + FReadU32(fp, item + 12);
+
+    // RWSD -> wave sound -> note 0 -> wave index
+    const uint32_t mainData = FReadU32(fp, mainOff + 0x10);
+    const uint64_t mainBase = mainOff + mainData + 8;
+    auto mref = [&](uint64_t at, uint64_t* out) -> bool {
+        uint8_t t = 0;
+        if (!FReadAt(fp, at, &t, 1) || t != 1) return false;
+        const uint32_t v = FReadU32(fp, at + 4);
+        if (!v) return false;
+        *out = mainBase + v;
+        return true;
+    };
+    uint64_t wsd = 0, notes = 0, note0 = 0;
+    if (subNo < 0 || !mref(mainOff + mainData + 12 + static_cast<uint64_t>(subNo) * 8, &wsd) ||
+        !mref(wsd + 16, &notes) || !mref(notes + 4, &note0)) {
+        AppLog("[Audio] RWSD layout unexpected for sound %u\n", soundId);
+        std::fclose(fp);
+        return false;
+    }
+    const int32_t waveIndex = static_cast<int32_t>(FReadU32(fp, note0));
+    if (waveIndex < 0) {
+        std::fclose(fp);
+        return false;
+    }
+
+    // RWAR -> wave entry -> RWAV header
+    const uint64_t waveTable = waveOff + FReadU32(fp, waveOff + 0x10);
+    const uint64_t rwav = waveOff + FReadU32(fp, waveOff + 0x18) +
+                          FReadU32(fp, waveTable + 12 + static_cast<uint64_t>(waveIndex) * 12 + 4);
+    const uint64_t rwavInfo = rwav + FReadU32(fp, rwav + 0x10) + 8;
+    uint8_t fmt = 0, loopFlag = 0, channels = 0, rateHi = 0;
+    FReadAt(fp, rwavInfo, &fmt, 1);
+    FReadAt(fp, rwavInfo + 1, &loopFlag, 1);
+    FReadAt(fp, rwavInfo + 2, &channels, 1);
+    FReadAt(fp, rwavInfo + 3, &rateHi, 1);
+    const uint32_t rate = (static_cast<uint32_t>(rateHi) << 16) | FReadU16(fp, rwavInfo + 4);
+    const uint32_t loopNib = FReadU32(fp, rwavInfo + 8);
+    const uint32_t endNib = FReadU32(fp, rwavInfo + 12);
+    if (fmt != 2 || channels < 1 || channels > 2) {
+        AppLog("[Audio] sound %u is not 1-2 channel DSP-ADPCM (fmt=%u ch=%u)\n", soundId, fmt, channels);
+        std::fclose(fp);
+        return false;
+    }
+    auto nibToSample = [](uint32_t nib) -> uint32_t { return nib / 16 * 14 + (nib % 16) - 2; };
+    const uint32_t samples = nibToSample(endNib) + 1;
+    const uint32_t loopSample = loopFlag ? nibToSample(loopNib) : 0;
+    const uint64_t chanTable = rwavInfo + FReadU32(fp, rwavInfo + 0x10);
+    const uint64_t dataBase = rwav + FReadU32(fp, rwav + 0x18) + 8;
+
+    AudioPcmStop();
+    std::memset(&g_pcmSrc, 0, sizeof(g_pcmSrc));
+    g_pcmSrc.fp = fp;
+    g_pcmSrc.channels = channels;
+    g_pcmSrc.rate = rate;
+    g_pcmSrc.frames = (samples + 13) / 14;
+    g_pcmSrc.loops = loopFlag && loopSample > 14 && loopSample < samples;
+    g_pcmSrc.loopFrame = g_pcmSrc.loops ? (loopSample / 14) : 0;
+    for (int c = 0; c < channels; ++c) {
+        const uint64_t ci = rwavInfo + FReadU32(fp, chanTable + static_cast<uint64_t>(c) * 4);
+        g_pcmSrc.chanOffset[c] = dataBase + FReadU32(fp, ci);
+        const uint64_t adpcm = rwavInfo + FReadU32(fp, ci + 4);
+        for (int i = 0; i < 16; ++i) g_pcmSrc.coefs[c][i] = FReadU16(fp, adpcm + i * 2);
+        g_pcmSrc.yn1[c] = static_cast<int16_t>(FReadU16(fp, adpcm + 36));
+        g_pcmSrc.yn2[c] = static_cast<int16_t>(FReadU16(fp, adpcm + 38));
+    }
+    // Exact loop history: replay the intro once to get the decoder state at loopFrame.
+    if (g_pcmSrc.loops && g_pcmSrc.loopFrame > 0) {
+        for (int c = 0; c < channels; ++c) {
+            const uint64_t ci = rwavInfo + FReadU32(fp, chanTable + static_cast<uint64_t>(c) * 4);
+            const uint64_t adpcm = rwavInfo + FReadU32(fp, ci + 4);
+            int16_t h1 = static_cast<int16_t>(FReadU16(fp, adpcm + 36));
+            int16_t h2 = static_cast<int16_t>(FReadU16(fp, adpcm + 38));
+            if (PcmWalkFrames(fp, g_pcmSrc.chanOffset[c], 0, g_pcmSrc.loopFrame, g_pcmSrc.coefs[c],
+                              &h1, &h2, nullptr, 0, 0)) {
+                g_pcmSrc.loopYn1[c] = h1;
+                g_pcmSrc.loopYn2[c] = h2;
+            } else {
+                AppLog("[Audio] could not pre-roll the loop history\n");
+            }
+        }
+    }
+
+    if (!g_audioReady) {
+        if (R_FAILED(ndspInit())) {
+            AppLog("[Audio] ndspInit failed (no dspfirm.cdc?) - staying silent\n");
+            g_audioFailed = true;
+            AudioPcmStop();
+            return false;
+        }
+        ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+        ndspSetMasterVol(1.0f);
+        g_audioReady = true;
+    }
+    if (!g_pcmRing) {
+        g_pcmRing = static_cast<int16_t*>(linearMemAlign(kPcmRingBytes, 64));
+        if (!g_pcmRing) {
+            AppLog("[Audio] no linear memory for the PCM ring (%zuKB free)\n",
+                   static_cast<size_t>(linearSpaceFree() / 1024));
+            AudioPcmStop();
+            return false;
+        }
+    }
+    for (auto& w : g_pcmWave) w = ndspWaveBuf{};
+    ndspChnWaveBufClear(0);
+    ndspChnReset(0);
+    ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
+    ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
+    ndspChnSetRate(0, static_cast<float>(rate));
+    float mix[12] = {0};
+    mix[0] = 1.0f;
+    mix[1] = 1.0f;
+    ndspChnSetMix(0, mix);
+    std::snprintf(g_pcmLabel, sizeof(g_pcmLabel), "%s", label);
+    std::snprintf(g_audioPlaying, sizeof(g_audioPlaying), "%s", label);
+    AudioPcmPump();
+    ndspChnSetPaused(0, false);
+    AppLog("[Audio] playing %s (sound id %u) %uHz ch=%u samples=%u loop=%u ring=%zuKB\n",
+           label, soundId, rate, channels, samples, g_pcmSrc.loops ? loopSample : 0,
+           kPcmRingBytes / 1024);
+    return true;
+}
+
+// Wave-sound BGMs we know by name (everything else that is not a stream stays on the menu track).
+struct AudioWaveBgm { uint32_t id; const char* label; };
+static const AudioWaveBgm kAudioWaveBgms[] = {
+    {84, "W_BGM_TITLE"},
+    {116, "W_BGM_FINALLAP_FAN"},
+};
+static const char* AudioWaveBgmLabel(uint32_t soundId) {
+    for (const auto& e : kAudioWaveBgms)
+        if (e.id == soundId) return e.label;
+    return nullptr;
+}
+
 // Sections that are menus (docs/TITLE_FLOW_FINDINGS.md): 63 title, 16-24 / 69 / 71 options,
 // 78 / 81 single player, 84 multiplayer, 21 / 22 channel.
 static bool AudioMenuSection(uint32_t section) {
@@ -3264,6 +3731,28 @@ static bool AudioMenuSection(uint32_t section) {
 // falls back to the menu track so the game is never silent, and anything else keeps the current one.
 static void AudioTick(uint32_t section, uint32_t soundId) {
     if (!g_audioEnabled || g_audioFailed) return;
+    if (g_audioTone) {
+        if (std::strcmp(g_audioPlaying, "tone") != 0) AudioStartTone();
+        return;
+    }
+    // Wave-sound BGM (the title theme) comes out of the archive and streams through the PCM ring.
+    if (g_audioFollowSection) {
+        const char* waveLabel = AudioWaveBgmLabel(soundId);
+        if (waveLabel) {
+            if (std::strcmp(g_audioPlaying, waveLabel) == 0) {
+                AudioPcmPump();
+                return;
+            }
+            if (std::strcmp(g_audioLoadFail, waveLabel) != 0) {
+                if (AudioStartWaveSound(soundId, waveLabel)) return;
+                std::snprintf(g_audioLoadFail, sizeof(g_audioLoadFail), "%s", waveLabel);
+                AppLog("[Audio] could not start %s, falling back\n", waveLabel);
+            }
+        } else if (g_pcmSrc.fp) {
+            // The section wants something other than the wave BGM: drop it before picking a stream.
+            AudioPcmStop();
+        }
+    }
     char path[sizeof(g_audioPathBuf)];
     if (!g_audioFollowSection) {
         std::snprintf(path, sizeof(path), "%s", g_audioPathBuf);
@@ -3516,6 +4005,7 @@ static bool Gpu2dReadConfig() {
         else if (std::strcmp(k, "clear") == 0)
             g_gpuClearOverride = (static_cast<uint32_t>(std::strtoul(v, nullptr, 16)) << 8) | 0xFFu;
         else if (std::strcmp(k, "audio") == 0) g_audioEnabled = on;
+        else if (std::strcmp(k, "tone") == 0) g_audioTone = on;
         else if (std::strcmp(k, "audiopath") == 0) {
             std::snprintf(g_audioPathBuf, sizeof(g_audioPathBuf), "%s", v);
             g_audioFollowSection = false;
@@ -9141,11 +9631,17 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 ? Memory::Read32(sceneMgr + 36) : 0u;
             const uint32_t sceneState = (scene && Memory::Contains(scene + 8, 4))
                 ? Memory::Read32(scene + 4) : 0u;
-            AppLog(" audioSnd=%u audioAx=%u stubAudio=%u"
+            // DSP telemetry: does the hardware counter advance, and is our channel actually playing?
+            static uint64_t s_lastDspFrame = 0;
+            const uint64_t dspNow = gx_bridge::AudioDspFrames();
+            const uint64_t dspAdv = s_lastDspFrame ? (dspNow - s_lastDspFrame) : 0;
+            s_lastDspFrame = dspNow;
+            AppLog(" audioSnd=%u audioAx=%u stubAudio=%u dspAdv=%llu chn0=%d"
                    " nextSec=%u sceneState=%u hostHeapFree=%zuKB texCache=%zuKB"
                    " texDecode=%u texHit=%u texEvict=%u texTexels=%u gpu2d=%u quads=%u drawn=%u"
                    " vram=%zuKB up=%u gev=%u base=%u\n",
                 g_hleAudioSndCalls, g_hleAudioAxCalls, g_stubGuestAudio ? 1u : 0u,
+                static_cast<unsigned long long>(dspAdv), gx_bridge::AudioVoicePlaying(0) ? 1 : 0,
                 nextSec, sceneState, HostHeapFreeKb(), gx_bridge::g_texCacheBytes / 1024,
                 gx_bridge::g_texStatDecodes, gx_bridge::g_texStatHits,
                 gx_bridge::g_texStatEvictions, static_cast<uint32_t>(gx_bridge::g_texStatTexels),
