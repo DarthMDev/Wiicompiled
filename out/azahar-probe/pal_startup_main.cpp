@@ -5788,10 +5788,12 @@ static std::FILE* OpenDiscAsset(const std::string& rel) {
 
 struct SzsByteReader {
     std::FILE* file = nullptr;
-    uint8_t buffer[1 << 16];
-    size_t pos = sizeof(buffer);
+    size_t pos = 0;
     size_t len = 0;
     int get() {
+        // Static buffer: a 64 KiB local here overflowed the 3DS main-thread stack (PC=0,
+        // LR=0xFEFEFEFF).  The HLE runs single-threaded, so one shared input buffer is enough.
+        static uint8_t buffer[4096];
         if (pos >= len) {
             len = std::fread(buffer, 1, sizeof(buffer), file);
             pos = 0;
@@ -5800,6 +5802,8 @@ struct SzsByteReader {
         return buffer[pos++];
     }
 };
+
+static constexpr uint32_t kSzsMetaCap = 128u * 1024u;
 
 // Extract one leaf member out of a Yaz0-compressed U8 archive into the menu arena.  Decoding stops
 // as soon as the member's bytes are complete, so a large archive is never fully expanded.
@@ -5828,8 +5832,9 @@ static bool ExtractSzsMember(const char* archiveRel, const char* leaf,
     SzsByteReader reader;
     reader.file = file;
     std::vector<uint8_t> meta;
-    try { meta.reserve(512u * 1024u); } catch (...) { std::fclose(file); return false; }
-    uint8_t history[0x1000] = {};
+    try { meta.reserve(kSzsMetaCap); } catch (...) { std::fclose(file); return false; }
+    static uint8_t history[0x1000];
+    std::memset(history, 0, sizeof(history));
     uint32_t dst = 0;
     U8MemberLocation loc;
     uint32_t nextProbe = 4096;
@@ -5839,7 +5844,7 @@ static bool ExtractSzsMember(const char* archiveRel, const char* leaf,
 
     const auto emitByte = [&](uint8_t value) {
         history[dst & 0xFFFu] = value;
-        if (!loc.found && meta.size() < 512u * 1024u) meta.push_back(value);
+        if (!loc.found && meta.size() < kSzsMetaCap) meta.push_back(value);
         if (loc.found && dst >= loc.offset && dst < loc.offset + loc.size)
             Memory::Write8(guestBase + (dst - loc.offset), value);
         ++dst;
@@ -5848,7 +5853,7 @@ static bool ExtractSzsMember(const char* archiveRel, const char* leaf,
     const auto tryParse = [&]() {
         if (loc.found || meta.size() < nextProbe) return;
         loc = ParseU8Member(meta, leaf);
-        if (nextProbe < 512u * 1024u) nextProbe = std::min<uint32_t>(512u * 1024u, nextProbe * 2u);
+        if (nextProbe < kSzsMetaCap) nextProbe = std::min<uint32_t>(kSzsMetaCap, nextProbe * 2u);
         if (!loc.found) {
             if (!loc.needMore) aborted = true;   // index complete and the name is absent
             return;
@@ -5900,7 +5905,7 @@ static bool ExtractSzsMember(const char* archiveRel, const char* leaf,
             tryParse();
         }
         tryParse();
-        if (!loc.found && meta.size() >= 512u * 1024u) aborted = true;
+        if (!loc.found && meta.size() >= kSzsMetaCap) aborted = true;
     }
     std::fclose(file);
     if (!loc.found || !done) return false;
