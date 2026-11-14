@@ -5710,6 +5710,269 @@ static uint32_t LoadMenuOtherResource(const char* requestedName, uint32_t* outSi
     return 0;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Generic on-demand SZS member service.
+//
+// The guest asks ArchiveMgr/ResourceAccessor for a leaf resource name and expects a guest pointer.
+// Previously only OptionBG.{brctr,brlyt,brlan} were special-cased out of MenuOther.szs.  This
+// resolves any name against the archives that can own it (the current section's UI archive, the
+// other UI archives, the model archives), streaming the Yaz0 data only up to the member and
+// caching the extracted bytes in the small kMenuArena.  Misses are logged once by the callers as
+// [AssetMiss] so one run enumerates everything still missing.
+// ---------------------------------------------------------------------------------------------
+struct SzsCacheEntry { uint32_t guest = 0; uint32_t size = 0; };
+static uint32_t g_szsArenaCursor = 0;
+static std::map<std::string, SzsCacheEntry> g_szsResourceCache;
+
+struct U8MemberLocation {
+    uint32_t offset = 0;
+    uint32_t size = 0;
+    bool found = false;
+    bool needMore = false;
+};
+
+static U8MemberLocation ParseU8Member(const std::vector<uint8_t>& meta, const char* leaf) {
+    U8MemberLocation out;
+    if (meta.size() < 12) { out.needMore = true; return out; }
+    const auto be32 = [&](size_t o) -> uint32_t {
+        return (static_cast<uint32_t>(meta[o]) << 24) | (static_cast<uint32_t>(meta[o + 1]) << 16) |
+               (static_cast<uint32_t>(meta[o + 2]) << 8) | static_cast<uint32_t>(meta[o + 3]);
+    };
+    if (be32(0) != 0x55AA382Du) return out;
+    const uint32_t root = be32(4);
+    if (root > meta.size() || meta.size() - root < 12) { out.needMore = true; return out; }
+    const uint32_t count = be32(root + 8);
+    if (count > (meta.size() - root) / 12u) { out.needMore = true; return out; }
+    const size_t strings = static_cast<size_t>(root) + static_cast<size_t>(count) * 12u;
+    if (strings > meta.size()) { out.needMore = true; return out; }
+    for (uint32_t i = 0; i < count; ++i) {
+        const size_t node = static_cast<size_t>(root) + static_cast<size_t>(i) * 12u;
+        if (meta[node] != 0) continue;
+        const uint32_t nameOff = (static_cast<uint32_t>(meta[node + 1]) << 16) |
+                                 (static_cast<uint32_t>(meta[node + 2]) << 8) | meta[node + 3];
+        const size_t name = strings + nameOff;
+        if (name >= meta.size()) { out.needMore = true; return out; }
+        size_t end = name;
+        while (end < meta.size() && meta[end] != 0) ++end;
+        if (end == meta.size()) { out.needMore = true; return out; }
+        const char* nodeName = reinterpret_cast<const char*>(meta.data() + name);
+        const char* slash = std::strrchr(nodeName, '/');
+        if (strcasecmp(slash ? slash + 1 : nodeName, leaf) != 0) continue;
+        const uint32_t offset = be32(node + 4);
+        const uint32_t size = be32(node + 8);
+        if (offset == 0 || size == 0) continue;
+        out.offset = offset;
+        out.size = size;
+        out.found = true;
+        return out;
+    }
+    return out;
+}
+
+static std::FILE* OpenDiscAsset(const std::string& rel) {
+    static const char* roots[] = {
+#ifdef __3DS__
+        "sdmc:/mkwii/",
+#endif
+        "../../Assets/extracted-rmcp01/DATA/files/",
+        "Assets/extracted-rmcp01/DATA/files/",
+        "sdmc:/mkwii/DATA/files/",
+    };
+    for (const char* root : roots) {
+        std::string path = std::string(root) + rel;
+        std::FILE* f = std::fopen(path.c_str(), "rb");
+        if (f) return f;
+    }
+    return nullptr;
+}
+
+struct SzsByteReader {
+    std::FILE* file = nullptr;
+    uint8_t buffer[1 << 16];
+    size_t pos = sizeof(buffer);
+    size_t len = 0;
+    int get() {
+        if (pos >= len) {
+            len = std::fread(buffer, 1, sizeof(buffer), file);
+            pos = 0;
+            if (!len) return -1;
+        }
+        return buffer[pos++];
+    }
+};
+
+// Extract one leaf member out of a Yaz0-compressed U8 archive into the menu arena.  Decoding stops
+// as soon as the member's bytes are complete, so a large archive is never fully expanded.
+static bool ExtractSzsMember(const char* archiveRel, const char* leaf,
+                             uint32_t* outSize, uint32_t* outGuest) {
+    std::FILE* file = OpenDiscAsset(archiveRel);
+    if (!file) return false;
+    uint8_t header[16];
+    if (std::fread(header, 1, sizeof(header), file) != sizeof(header) ||
+        std::memcmp(header, "Yaz0", 4) != 0) {
+        std::fclose(file);
+        return false;
+    }
+    const uint32_t expanded = (static_cast<uint32_t>(header[4]) << 24) |
+                              (static_cast<uint32_t>(header[5]) << 16) |
+                              (static_cast<uint32_t>(header[6]) << 8) | header[7];
+    if (expanded < 0x20 || expanded > 16u * 1024u * 1024u) {
+        std::fclose(file);
+        return false;
+    }
+    if (!ensure_menu_arena()) {
+        std::fclose(file);
+        return false;
+    }
+
+    SzsByteReader reader;
+    reader.file = file;
+    std::vector<uint8_t> meta;
+    try { meta.reserve(512u * 1024u); } catch (...) { std::fclose(file); return false; }
+    uint8_t history[0x1000] = {};
+    uint32_t dst = 0;
+    U8MemberLocation loc;
+    uint32_t nextProbe = 4096;
+    uint32_t guestBase = 0;
+    bool done = false;
+    bool aborted = false;
+
+    const auto emitByte = [&](uint8_t value) {
+        history[dst & 0xFFFu] = value;
+        if (!loc.found && meta.size() < 512u * 1024u) meta.push_back(value);
+        if (loc.found && dst >= loc.offset && dst < loc.offset + loc.size)
+            Memory::Write8(guestBase + (dst - loc.offset), value);
+        ++dst;
+        if (loc.found && dst >= loc.offset + loc.size) done = true;
+    };
+    const auto tryParse = [&]() {
+        if (loc.found || meta.size() < nextProbe) return;
+        loc = ParseU8Member(meta, leaf);
+        if (nextProbe < 512u * 1024u) nextProbe = std::min<uint32_t>(512u * 1024u, nextProbe * 2u);
+        if (!loc.found) {
+            if (!loc.needMore) aborted = true;   // index complete and the name is absent
+            return;
+        }
+        if (loc.size > kMenuArenaSize) { aborted = true; loc.found = false; return; }
+        const uint32_t off = (g_szsArenaCursor + 31u) & ~31u;
+        if (off + loc.size > kMenuArenaSize) {
+            AppLog("[AssetSzs] arena full (%u/%u) - cannot extract %s from %s\n",
+                g_szsArenaCursor, (unsigned)kMenuArenaSize, leaf, archiveRel);
+            aborted = true;
+            loc.found = false;
+            return;
+        }
+        g_szsArenaCursor = off + loc.size;
+        guestBase = kMenuArenaBase + off;
+        // The parser may have been reached after some of the member's bytes were already emitted.
+        for (uint32_t p = loc.offset; p < dst && p < loc.offset + loc.size && p < meta.size(); ++p)
+            Memory::Write8(guestBase + (p - loc.offset), meta[p]);
+        if (dst >= loc.offset + loc.size) done = true;
+    };
+
+    while (dst < expanded && !done && !aborted) {
+        const int code = reader.get();
+        if (code < 0) { aborted = true; break; }
+        for (int bit = 7; bit >= 0 && dst < expanded && !done && !aborted; --bit) {
+            if (code & (1 << bit)) {
+                const int value = reader.get();
+                if (value < 0) { aborted = true; break; }
+                emitByte(static_cast<uint8_t>(value));
+            } else {
+                const int b1 = reader.get();
+                const int b2 = reader.get();
+                if (b1 < 0 || b2 < 0) { aborted = true; break; }
+                const uint32_t distance = ((static_cast<uint32_t>(b1 & 0xF) << 8) | static_cast<uint32_t>(b2)) + 1u;
+                uint32_t count = static_cast<uint32_t>(b1) >> 4;
+                if (count == 0) {
+                    const int extra = reader.get();
+                    if (extra < 0) { aborted = true; break; }
+                    count = static_cast<uint32_t>(extra) + 18u;
+                } else {
+                    count += 2u;
+                }
+                if (distance > dst) { aborted = true; break; }
+                for (uint32_t i = 0; i < count && dst < expanded && !done; ++i) {
+                    const uint8_t value = history[(dst - distance) & 0xFFFu];
+                    emitByte(value);
+                }
+            }
+            tryParse();
+        }
+        tryParse();
+        if (!loc.found && meta.size() >= 512u * 1024u) aborted = true;
+    }
+    std::fclose(file);
+    if (!loc.found || !done) return false;
+    if (outSize) *outSize = loc.size;
+    if (outGuest) *outGuest = guestBase;
+    return true;
+}
+
+// Resolve a resource name against the archives that can own it, current section first.
+static uint32_t ResolveDiscResource(const char* requested, uint32_t* outSize) {
+    if (!requested || !requested[0] || !outSize) return 0;
+    const char* leaf = std::strrchr(requested, '/');
+    leaf = leaf ? leaf + 1 : requested;
+    auto cached = g_szsResourceCache.find(leaf);
+    if (cached != g_szsResourceCache.end() && cached->second.guest) {
+        *outSize = cached->second.size;
+        return cached->second.guest;
+    }
+
+    static const char* kUiArchives[] = {
+        "Title", "MenuOther", "MenuSingle", "MenuMulti", "Globe", "Channel",
+        "Award", "Event", "Present", "Race",
+    };
+    const uint32_t sectionMgr = Memory::Read32(0x809C1E38u);
+    const uint32_t section = (sectionMgr && Memory::Contains(sectionMgr, 4))
+        ? Memory::Read32(sectionMgr) : 0u;
+    const uint32_t sectionId = (section && Memory::Contains(section + 4, 4))
+        ? Memory::Read32(section + 4) : 0xFFFFFFFFu;
+    const char* current = nullptr;
+    switch (sectionId) {
+        case 63: current = "Title"; break;
+        case 69: case 71: current = "MenuOther"; break;
+        case 78: case 81: current = "MenuSingle"; break;
+        case 84: current = "MenuMulti"; break;
+        case 21: case 22: current = "Channel"; break;
+        default:
+            if (sectionId >= 16 && sectionId <= 24) current = "MenuOther";
+            else if (sectionId >= 0x20) current = "Race";
+            break;
+    }
+
+    std::vector<const char*> order;
+    if (current) order.push_back(current);
+    for (const char* name : kUiArchives)
+        if (!current || strcmp(current, name) != 0) order.push_back(name);
+
+    for (const char* name : order) {
+        for (const char* suffix : {"_E", ""}) {
+            std::string rel = std::string("Scene/UI/") + name + suffix + ".szs";
+            uint32_t size = 0, guest = 0;
+            if (ExtractSzsMember(rel.c_str(), leaf, &size, &guest)) {
+                g_szsResourceCache[leaf] = SzsCacheEntry{guest, size};
+                AppLog("[AssetSzs] %s <- %s (%u bytes) frame=%u\n", leaf, rel.c_str(), size,
+                    gx_bridge::g_gxFrame);
+                *outSize = size;
+                return guest;
+            }
+        }
+    }
+    for (const char* rel : {"Scene/Model/MiiBody.szs", "Scene/Model/Earth.szs"}) {
+        uint32_t size = 0, guest = 0;
+        if (ExtractSzsMember(rel, leaf, &size, &guest)) {
+            g_szsResourceCache[leaf] = SzsCacheEntry{guest, size};
+            AppLog("[AssetSzs] %s <- %s (%u bytes) frame=%u\n", leaf, rel, size,
+                gx_bridge::g_gxFrame);
+            *outSize = size;
+            return guest;
+        }
+    }
+    return 0;
+}
+
 static uint32_t g_raceSzsBase = 0;
 static uint32_t g_raceESzsBase = 0;
 
@@ -6267,6 +6530,18 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 if (sizeOut && Memory::Contains(sizeOut, 4)) Memory::Write32(sizeOut, foundSize);
                 return true;
             }
+        }
+        if (name && name[0]) {
+            uint32_t foundSize = 0;
+            const uint32_t found = ResolveDiscResource(name, &foundSize);
+            if (found) {
+                cpu->gpr[3] = found;
+                if (sizeOut && Memory::Contains(sizeOut, 4)) Memory::Write32(sizeOut, foundSize);
+                return true;
+            }
+            static std::set<std::string> s_assetMiss;
+            if (s_assetMiss.size() < 256 && s_assetMiss.insert(name).second)
+                AppLog("[AssetMiss] type=%08X name='%s' frame=%u\n", type, name, gx_bridge::g_gxFrame);
         }
         AppLog("[U8 GetResource HLE] Not found: '%s' (type=%08X)\n", name, type);
         return true;
@@ -7674,6 +7949,16 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 break;
             }
         }
+        // Last resort: stream the member out of the SZS archives that could own it (current
+        // section's UI archive first, then the other UI/model archives) into the small menu arena.
+        if (!result && !reqName.empty() && reqName.size() < 160) {
+            uint32_t foundSize = 0;
+            const uint32_t found = ResolveDiscResource(reqName.c_str(), &foundSize);
+            if (found) {
+                result = found;
+                cpu->gpr[3] = found;
+            }
+        }
         const auto* trace = FindTracedModelFilename(namePtr);
         if (trace) {
             AppLog("[Race Model] ArchiveMgr::GetFile %s lr=%08X type=%u brres=%08X magic=%08X\n",
@@ -7696,6 +7981,12 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 ++s_fontLookupLogs;
                 AppLog("[ArchiveMgr] font lookup failed type=%u name='%s' frame=%u\n",
                     archiveType, reqName.c_str(), gx_bridge::g_gxFrame);
+            }
+            if (!result) {
+                static std::set<std::string> s_assetMiss;
+                if (s_assetMiss.size() < 256 && s_assetMiss.insert(reqName).second)
+                    AppLog("[AssetMiss] type=%u name='%s' frame=%u\n",
+                        archiveType, reqName.c_str(), gx_bridge::g_gxFrame);
             }
             if (s_seenArchiveLookups.size() < 200 && s_seenArchiveLookups.insert(key).second) {
                 AppLog("[ArchiveMgr] type=%u name='%s' -> %08X (magic=%08X) frame=%u\n",
