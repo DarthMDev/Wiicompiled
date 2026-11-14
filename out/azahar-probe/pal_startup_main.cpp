@@ -120,6 +120,11 @@ static uint8_t* mem2Ram;
 static constexpr uint32_t kRaceSzsBase = 0x95000000u;
 static constexpr size_t kRaceSzsSize = 6u * 1024 * 1024;
 static uint8_t* g_raceSzsRam = nullptr;
+// Small lazily-mapped guest arena for resources extracted from SZS archives on demand (menu
+// layouts, model params, ...).  Sits just below the race staging buffer; nothing else maps here.
+static constexpr uint32_t kMenuArenaBase = 0x94F00000u;
+static constexpr size_t kMenuArenaSize = 0x40000u; // 256 KiB
+static uint8_t* g_menuArenaRam = nullptr;
 static constexpr uint32_t kLockedCacheBase = 0xE0000000u;
 alignas(32) static uint8_t g_lockedCache[16 * 1024];
 static uint32_t g_lockedCacheDmaUpper = 0;
@@ -208,6 +213,28 @@ static bool ensure_race_szs_ram()
     return true;
 }
 
+// Lazily back the tiny on-demand SZS extraction arena (see ResolveDiscResource).
+static bool ensure_menu_arena()
+{
+    if (g_menuArenaRam) return true;
+    g_menuArenaRam = static_cast<uint8_t*>(std::calloc(1, kMenuArenaSize));
+    if (!g_menuArenaRam) {
+        AppLog("[Mem] menu SZS arena (%u KiB) allocation failed, host heap free %zuKB\n",
+            (unsigned)(kMenuArenaSize / 1024), HostHeapFreeKb());
+        return false;
+    }
+    const uintptr_t bias = reinterpret_cast<uintptr_t>(g_menuArenaRam) - kMenuArenaBase + 1;
+    for (size_t offset = 0; offset < kMenuArenaSize; offset += MemoryInline::kPageSize) {
+        const auto page = (kMenuArenaBase + offset) >> MemoryInline::kPageShift;
+        MemoryInline::g_fullPageBias[page] = bias;
+        MemoryInline::g_fullReadablePageBias[page] = bias;
+        MemoryInline::g_fullWritablePageBias[page] = bias;
+    }
+    AppLog("[Mem] menu SZS arena committed on first use (%u KiB, host heap free %zuKB)\n",
+        (unsigned)(kMenuArenaSize / 1024), HostHeapFreeKb());
+    return true;
+}
+
 static uint8_t* resolve_guest(uint32_t address, size_t length)
 {
     // Physical MEM1 (0x00000000 - 0x01800000)
@@ -235,6 +262,12 @@ static uint8_t* resolve_guest(uint32_t address, size_t length)
 
     if (address >= kLockedCacheBase && address < kLockedCacheBase + sizeof(g_lockedCache))
         return resolve_region(g_lockedCache, kLockedCacheBase, sizeof(g_lockedCache), address, length);
+
+    // On-demand SZS extraction arena (menu layouts, model params, ...).
+    if (address >= kMenuArenaBase && address < kMenuArenaBase + kMenuArenaSize) {
+        if (!ensure_menu_arena()) return nullptr;
+        return resolve_region(g_menuArenaRam, kMenuArenaBase, kMenuArenaSize, address, length);
+    }
 
     // Race SZS buffer (0x95000000 - 0x95600000) and physical alias (0x15000000 - 0x15600000).
     // The 6 MiB backing store is only needed by the force-race shortcut; the menu path never touches
@@ -1158,6 +1191,69 @@ static void ProfReport()
     }
     for (uint32_t i = 0; i < kProfSlots; ++i) g_profBuckets[i] = ProfBucket{0u, 0u};
     g_profCalls = 0;
+}
+
+// --- guest time attribution (gpu.cfg samples=1) ----------------------------------------------
+// Call counts cannot tell "called 850 times cheaply" from "called 60 times and eats the frame".
+// A sampler thread on core 2 reads whichever guest target the main thread is inside (handle_startup_hle
+// publishes it before dispatch), so the samples name the innermost guest function -- that is what
+// locates things like a per-frame movie/JPEG decode without instrumenting 12490 dispatch cases.
+struct SampleBucket { uint32_t target; uint32_t hits; };
+static constexpr uint32_t kSampleSlots = 2048;
+static SampleBucket g_sampleBuckets[kSampleSlots];
+static volatile uint32_t g_sampleTarget = 0;
+static volatile bool     g_samplerOn = false;
+static bool              g_samplerStarted = false;
+
+static void SamplerNote(uint32_t target)
+{
+    uint32_t slot = (target * 2654435761u) & (kSampleSlots - 1u);
+    for (uint32_t probe = 0; probe < 16u; ++probe, slot = (slot + 1u) & (kSampleSlots - 1u)) {
+        if (g_sampleBuckets[slot].target == target) { ++g_sampleBuckets[slot].hits; return; }
+        if (g_sampleBuckets[slot].target == 0u) {
+            g_sampleBuckets[slot].target = target;
+            g_sampleBuckets[slot].hits = 1;
+            return;
+        }
+    }
+}
+
+static void SamplerThread(void*)
+{
+    while (true) {
+        if (g_samplerOn) {
+            const uint32_t target = g_sampleTarget;
+            if (target) SamplerNote(target);
+        }
+        svcSleepThread(1000000LL);   // ~1 ms: ~1 sample per ms of guest time
+    }
+}
+
+static void SamplerStartIfNeeded()
+{
+    if (!g_samplerOn || g_samplerStarted) return;
+    g_samplerStarted = true;
+    threadCreate(SamplerThread, nullptr, 0x2000, 0x30, -2, false);   // core 2, idle priority
+}
+
+// Appends " samples=<n> stop=<addr>:<percent>,..." to the [Beat] line and clears the table.
+static void SamplerReport()
+{
+    if (!g_samplerOn) return;
+    uint32_t total = 0;
+    for (uint32_t i = 0; i < kSampleSlots; ++i) total += g_sampleBuckets[i].hits;
+    AppLog(" samples=%u stop=", total);
+    for (int rank = 0; rank < 6; ++rank) {
+        uint32_t bestSlot = 0, bestHits = 0;
+        for (uint32_t i = 0; i < kSampleSlots; ++i) {
+            if (g_sampleBuckets[i].hits > bestHits) { bestHits = g_sampleBuckets[i].hits; bestSlot = i; }
+        }
+        if (!bestHits) break;
+        AppLog("%s%08X:%u%%", rank ? "," : "", g_sampleBuckets[bestSlot].target,
+            total ? bestHits * 100u / total : 0u);
+        g_sampleBuckets[bestSlot].hits = 0;
+    }
+    for (uint32_t i = 0; i < kSampleSlots; ++i) g_sampleBuckets[i] = SampleBucket{0u, 0u};
 }
 // --- Debug chase camera -------------------------------------------------------------
 // The guest never registers a race camera in this boot path (the camera manager stays empty),
@@ -4109,6 +4205,7 @@ static bool Gpu2dReadConfig() {
         else if (std::strcmp(k, "pnmtx") == 0) { pendingPnMtx = on; hasDebugOverrideKey = true; }
         else if (std::strcmp(k, "scissor") == 0) g_gpuScissor = on;
         else if (std::strcmp(k, "prof") == 0) g_profOn = on;
+        else if (std::strcmp(k, "samples") == 0) g_samplerOn = on;
         else if (std::strcmp(k, "debug") == 0) g_gpuDebugQuads = on ? 4u : 0u;
         else if (std::strcmp(k, "clear") == 0)
             g_gpuClearOverride = (static_cast<uint32_t>(std::strtoul(v, nullptr, 16)) << 8) | 0xFFu;
@@ -5878,6 +5975,7 @@ static void NoteSndCall(uint32_t target) {
 bool handle_startup_hle(uint32_t target, CpuContext* cpu)
 {
     if (gx_bridge::g_profOn) gx_bridge::ProfNote(target);
+    gx_bridge::g_sampleTarget = target;
     // Full indirect-call trace for a short frame window (diagnostic only).  Used to find which
     // page/caller schedules an idle section reinit right after the licence page activates.
     static const bool s_traceIndirectAll = std::getenv("MKW_TRACE_INDIRECT") != nullptr;
@@ -10143,6 +10241,8 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
             gx_bridge::g_quadTexSeen = 0;
             gx_bridge::g_quadTiny = 0;
             gx_bridge::g_quadBig = 0;
+            gx_bridge::SamplerStartIfNeeded();
+            gx_bridge::SamplerReport();
             gx_bridge::ProfReport();
             AppLog("\n");
             g_hleAudioSndCalls = 0;
