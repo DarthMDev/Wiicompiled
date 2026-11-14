@@ -5,7 +5,7 @@
 // out/azahar-probe/runtime-overlay/gpu2d.v.pica. Its four attributes follow the native renderer's
 // packed Vertex layout: float3 position, float3 normal, float4 UVs, byte4 color. Positions are
 // pre-projected on the CPU; byte colors are normalized by 1/255 in the shader.
-static const uint8_t kGpu2dShader[] = {
+alignas(4) static const uint8_t kGpu2dShader[] = {
     68, 86, 76, 66, 1, 0, 0, 0, 104, 0, 0, 0,
     68, 86, 76, 80, 0, 0, 0, 0, 40, 0, 0, 0,
     5, 0, 0, 0, 60, 0, 0, 0, 4, 0, 0, 0,
@@ -3265,22 +3265,30 @@ static bool Gpu2dInit() {
 }
 
 // Reads sdmc:/mkwii/gpu.cfg, one "key=value" per line (blank lines and '#' comments ignored):
-//   gpu=0           use the software rasteriser
-//   test=1          draw the two reference quads
-//   unif=3          projection uniform slot
-//   ysign=1         canvas y -> screen y sign
-//   vflip=1         flip V on textured quads
-//   pnmtx=0         ignore the pane matrix (old, untranslated layout)
-//   scissor=1       per-quad scissor
-//   debug=0         silence the first-quad dump
-//   clear=FF00FF    forced clear colour
-//   texmb=3         VRAM texture budget
+//   gpu=0              use the software rasteriser
+//   debug_overrides=1  enable test/unif/ysign/vflip/pnmtx diagnostic keys
+//   test=1             draw the two reference quads (requires debug_overrides=1)
+//   unif=3             projection uniform slot (requires debug_overrides=1)
+//   ysign=1            canvas y -> screen y sign (requires debug_overrides=1)
+//   vflip=1            flip V on textured quads (requires debug_overrides=1)
+//   pnmtx=0            ignore the pane matrix (requires debug_overrides=1)
+//   scissor=1          per-quad scissor
+//   debug=0            silence the first-quad dump
+//   clear=FF00FF       forced clear colour
+//   texmb=3            VRAM texture budget
 static bool Gpu2dReadConfig() {
     FILE* fp = std::fopen("sdmc:/mkwii/gpu.cfg", "rb");
     if (!fp) fp = std::fopen("gpu.cfg", "rb");
     if (!fp) return false;
     char line[128];
     bool any = false;
+    bool debugOverrides = false;
+    bool hasDebugOverrideKey = false;
+    int pendingTestMode = g_gpuTestMode;
+    int pendingProjUnif = g_gpuProjUnif;
+    float pendingYSpace = g_gpuYSpace;
+    bool pendingVFlip = g_gpuVFlip;
+    bool pendingPnMtx = g_gpuPnMtx;
     while (std::fgets(line, sizeof(line), fp)) {
         char* hash = std::strchr(line, '#');
         if (hash) *hash = 0;
@@ -3306,11 +3314,12 @@ static bool Gpu2dReadConfig() {
         const bool on = n != 0;
         any = true;
         if (std::strcmp(k, "gpu") == 0) g_gpu2d = on;
-        else if (std::strcmp(k, "test") == 0) g_gpuTestMode = static_cast<int>(n);
-        else if (std::strcmp(k, "unif") == 0) g_gpuProjUnif = static_cast<int>(n) & 3;
-        else if (std::strcmp(k, "ysign") == 0) g_gpuYSpace = (n == 0) ? 0.0f : static_cast<float>(n);
-        else if (std::strcmp(k, "vflip") == 0) g_gpuVFlip = on;
-        else if (std::strcmp(k, "pnmtx") == 0) g_gpuPnMtx = on;
+        else if (std::strcmp(k, "debug_overrides") == 0) debugOverrides = on;
+        else if (std::strcmp(k, "test") == 0) { pendingTestMode = static_cast<int>(n); hasDebugOverrideKey = true; }
+        else if (std::strcmp(k, "unif") == 0) { pendingProjUnif = static_cast<int>(n) & 3; hasDebugOverrideKey = true; }
+        else if (std::strcmp(k, "ysign") == 0) { pendingYSpace = (n == 0) ? 0.0f : static_cast<float>(n); hasDebugOverrideKey = true; }
+        else if (std::strcmp(k, "vflip") == 0) { pendingVFlip = on; hasDebugOverrideKey = true; }
+        else if (std::strcmp(k, "pnmtx") == 0) { pendingPnMtx = on; hasDebugOverrideKey = true; }
         else if (std::strcmp(k, "scissor") == 0) g_gpuScissor = on;
         else if (std::strcmp(k, "debug") == 0) g_gpuDebugQuads = on ? 4u : 0u;
         else if (std::strcmp(k, "clear") == 0)
@@ -3322,6 +3331,15 @@ static bool Gpu2dReadConfig() {
             g_gpuTexCap = static_cast<size_t>(n) * 1024ull * 1024ull;
     }
     std::fclose(fp);
+    if (debugOverrides) {
+        g_gpuTestMode = pendingTestMode;
+        g_gpuProjUnif = pendingProjUnif;
+        g_gpuYSpace = pendingYSpace;
+        g_gpuVFlip = pendingVFlip;
+        g_gpuPnMtx = pendingPnMtx;
+    } else if (hasDebugOverrideKey) {
+        AppLog("[Gpu2d] ignoring stale gpu.cfg debug overrides (set debug_overrides=1 to enable)\n");
+    }
     if (any) AppLog("[Gpu2d] config sdmc:/mkwii/gpu.cfg loaded: gpu=%d test=%d unif=%d ysign=%.1f "
                     "vflip=%d pnmtx=%d scissor=%d debug=%u clear=%08X texmb=%zu\n",
                     g_gpu2d ? 1 : 0, g_gpuTestMode, g_gpuProjUnif, g_gpuYSpace,
@@ -3607,12 +3625,38 @@ static bool Gpu2dUploadBase() {
 // Project a layout pixel coordinate through the (OrthoTilt) projection on the CPU, so the draw
 // does not depend on which float-uniform slot citro3d's built-in vertex shader reads.
 static inline void TransformToClip(const C3D_Mtx& m, float x, float y, float* outX, float* outY) {
-    const float cx = m.r[0].c[0] * x + m.r[0].c[1] * y + m.r[0].c[3];
-    const float cy = m.r[1].c[0] * x + m.r[1].c[1] * y + m.r[1].c[3];
-    const float cw = m.r[3].c[0] * x + m.r[3].c[1] * y + m.r[3].c[3];
+    // C3D_FVec stores components as {w, z, y, x}, so use named fields instead of raw .c[] indices.
+    const float cx = m.r[0].x * x + m.r[0].y * y + m.r[0].w;
+    const float cy = m.r[1].x * x + m.r[1].y * y + m.r[1].w;
+    const float cw = m.r[3].x * x + m.r[3].y * y + m.r[3].w;
     const float inv = (std::fabs(cw) > 1e-6f) ? 1.0f / cw : 1.0f;
     *outX = cx * inv;
     *outY = cy * inv;
+}
+
+static inline void FillGpuDrawVertex(GpuDrawVertex& dst, float x, float y, float u, float v,
+                                     uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    TransformToClip(g_gpuProj, x, y, &dst.position[0], &dst.position[1]);
+    dst.position[2] = 0.0f;
+    dst.normal[0] = dst.normal[1] = 0.0f;
+    dst.normal[2] = 1.0f;
+    dst.texcoord[0] = u;
+    dst.texcoord[1] = v;
+    dst.texcoord[2] = dst.texcoord[3] = 0.0f;
+    dst.color[0] = r;
+    dst.color[1] = g;
+    dst.color[2] = b;
+    dst.color[3] = a;
+}
+
+static inline void EmitImmQuadVertex(float x, float y, float u, float v,
+                                     float r, float g, float b, float a) {
+    float cx = 0.0f, cy = 0.0f;
+    TransformToClip(g_gpuProj, x, y, &cx, &cy);
+    C3D_ImmSendAttrib(cx, cy, 0.0f, 1.0f);
+    C3D_ImmSendAttrib(0.0f, 0.0f, 1.0f, 0.0f);
+    C3D_ImmSendAttrib(u, v, 0.0f, 0.0f);
+    C3D_ImmSendAttrib(r, g, b, a);
 }
 
 static void Gpu2dRender() {
@@ -3650,28 +3694,6 @@ static void Gpu2dRender() {
         C3D_TexEnvFunc(env, C3D_Both, GPU_MODULATE);
     }
 
-    // Anything the software path drew (3D) is composited underneath the layout.
-    // Any pixel the software path produced (3D, or a 2D draw that did not come through the
-    // layout hook) has to be composited underneath the GPU drawn layout.
-    if ((g_gx.pixels3DThisFrame > 0 || g_gx.tri2DWritten > 0) && Gpu2dUploadBase()) {
-        C3D_TexBind(0, &g_gpuBase);
-        const float su = static_cast<float>(kScreenW) / 512.0f;
-        const float sv = static_cast<float>(kScreenH) / 256.0f;
-        C3D_ImmDrawBegin(GPU_TRIANGLE_STRIP);
-        const float xs[4] = {0.0f, static_cast<float>(kScreenW), 0.0f, static_cast<float>(kScreenW)};
-        const float ys[4] = {0.0f, 0.0f, static_cast<float>(kScreenH), static_cast<float>(kScreenH)};
-        const float us[4] = {0.0f, su, 0.0f, su};
-        const float vs[4] = {0.0f, 0.0f, sv, sv};
-        for (int i = 0; i < 4; ++i) {
-            float cx = 0.0f, cy = 0.0f;
-            TransformToClip(g_gpuProj, xs[i], ys[i], &cx, &cy);
-            C3D_ImmSendAttrib(cx, cy, 0.0f, 1.0f);
-            C3D_ImmSendAttrib(us[i], vs[i], 0.0f, 0.0f);
-            C3D_ImmSendAttrib(1.0f, 1.0f, 1.0f, 1.0f);
-        }
-        C3D_ImmDrawEnd();
-    }
-
     g_gpuQuadsDrawn = 0;
     // test=1: a pure reference pattern (full-screen quad + two blocks) instead of the guest's
     // layout.  If this does not appear, nothing about the frame setup works and the guest is not
@@ -3684,11 +3706,7 @@ static void Gpu2dRender() {
         const float fx[4] = {0.0f, 400.0f, 0.0f, 400.0f};
         const float fy[4] = {0.0f, 0.0f, 240.0f, 240.0f};
         for (int i = 0; i < 4; ++i) {
-            float cx = 0.0f, cy = 0.0f;
-            TransformToClip(g_gpuProj, fx[i], fy[i], &cx, &cy);
-            C3D_ImmSendAttrib(cx, cy, 0.0f, 1.0f);
-            C3D_ImmSendAttrib(0.5f, 0.5f, 0.0f, 0.0f);
-            C3D_ImmSendAttrib(0.0f, 0.45f, 0.9f, 1.0f); // blue-green, unmistakable
+            EmitImmQuadVertex(fx[i], fy[i], 0.5f, 0.5f, 0.0f, 115.0f, 230.0f, 255.0f);
         }
         C3D_ImmDrawEnd();
         ++g_gpuQuadsDrawn;
@@ -3697,11 +3715,20 @@ static void Gpu2dRender() {
         g_gpuQuads.clear();
         return;
     }
+
+    // Anything the software path drew (3D, or a 2D draw that did not come through the layout hook)
+    // is uploaded into g_gpuBase and composited via the VBO underneath the GPU drawn layout.
+    const bool hasBaseQuad =
+        (g_gpuTestMode != 3) &&
+        (g_gx.pixels3DThisFrame > 0 || g_gx.tri2DWritten > 0) &&
+        Gpu2dUploadBase();
+    const size_t baseVertexOffset = hasBaseQuad ? size_t{6} : size_t{0};
+
     // Submit layout geometry from one explicit linear-memory vertex buffer.  Immediate mode
     // works for the diagnostic pattern, but the menu path needs a persistent vertex stream with
     // per-draw offsets so each texture/state change is represented by a normal PICA draw call.
     const size_t layoutVertexCount = g_gpuQuads.size() * 6;
-    const size_t vertexCount = g_gpuTestMode == 3 ? size_t{6} : layoutVertexCount;
+    const size_t vertexCount = (g_gpuTestMode == 3) ? size_t{6} : (baseVertexOffset + layoutVertexCount);
     if (vertexCount > g_gpuDrawVertexCapacity) {
         size_t newCapacity = 256;
         while (newCapacity < vertexCount) newCapacity *= 2;
@@ -3718,42 +3745,41 @@ static void Gpu2dRender() {
         g_gpuDrawVertexCapacity = newCapacity;
     }
     constexpr int kTriangleCorners[6] = {0, 1, 2, 0, 2, 3};
-    for (size_t qi = 0; qi < g_gpuQuads.size(); ++qi) {
-        const GpuQuad& q = g_gpuQuads[qi];
+    if (hasBaseQuad) {
+        const float su = static_cast<float>(kScreenW) / 512.0f;
+        const float sv = static_cast<float>(kScreenH) / 256.0f;
+        const float xs[4] = {0.0f, static_cast<float>(kScreenW), static_cast<float>(kScreenW), 0.0f};
+        const float ys[4] = {0.0f, 0.0f, static_cast<float>(kScreenH), static_cast<float>(kScreenH)};
+        const float us[4] = {0.0f, su, su, 0.0f};
+        // PICA200 textures have v=1 at memory row 0 (where top-down images are written) and v=0 at potH-1.
+        const float vs[4] = {1.0f, 1.0f, 1.0f - sv, 1.0f - sv};
         for (int vi = 0; vi < 6; ++vi) {
-            const GpuQuadVtx& src = q.v[kTriangleCorners[vi]];
-            GpuDrawVertex& dst = g_gpuDrawVertices[qi * 6 + vi];
-            TransformToClip(g_gpuProj, src.x, src.y, &dst.position[0], &dst.position[1]);
-            dst.position[2] = 0.0f;
-            dst.normal[0] = dst.normal[1] = 0.0f;
-            dst.normal[2] = 1.0f;
-            dst.texcoord[0] = src.u * q.uScale;
-            dst.texcoord[1] = src.v * q.vScale;
-            dst.texcoord[2] = dst.texcoord[3] = 0.0f;
-            dst.color[0] = static_cast<uint8_t>(std::lround(std::clamp(src.r, 0.0f, 1.0f) * 255.0f));
-            dst.color[1] = static_cast<uint8_t>(std::lround(std::clamp(src.g, 0.0f, 1.0f) * 255.0f));
-            dst.color[2] = static_cast<uint8_t>(std::lround(std::clamp(src.b, 0.0f, 1.0f) * 255.0f));
-            dst.color[3] = static_cast<uint8_t>(std::lround(std::clamp(src.a, 0.0f, 1.0f) * 255.0f));
+            const int c = kTriangleCorners[vi];
+            FillGpuDrawVertex(g_gpuDrawVertices[vi], xs[c], ys[c], us[c], vs[c], 255, 255, 255, 255);
         }
     }
+    auto toColorByte = [](float c) -> uint8_t {
+        return static_cast<uint8_t>(std::lround(std::clamp(c, 0.0f, 1.0f) * 255.0f));
+    };
     if (g_gpuTestMode == 3) {
         const float xs[6] = {0.0f, 400.0f, 400.0f, 0.0f, 400.0f, 0.0f};
         const float ys[6] = {0.0f, 0.0f, 240.0f, 0.0f, 240.0f, 240.0f};
         for (int i = 0; i < 6; ++i) {
-            GpuDrawVertex& dst = g_gpuDrawVertices[i];
-            TransformToClip(g_gpuProj, xs[i], ys[i], &dst.position[0], &dst.position[1]);
-            dst.position[2] = 0.0f;
-            dst.normal[0] = dst.normal[1] = 0.0f;
-            dst.normal[2] = 1.0f;
-            dst.texcoord[0] = dst.texcoord[1] = 0.5f;
-            dst.texcoord[2] = dst.texcoord[3] = 0.0f;
-            dst.color[0] = 0;
-            dst.color[1] = 115;
-            dst.color[2] = 230;
-            dst.color[3] = 255;
+            FillGpuDrawVertex(g_gpuDrawVertices[i], xs[i], ys[i], 0.5f, 0.5f, 0, 115, 230, 255);
         }
         AppLog("[Gpu2d] drawing VBO reference pattern vertices=%zu stride=%zu\n",
                vertexCount, sizeof(GpuDrawVertex));
+    } else {
+        for (size_t qi = 0; qi < g_gpuQuads.size(); ++qi) {
+            const GpuQuad& q = g_gpuQuads[qi];
+            for (int vi = 0; vi < 6; ++vi) {
+                const GpuQuadVtx& src = q.v[kTriangleCorners[vi]];
+                FillGpuDrawVertex(g_gpuDrawVertices[baseVertexOffset + qi * 6 + vi],
+                                  src.x, src.y, src.u * q.uScale, 1.0f - src.v * q.vScale,
+                                  toColorByte(src.r), toColorByte(src.g),
+                                  toColorByte(src.b), toColorByte(src.a));
+            }
+        }
     }
     if (vertexCount != 0) {
         const u32 vertexBytes = static_cast<u32>(vertexCount * sizeof(GpuDrawVertex));
@@ -3776,6 +3802,18 @@ static void Gpu2dRender() {
         g_gpuQuads.clear();
         return;
     }
+    if (hasBaseQuad) {
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
+        C3D_TexBind(0, &g_gpuBase);
+        C3D_DrawArrays(GPU_TRIANGLES, 0, 6);
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
+                       GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
+                       GPU_ONE, GPU_ONE_MINUS_SRC_ALPHA);
+    } else {
+        C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
+                       GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
+                       GPU_ONE, GPU_ONE_MINUS_SRC_ALPHA);
+    }
     for (size_t qi = 0; qi < g_gpuQuads.size(); ++qi) {
         const GpuQuad& q = g_gpuQuads[qi];
         C3D_Tex* tex = q.tex;
@@ -3790,9 +3828,10 @@ static void Gpu2dRender() {
         if (!q.blend) C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_ONE, GPU_ZERO, GPU_ONE, GPU_ZERO);
         if (tex != &g_gpuWhite) C3D_TexSetWrap(tex, q.wrapS, q.wrapT);
         C3D_TexBind(0, tex);
-        C3D_DrawArrays(GPU_TRIANGLES, static_cast<u32>(qi * 6), 6);
+        C3D_DrawArrays(GPU_TRIANGLES, static_cast<u32>(baseVertexOffset + qi * 6), 6);
         if (!q.blend) {
-            C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD, GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
+            C3D_AlphaBlend(GPU_BLEND_ADD, GPU_BLEND_ADD,
+                           GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA,
                            GPU_SRC_ALPHA, GPU_ONE_MINUS_SRC_ALPHA);
         }
         ++g_gpuQuadsDrawn;
@@ -3808,11 +3847,7 @@ static void Gpu2dRender() {
         const float xs[4] = {20.0f, 180.0f, 20.0f, 180.0f};
         const float ys[4] = {20.0f, 20.0f, 100.0f, 100.0f};
         for (int i = 0; i < 4; ++i) {
-            float cx = 0.0f, cy = 0.0f;
-            TransformToClip(g_gpuProj, xs[i], ys[i], &cx, &cy);
-            C3D_ImmSendAttrib(cx, cy, 0.0f, 1.0f);
-            C3D_ImmSendAttrib(0.5f, 0.5f, 0.0f, 0.0f);
-            C3D_ImmSendAttrib(1.0f, 0.0f, 1.0f, 1.0f);
+            EmitImmQuadVertex(xs[i], ys[i], 0.5f, 0.5f, 255.0f, 0.0f, 255.0f, 255.0f);
         }
         C3D_ImmDrawEnd();
         if (g_gpuWhiteValid) {
@@ -3822,9 +3857,7 @@ static void Gpu2dRender() {
             const float xs2[4] = {200.0f, 380.0f, 200.0f, 380.0f};
             const float ys2[4] = {20.0f, 20.0f, 100.0f, 100.0f};
             for (int i = 0; i < 4; ++i) {
-                C3D_ImmSendAttrib(xs2[i], ys2[i], 0.0f, 1.0f);
-                C3D_ImmSendAttrib(0.25f, 0.25f, 0.0f, 0.0f);
-                C3D_ImmSendAttrib(0.0f, 1.0f, 0.0f, 1.0f);
+                EmitImmQuadVertex(xs2[i], ys2[i], 0.25f, 0.25f, 0.0f, 255.0f, 0.0f, 255.0f);
             }
             C3D_ImmDrawEnd();
         }
@@ -9040,7 +9073,6 @@ bool handle_startup_hle(uint32_t target, CpuContext* cpu)
                 }
             }
         }
-        gx_bridge::PresentFrameTo3DS(s_frameCount);
         static bool s_profiled100 = false;
         if (!s_profiled100 && s_frameCount >= 100) {
             s_profiled100 = true;
