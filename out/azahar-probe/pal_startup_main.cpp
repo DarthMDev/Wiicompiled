@@ -3867,8 +3867,9 @@ static shaderProgram_s g_gpuProgram{};
 static bool      g_gpuProgramReady = false;
 static C3D_Tex   g_gpuBase{};
 static bool      g_gpuBaseValid = false;
-static GpuDrawVertex* g_gpuDrawVertices = nullptr;
-static size_t g_gpuDrawVertexCapacity = 0;
+static GpuDrawVertex* g_gpuDrawVertices = nullptr;   // two halves, rotated per frame
+static size_t g_gpuDrawVertexCapacity = 0;           // vertices per half
+static int    g_gpuVtxHalf = 0;                      // which half this frame writes
 
 // PICA200 textures are not row-major: texels are grouped in 8x8 tiles (tiles in row-major
 // order), and inside a tile they follow a Morton/Z order.  C3D_TexUpload (C3D_TexLoadImage in
@@ -4455,7 +4456,11 @@ static void Gpu2dRender() {
     if (vertexCount > g_gpuDrawVertexCapacity) {
         size_t newCapacity = 256;
         while (newCapacity < vertexCount) newCapacity *= 2;
-        GpuDrawVertex* replacement = static_cast<GpuDrawVertex*>(linearAlloc(newCapacity * sizeof(GpuDrawVertex)));
+        // Two halves: with syncframe=0 the previous frame's GPU work may still be reading the last
+        // vertex buffer, and rewriting it in place is what makes menu panels drift and flicker.
+        // Alternating halves keeps each submission untouched until it is two frames old.
+        GpuDrawVertex* replacement = static_cast<GpuDrawVertex*>(
+            linearAlloc(newCapacity * sizeof(GpuDrawVertex) * 2));
         if (!replacement) {
             AppLog("[Gpu2d] vertex buffer alloc failed count=%zu\n", vertexCount);
             C3D_SetScissor(static_cast<GPU_SCISSORMODE>(0), 0, 0, 0, 0);
@@ -4467,6 +4472,8 @@ static void Gpu2dRender() {
         g_gpuDrawVertices = replacement;
         g_gpuDrawVertexCapacity = newCapacity;
     }
+    GpuDrawVertex* const vtx = g_gpuDrawVertices +
+        (g_gpuVtxHalf ? g_gpuDrawVertexCapacity : size_t{0});
     constexpr int kTriangleCorners[6] = {0, 1, 2, 0, 2, 3};
     if (hasBaseQuad) {
         const float su = static_cast<float>(kScreenW) / 512.0f;
@@ -4478,7 +4485,7 @@ static void Gpu2dRender() {
         const float vs[4] = {1.0f, 1.0f, 1.0f - sv, 1.0f - sv};
         for (int vi = 0; vi < 6; ++vi) {
             const int c = kTriangleCorners[vi];
-            FillGpuDrawVertex(g_gpuDrawVertices[vi], xs[c], ys[c], us[c], vs[c], 255, 255, 255, 255);
+            FillGpuDrawVertex(vtx[vi], xs[c], ys[c], us[c], vs[c], 255, 255, 255, 255);
         }
     }
     auto toColorByte = [](float c) -> uint8_t {
@@ -4488,7 +4495,7 @@ static void Gpu2dRender() {
         const float xs[6] = {0.0f, 400.0f, 400.0f, 0.0f, 400.0f, 0.0f};
         const float ys[6] = {0.0f, 0.0f, 240.0f, 0.0f, 240.0f, 240.0f};
         for (int i = 0; i < 6; ++i) {
-            FillGpuDrawVertex(g_gpuDrawVertices[i], xs[i], ys[i], 0.5f, 0.5f, 0, 115, 230, 255);
+            FillGpuDrawVertex(vtx[i], xs[i], ys[i], 0.5f, 0.5f, 0, 115, 230, 255);
         }
         AppLog("[Gpu2d] drawing VBO reference pattern vertices=%zu stride=%zu\n",
                vertexCount, sizeof(GpuDrawVertex));
@@ -4497,7 +4504,7 @@ static void Gpu2dRender() {
             const GpuQuad& q = g_gpuQuads[qi];
             for (int vi = 0; vi < 6; ++vi) {
                 const GpuQuadVtx& src = q.v[kTriangleCorners[vi]];
-                FillGpuDrawVertex(g_gpuDrawVertices[baseVertexOffset + qi * 6 + vi],
+                FillGpuDrawVertex(vtx[baseVertexOffset + qi * 6 + vi],
                                   src.x, src.y, src.u * q.uScale, 1.0f - src.v * q.vScale,
                                   toColorByte(src.r), toColorByte(src.g),
                                   toColorByte(src.b), toColorByte(src.a));
@@ -4506,10 +4513,10 @@ static void Gpu2dRender() {
     }
     if (vertexCount != 0) {
         const u32 vertexBytes = static_cast<u32>(vertexCount * sizeof(GpuDrawVertex));
-        GSPGPU_FlushDataCache(g_gpuDrawVertices, vertexBytes);
+        GSPGPU_FlushDataCache(vtx, vertexBytes);
         C3D_BufInfo* buf = C3D_GetBufInfo();
         BufInfo_Init(buf);
-        BufInfo_Add(buf, g_gpuDrawVertices, sizeof(GpuDrawVertex), 4, 0x3210);
+        BufInfo_Add(buf, vtx, sizeof(GpuDrawVertex), 4, 0x3210);
     }
     g_gpuQuadsDrawn = 0;
     if (g_gpuTestMode == 3) {
@@ -4586,6 +4593,7 @@ static void Gpu2dRender() {
         }
     }
     C3D_FrameEnd(0);
+    g_gpuVtxHalf ^= 1;   // next frame writes the other half
     g_gpuQuads.clear();
     // The frame just submitted is now in flight; the next one starts recording.
     g_gpuEvictFloor = g_gpuFrameStartTick;
